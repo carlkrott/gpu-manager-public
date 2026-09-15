@@ -6,7 +6,7 @@ redis==8.1.0
 # Required for image-byte validation and bounded local-vision payload resizing.
 Pillow==12.2.0
 # Required by semantic_scene_pipeline.py for strict Draft-07 policy validation.
-jsonschema==4.25.1
+jsonschema==4.26.0
 # Optional request-format adapters are included in the staged control plane.
 PyYAML==6.0.3
 xmltodict==1.0.4
