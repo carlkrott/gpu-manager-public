@@ -4,7 +4,7 @@ aiohttp==3.13.5
 # Valkey-compatible queue, lease and durable job client.
 redis==8.1.0
 # Required for image-byte validation and bounded local-vision payload resizing.
-Pillow==12.2.0
+Pillow==12.3.0
 # Required by semantic_scene_pipeline.py for strict Draft-07 policy validation.
 jsonschema==4.25.1
 # Optional request-format adapters are included in the staged control plane.
