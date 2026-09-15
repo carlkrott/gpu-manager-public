@@ -1,0 +1,116 @@
+name: source-only-ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Source-only checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan source and history for secrets
+        # The pinned action invokes gitleaks detect with --redact and writes no report artifact.
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_SUMMARY: "false"
+          GITLEAKS_CONFIG: ".gitleaks.toml"
+          GITLEAKS_VERSION: "8.24.3"
+
+      - name: Set up the documented Python target
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Install exact locked dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_CACHE_DIR: "1"
+        run: python -m pip install --require-hashes --no-deps -r requirements-dev.lock
+
+      - name: Check installed dependency closure
+        run: python -m pip check
+
+      - name: Check Python syntax
+        run: python -m compileall -q scripts examples tests/publication
+
+      - name: Check the public payload
+        env:
+          PYTHONPATH: scripts
+        run: python scripts/check_public_payload.py .
+
+      - name: Check dependency versions and license metadata
+        run: |
+          python - <<'PY'
+          from importlib import metadata
+          from pathlib import Path
+          import re
+
+          requirements = []
+          for filename in ("requirements.lock", "requirements-dev.lock"):
+              for raw in Path(filename).read_text(encoding="utf-8").splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#") or line.startswith("-"):
+                      continue
+                  match = re.match(r"([A-Za-z0-9_.-]+)==([^ ]+)", line)
+                  if match:
+                      requirements.append(match.groups())
+
+          seen = set()
+          for name, expected_version in requirements:
+              normalized = name.lower().replace("-", "_")
+              if normalized in seen:
+                  continue
+              seen.add(normalized)
+              dist = metadata.distribution(name)
+              actual_version = dist.version
+              license_name = (
+                  dist.metadata.get("License-Expression")
+                  or dist.metadata.get("License")
+                  or ""
+              ).strip()
+              if actual_version != expected_version:
+                  raise SystemExit(
+                      f"version mismatch for {name}: {actual_version} != {expected_version}"
+                  )
+              if not license_name or license_name.lower() in {"unknown", "n/a"}:
+                  raise SystemExit(f"missing license metadata for {name}")
+              print(f"{name}=={actual_version}: {license_name}")
+
+          notices = Path("THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+          if "No third-party source code is vendored" not in notices:
+              raise SystemExit("third-party notice policy marker is missing")
+          readme = Path("README.md").read_text(encoding="utf-8")
+          license_text = Path("LICENSE").read_text(encoding="utf-8")
+          if "MIT License" not in license_text:
+              raise SystemExit("MIT license file is missing")
+          if "licensed under the MIT License" not in readme:
+              raise SystemExit("MIT license README statement is missing")
+          PY
+
+      - name: Run the hermetic publication suite
+        env:
+          PYTHONPATH: scripts
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -q tests/publication
+
+      - name: Exercise the neutral Combined Gemma example
+        run: |
+          python examples/combined-gemma/demo.py --dry-run
+          python examples/combined-gemma/demo.py --mock-demo

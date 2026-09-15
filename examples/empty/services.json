@@ -1,0 +1,17 @@
+{
+  "services": {},
+  "bundles": {},
+  "gpu_devices": {},
+  "routing_groups": {},
+  "generation_templates": {},
+  "pipeline_providers": {},
+  "scheduling": {
+    "queue_owner": "durable_only",
+    "scheduler_owns_load": false,
+    "scheduler_dry_run_mode": true,
+    "proactive_scheduling_enabled": false,
+    "maintenance_mode": false,
+    "idle_service": "",
+    "idle_services": {}
+  }
+}

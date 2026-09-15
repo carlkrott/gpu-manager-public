@@ -1,0 +1,685 @@
+{
+  "file_count": 113,
+  "files": [
+    {
+      "disposition": "utility",
+      "path": ".github/dependabot.yml",
+      "sha256": "1df1ce6ae55e6f7f34531a0a7af8440f9df86a6cac9c7625ac24adfe259cfae0",
+      "size": 260
+    },
+    {
+      "disposition": "utility",
+      "path": ".github/workflows/ci.yml",
+      "sha256": "9a63db72af0ab5075c213106da9da0d48e6b6f0f7895486943cfaa026d340bfb",
+      "size": 4305
+    },
+    {
+      "disposition": "utility",
+      "path": ".gitignore",
+      "sha256": "f158250b71dcb612a76206eb4346465538b4e3d5bb8764b9fd3fb2a53c23d4ac",
+      "size": 581
+    },
+    {
+      "disposition": "utility",
+      "path": ".gitleaks.toml",
+      "sha256": "414349bd03271c3b535fee5903cd2c87e15e07a34d0e111bf52af6bf69b36dcf",
+      "size": 354
+    },
+    {
+      "disposition": "core",
+      "path": "CONTRIBUTING.md",
+      "sha256": "3a941ed2c23565bf7b488c932f88a191248aa04c94d447274ee415fa69401a25",
+      "size": 1752
+    },
+    {
+      "disposition": "core",
+      "path": "LICENSE",
+      "sha256": "15ae6c2539448b74a041fdfdfe871f7d49ff6e493b034c3dd85af7dde42fc06f",
+      "size": 1071
+    },
+    {
+      "disposition": "core",
+      "path": "README.md",
+      "sha256": "861768178c13f9fc88102e9bb0787d0c46cc93e196e431717be0d5ffb57026d1",
+      "size": 4635
+    },
+    {
+      "disposition": "core",
+      "path": "SECURITY.md",
+      "sha256": "40ca73dadcae196dcb6675ecdde321f2f36e62583edbfa21071299d22b957b6f",
+      "size": 3455
+    },
+    {
+      "disposition": "core",
+      "path": "THIRD_PARTY_NOTICES.md",
+      "sha256": "2f76d7d37877be1ecf43b62fa1a63ce0963a565a50783d299cece510a1bc90cd",
+      "size": 1524
+    },
+    {
+      "disposition": "core",
+      "path": "examples/combined-gemma/README.md",
+      "sha256": "37617e1b128f2b23066d0a089f8f2b531414f513a98e0752dd6386531eba38a1",
+      "size": 2630
+    },
+    {
+      "disposition": "core",
+      "path": "examples/combined-gemma/demo.py",
+      "sha256": "643c513795454bc909bf4953576e38adc9b6a6d0686fb3558e00c1111b91ea3b",
+      "size": 7359
+    },
+    {
+      "disposition": "core",
+      "path": "examples/combined-gemma/services.json",
+      "sha256": "0ed47450a7ccf30fe4e74ce80c86b69a0802d2c7f0e2d5328089f439d4483656",
+      "size": 1106
+    },
+    {
+      "disposition": "core",
+      "path": "examples/empty/services.json",
+      "sha256": "5afb5dd1583f762e3c61be6696eb8c858ec9707c648f0ab3efbd7f05d1b192ea",
+      "size": 391
+    },
+    {
+      "disposition": "utility",
+      "path": "pytest.ini",
+      "sha256": "cc71a3498de137f6bbba8e09ae76a52168d2b6d5a4dfbe1d59f674c4e621b9e2",
+      "size": 78
+    },
+    {
+      "disposition": "utility",
+      "path": "requirements-dev.lock",
+      "sha256": "69a6f40e85c385d28a6d01d8d691a20d6b7ad6d551e900510789ac3f0e05a771",
+      "size": 578
+    },
+    {
+      "disposition": "utility",
+      "path": "requirements.lock",
+      "sha256": "e44e15fc421142b88a2412cfee2b28742858ffc19049509c1aa5aa0632419364",
+      "size": 2516
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/api_auth.py",
+      "sha256": "f2b9e3905578c6c18ec986974abde6b092f510913c6e5e07d84790dbe8f49419",
+      "size": 6372
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/backup_gpu_manager_state.py",
+      "sha256": "39e329f30237eedb759bda9111f0e510b375c7903f571be586a20a336b3e2642",
+      "size": 7973
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/build_comfyui_host_manifest.py",
+      "sha256": "5bb3cb3deee94f2a6ebb98f43c649e41589782c12eb835fc8284321d6fe895a1",
+      "size": 2610
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/bundle_identity.py",
+      "sha256": "9e568a201bfcc15ee4f5bfe15682074a1fd20cd1fe597758865bec73a11d5b4b",
+      "size": 22463
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/bundle_lifecycle.py",
+      "sha256": "0fc0a8ea10e44e6c8a3a8ce89514e6f1b094c93d7853a9c13f88edc5d0656b7e",
+      "size": 59624
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/check_public_payload.py",
+      "sha256": "5c5e711ad934fe7efa6bbee3a1c0c116aaed4bf6e9b44640642e864dcc7ed84d",
+      "size": 6008
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/combined_gemma_broker_service.py",
+      "sha256": "db3e2bf20496a58ed8638cc8d82be23242b5317877c99e6daa7b789caa87dedb",
+      "size": 27419
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/comfyui_workflow_sanitize.py",
+      "sha256": "0eaeac288f2573a8581ca019c6fa4e38596573c95590933fc8ab5295d11393eb",
+      "size": 2801
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/container_preflight.py",
+      "sha256": "5d9625058e0b95f8e552ff6bfb1f2cb91a2750dac4588875abfabbbeacdaae7f",
+      "size": 8169
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/coordinator_provider_bridge.py",
+      "sha256": "c4af649e9119108a3c10256346530d0b5c6886930cca4c5e1beb28cd73d6cdd0",
+      "size": 15478
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/declarative_package.py",
+      "sha256": "468ae55aa7a79b3d88d393aee9436105218f8981fe419603fd8b3cb3e616eee4",
+      "size": 15779
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/declarative_workflow_registration.py",
+      "sha256": "04d8d7111922973b9083e1cc09796ef4780ae0d1039cf5d9343fd8589162c3e5",
+      "size": 19792
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/execution_boundary.py",
+      "sha256": "5cd5be2a3e7cf37dfa26b466f57ae79870601f7d2545b5d4ffff1c63b217551a",
+      "size": 45486
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/export_public_source.py",
+      "sha256": "7bd864cf033ffe3db4986eb23aed830534d586898e1f220412d13b8380d0d77b",
+      "size": 8494
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/export_service_package.py",
+      "sha256": "40ffc0da3aa219eedf7bf931adfc7fbaa0dd52ab8ef21e5f95c521a8ef453f73",
+      "size": 10994
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/format_converter.py",
+      "sha256": "eeee14e71226537ba6e612f7e40a35770fc392ac85a0288b829d65035c0c3413",
+      "size": 31356
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/__init__.py",
+      "sha256": "9c3c3b674a90636c814946c3ab5731a97550af5f1efb21ecd5eb52a9a5ab09a9",
+      "size": 405
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/admission.py",
+      "sha256": "eca292d3f5a0a6f841bf9f162f09277c2bccbe28ac26b588082d9d4f7fbaaf5d",
+      "size": 3274
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/api.py",
+      "sha256": "242c3e763de716598dab9eebd217caca61adb396c0412d12e4aa668c4e3d7443",
+      "size": 11497
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/compat.py",
+      "sha256": "647dd8199db2f3353d33fcd2dcefd91fec688a78fd76bd1912a5ad3b7cf355bc",
+      "size": 10565
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/compatibility.py",
+      "sha256": "47679a5872c35c78421d36cc89dddb3b6d24cdd44ed4ffb7ae31188a8ae18a83",
+      "size": 3449
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/config.py",
+      "sha256": "c327d76dbf39e9cacdddaeb2e61815a8cc8a48d70806fa7c2a8705ce8ca0c209",
+      "size": 5060
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/contracts.py",
+      "sha256": "adf81d5ea9e4afccc5b22f804ccffe2ac5ece2f8f7b7b90271b347fecac25e22",
+      "size": 11036
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/dispatcher.py",
+      "sha256": "dbb9aac303d096152d89e8ea89dd0d16e9c8b1a123d8a3928e676e1a9e3b1d9c",
+      "size": 5295
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/drain.py",
+      "sha256": "c8222d388b4c1c95610b5aa5f24c72298458ce4c9825c613ab630206973663e0",
+      "size": 8721
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/events.py",
+      "sha256": "1ba63131a0905a3d8fb8b1dd211ac25644d1d8bd493ba69e25dc5ecf8703817e",
+      "size": 6060
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/acquire_leader.lua",
+      "sha256": "ecd5f4262657577ae94c64b6ca27246aa59363150ae55e5d3e01ed999328e9bf",
+      "size": 770
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/cancel_queued.lua",
+      "sha256": "b5c9f81538cd87fecfbebd0749edbcc1c0c5e4b894d35ade05bce29ead780455",
+      "size": 639
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/member_drain.lua",
+      "sha256": "9b0e8b557f778e720284c65534b7542fc3f402339808e5e869b8c1773890f306",
+      "size": 3836
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/renew_leader.lua",
+      "sha256": "de90a2da07d982a22ff9b5ed94abd2619120a6b126f40c1ec9d9aa2e5ea75f45",
+      "size": 614
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/repair_dead_job.lua",
+      "sha256": "8cdc241540a42114f29394fff8e840ff26ef8f5136ab950b705ac3ebdaa3104e",
+      "size": 1449
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/replace_job.lua",
+      "sha256": "d12a9e72aac0202cdcd8f4125edff64058977c998d3266ffed9f4c4f3c4e4641",
+      "size": 1252
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/requeue_claim.lua",
+      "sha256": "3f605477c34bfe19a9eb505d114013a8cb6a9d2375479f8f22f0a06ea9e648ce",
+      "size": 2378
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/reserve_job.lua",
+      "sha256": "e79bd7423878efbf057969d36e01e573c0204a2328abda182930f43fae573f21",
+      "size": 3494
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/submit_job.lua",
+      "sha256": "2e47fde1c8635bb0fabfe05dc3ff4609267b442be3c7e82a74a05fdc94c581be",
+      "size": 768
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/member_cache.py",
+      "sha256": "392fbcd6d15114c538b55c82d9a7c84552e87c265e439a8cb3da6ecf75461993",
+      "size": 2847
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/member_observer.py",
+      "sha256": "e3ed11d781fc11788368d8fdb9c24cef5e3186aa6dc8879dece0925dea48fbfe",
+      "size": 10580
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/migrate.py",
+      "sha256": "dd213fa2cdcb3a8f3bacae132dbb5ac9b193037c9813d606a1e0d37d9e4f6871",
+      "size": 7084
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/observability.py",
+      "sha256": "329d5f5ed1af39154954106c19a5f339a6021cb3be005926b378ed15b2e231b7",
+      "size": 6047
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/probe_adapter.py",
+      "sha256": "2876fbc34fba7b74bc1f7c7c1d57a80523e2b85d7827882cb09fae872543d10d",
+      "size": 9698
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/readiness.py",
+      "sha256": "1463747af1a20b531ee88b867c773fe134aa4eed95208a31064c00e4e263666c",
+      "size": 6979
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/reconcile.py",
+      "sha256": "d4ec9c09f990f3c5980c50dd776c692b3f0696caf2c2fd8cc88832bc2ef57b32",
+      "size": 16699
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/recovery.py",
+      "sha256": "0133b59806b369feed973a58e80f3c12e470a073813c213165ab40dd55b230d3",
+      "size": 622
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/redis_store.py",
+      "sha256": "089e854c74948c4e3e5b3d444a277b9c3777041977e44b2f70c7bb196d8115b0",
+      "size": 94525
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/runtime.py",
+      "sha256": "a57ad3ec9edb8ff21b1a9b11ec1740abc2787f2b7d0d29e9af96ba5c44e1833d",
+      "size": 86862
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/telemetry.py",
+      "sha256": "69b0971b994d25a11fefbe185351d370ba33ac7bdf2a0f8015b7bf61ad9317f6",
+      "size": 5455
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu-manager.py",
+      "sha256": "4834d98a484e5e79b74efe928bdb7be10ba874530ea25c6b3ae54ecc58032f78",
+      "size": 1888307
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager_contracts.py",
+      "sha256": "8da6f32bae7b28d15e2ff5badc944555835c150b81ceb732587453dcc7934fa6",
+      "size": 52700
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager_pipeline_runtime.py",
+      "sha256": "c75b2bb0fb33044a0f4e2ee75b3582fd889ef68931a7b922169d2487771d213a",
+      "size": 22268
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager_semantics.py",
+      "sha256": "b3e992f5c2cf2bad3aaf2de473777c1c0f3fb1ddb165ca2fc8d8c557df539ddd",
+      "size": 25788
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/import_service_package.py",
+      "sha256": "9a492a05498128fbda5b0c0e179a9a52110ab51a7e06deda71cf7c850ce6bfed",
+      "size": 16102
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/lean_format.py",
+      "sha256": "3c3559b6ef67d576d82bd89d575cdea7c4940cafdf617fc32690e2f5e11db48f",
+      "size": 40422
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_custom_callbacks.py",
+      "sha256": "690e6bec4627540c93819136e0d5ead27371f58783f78ee243789cbe0f1b2210",
+      "size": 28718
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_music3_adapter.py",
+      "sha256": "9d2fbed5c8fb474ef76a6233f9124fb37f90e403612315eb3f7737ce9a1ca10d",
+      "size": 23280
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_music3_generation_runner.py",
+      "sha256": "9043af487f60d55bcac84f114b0d09aa507fc2a8cdada14b369b712c544eab22",
+      "size": 4615
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_music3_preparation_contract.py",
+      "sha256": "504726ed7c56dde1bd512944c1dc18c55e6098b4ef9534ce291d9c45a1d0a5c7",
+      "size": 14560
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_recovered_callbacks.py",
+      "sha256": "1fa80b06395cf34e3608edf6d0dc76ce0e0ae8985e74763946e76ddaf7cb2310",
+      "size": 14312
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/native_task_client.py",
+      "sha256": "657649b776b5766937d6006c0918f6a104603ef715a602946a3560bb6e6b963e",
+      "size": 5219
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/native_task_host.py",
+      "sha256": "93166c31bbc89e336e667ed9a30a43845f6c5e5da0520f60b8c9a252f52e308b",
+      "size": 10708
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/pipeline_coordinator.py",
+      "sha256": "38c327c97955509063fe833514ff01034497076678ad1765c58d046c02847036",
+      "size": 95473
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/pipeline_http_provider.py",
+      "sha256": "9dc6e5853e69b633a159bf885f4ce39924f43a8b060442ab48666f92c9715621",
+      "size": 22297
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/pipeline_provider_runtime.py",
+      "sha256": "630e7cea0b149bad2e36d25ec348260fe4df88a5ba96362f974cd50dcca9d96c",
+      "size": 153481
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/portable_defaults.py",
+      "sha256": "ba7bcacbeb89797b3bbb27dd8df9b4a29b7eb9f792e44de02aa70a6be736828e",
+      "size": 1392
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/queue_engine.py",
+      "sha256": "88102429ffdb7b1ab3935a3d7594dc403a590dc2fec2bed82e4e69397e4bd4f3",
+      "size": 183263
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/queue_monitor.py",
+      "sha256": "2152c0afe65b653b543cb904a10cb2538b2a8490734638cb9700f37cf0878a23",
+      "size": 8748
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/queue_monitor_analyze.py",
+      "sha256": "9d14b328f361404309176b0ecb1a16a7d7ad3adfe61db081b35a759dcb066da8",
+      "size": 4589
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/registry_reconcile.py",
+      "sha256": "3e0ab1108b8fd42fc44e44c7828307d7e8d99bbc0dc6154cd88dfb22794ea0a9",
+      "size": 11580
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/requirements-gpu-manager.txt",
+      "sha256": "5305e2b7e2464ebe11de7ec838ec3e42440f78d927af781d443eca8fa99c4ae7",
+      "size": 532
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/retry_failed_coordinator_qc.py",
+      "sha256": "98f0db6694966f0eb7c23c876055da31efdb654338bb0f776399b0397c929187",
+      "size": 4675
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_contracts.py",
+      "sha256": "23c6ca49d30071b40570b1cc4fdba2960c44197da7ad28e13cf5cc7d428b7f92",
+      "size": 19478
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_controller.py",
+      "sha256": "eb5545f2fdcd2e717e5db44e02756f2e6c3175a1e3332fcebaa1ed20bb7527cb",
+      "size": 10045
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_dependency_resolver.py",
+      "sha256": "66812b73311f2884798c55dc3d411c96ebff2b98ccef185bbc10b8bf68c91e31",
+      "size": 20313
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_host_client.py",
+      "sha256": "9635676c61685798c9de94e244f799da438e449cf1b565926fd18e6e92335f63",
+      "size": 7729
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_host_supervisor.py",
+      "sha256": "6085aaa51eaa6ee6a26bf8a4f34afff7f6e3afa4cff744b94deb040d8d32689f",
+      "size": 31572
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_state.py",
+      "sha256": "37729f8264d0e3ddcfebfddab6a304bd66246e00de9f98caf880cd2ca625309b",
+      "size": 20826
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_supervisor.py",
+      "sha256": "09ae8c6afd99745a0ac71811f11b511907ac4bf178567c135be19392a59cff38",
+      "size": 11601
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/sanitize_registry.py",
+      "sha256": "8899745cd00a51ba1c8ecd3a5da279eca19d49e257b8713bc9b82662705dd128",
+      "size": 5352
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/service_pipeline.py",
+      "sha256": "d5702d3c96bf5bd51ae28a3e2f950f195abc4c4fd3402a250640964cdf0fb11b",
+      "size": 41474
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/service_revision.py",
+      "sha256": "c1fb2487ec2c0851f96d106b2f8d828ed09145773fdeb8e1820fef5f65247d7d",
+      "size": 19115
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/stage_dispatch.py",
+      "sha256": "e1868913d0a565d40aa06ae4b3534613b6eff263b85025f11116ab472f592d17",
+      "size": 38545
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/verify_provider_callback.py",
+      "sha256": "1797fbe640a9b4fc75188091df20f89fb3c0ec316b4e11e59fb9e7135a1867dd",
+      "size": 7415
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_capabilities.py",
+      "sha256": "6ae03efeef2fcb6cba7bdd2d0e14b7c83ebde60ea7180afa58b138733db9f2dc",
+      "size": 17350
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_contracts.py",
+      "sha256": "0a3fd52ff5e45cb6aa325c922e45405a4486ca8b1d5b84e06fb864e87194d2ac",
+      "size": 6674
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_coordinator_runtime.py",
+      "sha256": "ef8e379c8b9204c724ab1edac3ea8006755ba3265ccbf49f75cfa8ed1de0e4af",
+      "size": 39200
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_pipeline_bridge.py",
+      "sha256": "a44f19ce2117ed1d22a0ccc3ae1c117581624f9baa27a32fd85cbbe027a49da4",
+      "size": 12525
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_runtime.py",
+      "sha256": "3687019a9aeb4d7e8fb5d1d701b687c9b26b39c1b80bc333d69e90a246d03571",
+      "size": 29386
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/conftest.py",
+      "sha256": "1d9d9dce5e81609cea5ed0eaf3f699b8032a893df766da418dea43e04d89178b",
+      "size": 1878
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_api_auth.py",
+      "sha256": "643d7916e24068cfc78acd6f60813ece916317eebede22ee180b687c68b8522c",
+      "size": 6930
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_portability.py",
+      "sha256": "69071b410b00a63145bf93b7a1257827f8df5b7ab976a314be2814f0665448ce",
+      "size": 3726
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_client_auth.py",
+      "sha256": "d0395c1ce758b64627b0fe22ba7924bcb2b68a47a3727ca62d4dd8079c03c833",
+      "size": 7472
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_combined_gemma_example.py",
+      "sha256": "b7484829b613f8a7618afa9b58c1c35cb881a1d757d548724bbb00c953a90dd2",
+      "size": 5088
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_export_public_source.py",
+      "sha256": "c426480f09faf3d76c2deb079e228dc6c02a5a81252e6e2930f72588b9de696c",
+      "size": 4319
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_isolation.py",
+      "sha256": "f56a160803eb0564cde30a510e22d3f9eeb94845055e1bb60d7ee1a8f680c57f",
+      "size": 837
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_portable_controller.py",
+      "sha256": "c92da17b600f44608d80fd0acd12acc22ad1437af1ea46616ae3c419e8e1e7c6",
+      "size": 1672
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_public_payload.py",
+      "sha256": "4017aa5e8f9b2a4436fe984c091c6ada402ee06592184fb66c5b4bc207ee0bcc",
+      "size": 6036
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_source_closure.py",
+      "sha256": "e71ed571bd0616609470cb33ed3f2afa8fd9d6300ca1271b379e381bc3f2cb41",
+      "size": 7015
+    }
+  ],
+  "schema_version": "gpumanager.exported-files.v1",
+  "source_manifest_sha256": "55e7363d58500e45aec22bc16243784b4dbd9e49a11710d371ef3635dc2069e0"
+}

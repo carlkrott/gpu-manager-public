@@ -1,0 +1,55 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and tooling
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Operator configuration, state and evidence
+.config/
+state/
+run/
+results/
+evidence/
+reports/
+audit/
+private-work/
+.hermes/
+
+# Credentials and certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Models, weights and generated media
+models/
+model-cache/
+outputs/
+*.gguf
+*.ggml
+*.safetensors
+*.ckpt
+*.onnx
+*.pt
+*.wav
+*.flac
+*.mp3
+*.mp4
+
+# Local archives and build products
+*.zip
+*.tar
+*.tar.gz
+*.whl
+build/
+dist/

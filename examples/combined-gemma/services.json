@@ -1,0 +1,48 @@
+{
+  "services": {
+    "member-primary": {
+      "enabled": false,
+      "port": 19001,
+      "forward_timeout": 60,
+      "cpu_only": false
+    },
+    "member-secondary": {
+      "enabled": false,
+      "port": 19002,
+      "forward_timeout": 60,
+      "cpu_only": true
+    },
+    "member-fallback": {
+      "enabled": false,
+      "port": 19003,
+      "forward_timeout": 60,
+      "cpu_only": true
+    }
+  },
+  "combined_gemma_broker": {
+    "enabled": true,
+    "ordered_members": [
+      "member-primary",
+      "member-secondary",
+      "member-fallback"
+    ],
+    "priority_values": {
+      "interactive": 0,
+      "normal": 10,
+      "background": 20
+    },
+    "aging_interval_seconds": 60,
+    "redis_namespace": "qual:combined-gemma:example:",
+    "leader_ttl_seconds": 15,
+    "heartbeat_seconds": 2,
+    "freshness_seconds": 10,
+    "context_safety_margin": 256,
+    "api_wait_timeout": 30,
+    "eta_recent_window_seconds": 300,
+    "eta_sparse_window_seconds": 3600,
+    "eta_min_samples": 3,
+    "lifecycle_mutation_enabled": false,
+    "sse_enabled": false,
+    "candidate_mode": true
+  }
+}
