@@ -40,8 +40,8 @@
     {
       "disposition": "core",
       "path": "README.md",
-      "sha256": "861768178c13f9fc88102e9bb0787d0c46cc93e196e431717be0d5ffb57026d1",
-      "size": 4635
+      "sha256": "e9a7519410b39c3d60cde76e0079a6ae20472b7b01537df4c03072cd68c4b305",
+      "size": 15573
     },
     {
       "disposition": "core",
@@ -681,5 +681,5 @@
     }
   ],
   "schema_version": "gpumanager.exported-files.v1",
-  "source_manifest_sha256": "55e7363d58500e45aec22bc16243784b4dbd9e49a11710d371ef3635dc2069e0"
+  "source_manifest_sha256": "da7e0efd783aa812a183f1a02e09d177def50ab7d4c841e6a1110e851c3785da"
 }
