@@ -73,19 +73,16 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
         disposition = entry.get("disposition")
         if disposition not in _ALLOWED_DISPOSITIONS:
             raise ExportError(f"unsupported disposition for {relative}: {disposition!r}")
-        digest = entry.get("sha256")
-        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            raise ExportError(f"sha256 must be lowercase hexadecimal for {relative}")
-        size = entry.get("size")
-        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-            raise ExportError(f"size must be a non-negative integer for {relative}")
         allow_large = entry.get("allow_large", False)
         if type(allow_large) is not bool:
             raise ExportError(f"allow_large must be boolean for {relative}")
         if allow_large and not isinstance(entry.get("rationale"), str):
             raise ExportError(f"allow_large requires rationale for {relative}")
-        result.append({"path": relative, "sha256": digest, "size": size, "disposition": disposition, "allow_large": allow_large})
-    return result
+        result.append({"path": relative, "disposition": disposition, "allow_large": allow_large})
+    declared_count = document.get("file_count")
+    if declared_count is not None and declared_count != len(result):
+        raise ExportError("manifest file_count does not match files")
+    return sorted(result, key=lambda item: item["path"])
 
 
 def _assert_regular_source(root: Path, relative: str) -> Path:
@@ -107,8 +104,6 @@ def _assert_regular_source(root: Path, relative: str) -> Path:
 
 def _assert_public_content(path: Path, entry: dict[str, Any], *, allow_large: bool) -> None:
     size = path.stat().st_size
-    if size != entry["size"]:
-        raise ExportError(f"size mismatch for {entry['path']}: manifest={entry['size']} actual={size}")
     if size > MAX_FILE_BYTES and not (allow_large and entry["allow_large"]):
         raise ExportError(f"file exceeds {MAX_FILE_BYTES} byte limit: {entry['path']}")
     if path.suffix.lower() in _BINARY_SUFFIXES:
@@ -117,8 +112,7 @@ def _assert_public_content(path: Path, entry: dict[str, Any], *, allow_large: bo
         sample = handle.read(4096)
     if b"\0" in sample or any(sample.startswith(magic) for magic in _ARCHIVE_MAGICS):
         raise ExportError(f"binary/archive content is not publishable: {entry['path']}")
-    if _sha256(path) != entry["sha256"]:
-        raise ExportError(f"SHA-256 mismatch for {entry['path']}")
+
 
 
 def export_public_source(

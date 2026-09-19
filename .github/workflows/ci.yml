@@ -53,7 +53,7 @@ jobs:
       - name: Check the public payload
         env:
           PYTHONPATH: scripts
-        run: python scripts/check_public_payload.py .
+        run: python scripts/check_public_payload.py . --manifest release/export-manifest.json
 
       - name: Check dependency versions and license metadata
         run: |

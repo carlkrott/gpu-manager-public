@@ -1,5 +1,5 @@
 {
-  "file_count": 113,
+  "file_count": 114,
   "files": [
     {
       "disposition": "utility",
@@ -10,8 +10,8 @@
     {
       "disposition": "utility",
       "path": ".github/workflows/ci.yml",
-      "sha256": "9a63db72af0ab5075c213106da9da0d48e6b6f0f7895486943cfaa026d340bfb",
-      "size": 4305
+      "sha256": "67118e3f66afa2739ce2adfbed5cc12ec5dcfc188092cdc4921689df4ee9fb54",
+      "size": 4345
     },
     {
       "disposition": "utility",
@@ -28,8 +28,8 @@
     {
       "disposition": "core",
       "path": "CONTRIBUTING.md",
-      "sha256": "3a941ed2c23565bf7b488c932f88a191248aa04c94d447274ee415fa69401a25",
-      "size": 1752
+      "sha256": "4b32f8368a083b33a4f65d4aacdc5f1c553bbbc071fe0dabb2d7f5c767646a5f",
+      "size": 1860
     },
     {
       "disposition": "core",
@@ -40,8 +40,8 @@
     {
       "disposition": "core",
       "path": "README.md",
-      "sha256": "e9a7519410b39c3d60cde76e0079a6ae20472b7b01537df4c03072cd68c4b305",
-      "size": 15573
+      "sha256": "e63910fd7258245f4b7d7dafdea80ec2605c568e498746ca4c07e4860fecb13d",
+      "size": 15882
     },
     {
       "disposition": "core",
@@ -84,6 +84,12 @@
       "path": "pytest.ini",
       "sha256": "cc71a3498de137f6bbba8e09ae76a52168d2b6d5a4dfbe1d59f674c4e621b9e2",
       "size": 78
+    },
+    {
+      "disposition": "utility",
+      "path": "release/public-files.json",
+      "sha256": "129143747656929d535b95bcf05458827c7f64039614edfd2db1fcf247bd4e5c",
+      "size": 10572
     },
     {
       "disposition": "utility",
@@ -136,8 +142,8 @@
     {
       "disposition": "utility",
       "path": "scripts/check_public_payload.py",
-      "sha256": "5c5e711ad934fe7efa6bbee3a1c0c116aaed4bf6e9b44640642e864dcc7ed84d",
-      "size": 6008
+      "sha256": "3946af57427b47dc64265ab384b247644e2edfae6d676015a3b7745da0437c2f",
+      "size": 9559
     },
     {
       "disposition": "core",
@@ -184,8 +190,8 @@
     {
       "disposition": "utility",
       "path": "scripts/export_public_source.py",
-      "sha256": "7bd864cf033ffe3db4986eb23aed830534d586898e1f220412d13b8380d0d77b",
-      "size": 8494
+      "sha256": "1ace2c4db55d04e3995757d8bc206bcd2c7162a874a46fb99ea014c130049874",
+      "size": 8017
     },
     {
       "disposition": "core",
@@ -652,8 +658,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_export_public_source.py",
-      "sha256": "c426480f09faf3d76c2deb079e228dc6c02a5a81252e6e2930f72588b9de696c",
-      "size": 4319
+      "sha256": "bf61827fc373ab4c98bfc3d31725c437262a06293739a836a49f3e872546ba4a",
+      "size": 5462
     },
     {
       "disposition": "core",
@@ -676,10 +682,10 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_source_closure.py",
-      "sha256": "e71ed571bd0616609470cb33ed3f2afa8fd9d6300ca1271b379e381bc3f2cb41",
-      "size": 7015
+      "sha256": "2e45c7beef560df90986c9d67044191bc277ce18ad74d72cfa81217f5faa7847",
+      "size": 7555
     }
   ],
   "schema_version": "gpumanager.exported-files.v1",
-  "source_manifest_sha256": "da7e0efd783aa812a183f1a02e09d177def50ab7d4c841e6a1110e851c3785da"
+  "source_manifest_sha256": "129143747656929d535b95bcf05458827c7f64039614edfd2db1fcf247bd4e5c"
 }

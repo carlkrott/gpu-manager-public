@@ -22,11 +22,11 @@ Contributions should keep this repository source-only, portable and fail-closed.
 From the repository root:
 
     PYTHONPATH=scripts python3 -m pytest -q tests/publication
-    PYTHONPATH=scripts python3 scripts/check_public_payload.py .
+    PYTHONPATH=scripts python3 scripts/check_public_payload.py . --manifest release/export-manifest.json
     python3 examples/combined-gemma/demo.py --dry-run
     python3 examples/combined-gemma/demo.py --mock-demo
 
-For manifest-affecting changes, refresh the SHA-256 and size records in `release/public-files.json`, export to a new destination, and rerun the checker against the exact export. Do not reuse an old export directory.
+For public file-set changes, update only the path/disposition entries in `release/public-files.json`. Export to a new destination to generate the SHA-256/size receipt, then rerun the checker against that exact export. Do not hand-edit receipt fields or reuse an old export directory.
 
 ## Pull requests
 

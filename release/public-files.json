@@ -1,0 +1,462 @@
+{
+  "file_count": 114,
+  "files": [
+    {
+      "disposition": "utility",
+      "path": ".github/dependabot.yml"
+    },
+    {
+      "disposition": "utility",
+      "path": ".github/workflows/ci.yml"
+    },
+    {
+      "disposition": "utility",
+      "path": ".gitignore"
+    },
+    {
+      "disposition": "utility",
+      "path": ".gitleaks.toml"
+    },
+    {
+      "disposition": "core",
+      "path": "CONTRIBUTING.md"
+    },
+    {
+      "disposition": "core",
+      "path": "LICENSE"
+    },
+    {
+      "disposition": "core",
+      "path": "README.md"
+    },
+    {
+      "disposition": "core",
+      "path": "SECURITY.md"
+    },
+    {
+      "disposition": "core",
+      "path": "THIRD_PARTY_NOTICES.md"
+    },
+    {
+      "disposition": "core",
+      "path": "examples/combined-gemma/README.md"
+    },
+    {
+      "disposition": "core",
+      "path": "examples/combined-gemma/demo.py"
+    },
+    {
+      "disposition": "core",
+      "path": "examples/combined-gemma/services.json"
+    },
+    {
+      "disposition": "core",
+      "path": "examples/empty/services.json"
+    },
+    {
+      "disposition": "utility",
+      "path": "pytest.ini"
+    },
+    {
+      "disposition": "utility",
+      "path": "release/public-files.json"
+    },
+    {
+      "disposition": "utility",
+      "path": "requirements-dev.lock"
+    },
+    {
+      "disposition": "utility",
+      "path": "requirements.lock"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/__init__.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/api_auth.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/backup_gpu_manager_state.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/build_comfyui_host_manifest.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/bundle_identity.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/bundle_lifecycle.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/check_public_payload.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/combined_gemma_broker_service.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/comfyui_workflow_sanitize.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/container_preflight.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/coordinator_provider_bridge.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/declarative_package.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/declarative_workflow_registration.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/execution_boundary.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/export_public_source.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/export_service_package.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/format_converter.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/__init__.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/admission.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/api.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/compat.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/compatibility.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/config.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/contracts.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/dispatcher.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/drain.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/events.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/acquire_leader.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/cancel_queued.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/member_drain.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/renew_leader.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/repair_dead_job.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/replace_job.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/requeue_claim.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/reserve_job.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/submit_job.lua"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/member_cache.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/member_observer.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/migrate.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/observability.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/probe_adapter.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/readiness.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/reconcile.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/recovery.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/redis_store.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/runtime.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/telemetry.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu-manager.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager_contracts.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager_pipeline_runtime.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager_semantics.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/import_service_package.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/lean_format.py"
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_custom_callbacks.py"
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_music3_adapter.py"
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_music3_generation_runner.py"
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_music3_preparation_contract.py"
+    },
+    {
+      "disposition": "portable_optional_integration",
+      "path": "scripts/minimax_recovered_callbacks.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/native_task_client.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/native_task_host.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/pipeline_coordinator.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/pipeline_http_provider.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/pipeline_provider_runtime.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/portable_defaults.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/queue_engine.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/queue_monitor.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/queue_monitor_analyze.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/registry_reconcile.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/requirements-gpu-manager.txt"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/retry_failed_coordinator_qc.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_contracts.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_controller.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_dependency_resolver.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_host_client.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_host_supervisor.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_state.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/runtime_supervisor.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/sanitize_registry.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/service_pipeline.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/service_revision.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/stage_dispatch.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/verify_provider_callback.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_capabilities.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_contracts.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_coordinator_runtime.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_pipeline_bridge.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/workflow_runtime.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/conftest.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_api_auth.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_portability.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_client_auth.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_combined_gemma_example.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_export_public_source.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_isolation.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_portable_controller.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_public_payload.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_source_closure.py"
+    }
+  ],
+  "schema_version": "gpumanager.public-files.v1"
+}
