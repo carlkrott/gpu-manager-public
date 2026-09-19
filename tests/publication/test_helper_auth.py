@@ -11,11 +11,13 @@ import pytest
 from native_task_client import native_host_has_unresolved
 from native_task_host import NativeTaskHost
 from runtime_host_client import (
+    HelperCredentialError,
     HelperTokenAuth,
     HostRuntimeClientError,
     HostSupervisorRuntimeAdapter,
+    resolve_required_service_credential,
 )
-from runtime_host_supervisor import create_app
+from runtime_host_supervisor import create_app, create_unauthenticated_test_app
 
 
 TOKEN = "synthetic-helper-token"
@@ -98,22 +100,9 @@ def test_runtime_supervisor_rejects_wrong_bearer_and_accepts_injected_token():
     asyncio.run(run())
 
 
-def test_runtime_supervisor_missing_configured_token_fails_closed(tmp_path):
-    class Supervisor:
-        async def execute(self, _request):
-            raise AssertionError("authentication must reject before execution")
-
-    async def run():
-        app = create_app(
-            Supervisor(), service_token_file=tmp_path / "missing-helper-token"
-        )
-        async with TestClient(TestServer(app)) as client:
-            response = await client.post(
-                "/v1/runtime/inspect", json={"action": "inspect"}
-            )
-            assert response.status == 503
-
-    asyncio.run(run())
+def test_runtime_supervisor_without_credential_fails_closed():
+    with pytest.raises(HelperCredentialError, match="helper service credential"):
+        create_app(object())
 
 
 def test_native_host_health_requires_injected_token(tmp_path):
@@ -150,3 +139,111 @@ def test_native_client_sends_token_to_health_endpoint():
 
     asyncio.run(run())
     assert seen["authorization"] == f"Bearer {TOKEN}"
+
+
+@pytest.mark.parametrize("token_file_kind", ["missing", "empty", "unreadable"])
+def test_required_service_credential_rejects_invalid_token_files(tmp_path, token_file_kind):
+    token_file = tmp_path / "helper-token"
+    if token_file_kind == "empty":
+        token_file.write_text("   ", encoding="utf-8")
+    elif token_file_kind == "unreadable":
+        token_file.write_bytes(b"\xff")
+
+    with pytest.raises(HelperCredentialError, match="helper service credential"):
+        resolve_required_service_credential(service_token_file=token_file)
+
+
+def test_runtime_supervisor_config_builder_requires_token_file(tmp_path):
+    class Supervisor:
+        async def execute(self, _request):
+            raise AssertionError("authentication must be configured before serving")
+
+    with pytest.raises(HelperCredentialError, match="helper service credential"):
+        create_app(Supervisor(), service_token_file=tmp_path / "missing-helper-token")
+
+
+@pytest.mark.parametrize("token_file_kind", ["missing", "empty", "unreadable"])
+def test_runtime_supervisor_config_builder_rejects_invalid_token_files(
+    tmp_path, token_file_kind
+):
+    token_file = tmp_path / "helper-token"
+    if token_file_kind == "empty":
+        token_file.write_text("", encoding="utf-8")
+    elif token_file_kind == "unreadable":
+        token_file.write_bytes(b"\xff")
+
+    with pytest.raises(HelperCredentialError, match="helper service credential"):
+        create_app(object(), service_token_file=token_file)
+
+
+
+def test_runtime_supervisor_config_builder_accepts_valid_token_file(tmp_path):
+    token_file = tmp_path / "helper-token"
+    token_file.write_text(TOKEN, encoding="utf-8")
+
+    app = create_app(object(), service_token_file=token_file)
+    assert isinstance(app, web.Application)
+
+
+def test_native_host_config_builder_requires_token_file(tmp_path):
+    with pytest.raises(HelperCredentialError, match="helper service credential"):
+        NativeTaskHost(
+            tmp_path / "state",
+            "http://127.0.0.1:9999/submit",
+            1,
+            service_token_file=tmp_path / "missing-helper-token",
+        )
+
+def test_native_host_without_credential_fails_closed(tmp_path):
+    with pytest.raises(HelperCredentialError, match="helper service credential"):
+        NativeTaskHost(tmp_path / "state", "http://127.0.0.1:9999/submit", 1)
+
+
+@pytest.mark.parametrize("token_file_kind", ["missing", "empty", "unreadable"])
+def test_native_host_config_builder_rejects_invalid_token_files(
+    tmp_path, token_file_kind
+):
+    token_file = tmp_path / "helper-token"
+    if token_file_kind == "empty":
+        token_file.write_text("", encoding="utf-8")
+    elif token_file_kind == "unreadable":
+        token_file.write_bytes(b"\xff")
+
+    with pytest.raises(HelperCredentialError, match="helper service credential"):
+        NativeTaskHost(
+            tmp_path / "state",
+            "http://127.0.0.1:9999/submit",
+            1,
+            service_token_file=token_file,
+        )
+
+
+
+def test_native_host_config_builder_accepts_valid_token_file(tmp_path):
+    token_file = tmp_path / "helper-token"
+    token_file.write_text(TOKEN, encoding="utf-8")
+
+    async def run():
+        host = NativeTaskHost(
+            tmp_path / "state",
+            "http://127.0.0.1:9999/submit",
+            1,
+            service_token_file=token_file,
+        )
+        async with TestClient(TestServer(host.app())) as client:
+            response = await client.get(
+                "/health", headers={"Authorization": f"Bearer {TOKEN}"}
+            )
+            assert response.status == 200
+
+    asyncio.run(run())
+
+
+def test_unauthenticated_test_seams_are_explicit(tmp_path):
+    app = create_unauthenticated_test_app(object())
+    host = NativeTaskHost.for_unauthenticated_test_app(
+        tmp_path / "state", "http://127.0.0.1:9999/submit", 1
+    )
+
+    assert isinstance(app, web.Application)
+    assert host.helper_auth.available()

@@ -31,12 +31,17 @@ HELPER_TOKEN_FILE_ENV = "GPU_MANAGER_HELPER_TOKEN_FILE"
 _MAX_TOKEN_BYTES = 4096
 
 
+class HelperCredentialError(RuntimeError):
+    """A required helper-service credential is missing or unusable."""
+
+
 class HelperTokenAuth:
     """Small bearer boundary shared by the portable helper clients/hosts.
 
-    Authentication is opt-in so neutral examples remain usable. Once a token
-    value or token file is configured, an unreadable/invalid file is treated as
-    unavailable and every request must carry the exact bearer token.
+    Authentication is optional for low-level client compatibility and explicit
+    test-only neutral apps. Production service builders must first call
+    :func:`resolve_required_service_credential`, so they never use this
+    optional mode accidentally.
     """
 
     def __init__(
@@ -44,8 +49,9 @@ class HelperTokenAuth:
         *,
         service_token: str | None = None,
         service_token_file: str | os.PathLike[str] | None = None,
+        use_environment: bool = True,
     ) -> None:
-        if service_token_file is None and service_token is None:
+        if use_environment and service_token_file is None and service_token is None:
             service_token_file = os.environ.get(HELPER_TOKEN_FILE_ENV)
         self._explicit_token = service_token
         self.token_file = Path(service_token_file) if service_token_file else None
@@ -90,6 +96,35 @@ class HelperTokenAuth:
             and bool(token)
             and hmac.compare_digest(token, expected)
         )
+
+
+def resolve_required_service_credential(
+    *,
+    service_token: str | None = None,
+    service_token_file: str | os.PathLike[str] | None = None,
+) -> str:
+    """Resolve a non-empty helper credential or fail before service startup.
+
+    Explicit values take precedence over the dedicated token-file environment
+    variable. Token files are read only; this helper never creates or writes
+    credential material.
+    """
+    if service_token_file is None and service_token is None:
+        service_token_file = os.environ.get(HELPER_TOKEN_FILE_ENV)
+    if service_token is not None:
+        token = service_token
+    elif service_token_file is not None:
+        try:
+            token = Path(service_token_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise HelperCredentialError(
+                "helper service credential is unavailable"
+            ) from exc
+    else:
+        raise HelperCredentialError("helper service credential is required")
+    if not isinstance(token, str) or not token or len(token) > _MAX_TOKEN_BYTES:
+        raise HelperCredentialError("helper service credential is invalid")
+    return token
 
 
 class HostRuntimeClientError(RuntimeError):

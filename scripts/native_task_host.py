@@ -20,7 +20,10 @@ import time
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from runtime_host_client import HelperTokenAuth
+from runtime_host_client import (
+    HelperTokenAuth,
+    resolve_required_service_credential,
+)
 
 
 def atomic_write(path: Path, content: bytes) -> None:
@@ -50,16 +53,29 @@ class NativeTaskHost:
         *,
         service_token: str | None = None,
         service_token_file: str | os.PathLike[str] | None = None,
+        allow_unauthenticated_test_app: bool = False,
     ):
+        """Construct the host; production construction requires a credential.
+
+        ``allow_unauthenticated_test_app`` is reserved for explicit neutral
+        in-process tests and must never be used by the CLI entrypoint.
+        """
+        if allow_unauthenticated_test_app:
+            if service_token is not None or service_token_file is not None:
+                raise ValueError("unauthenticated test app cannot receive credentials")
+            helper_auth = HelperTokenAuth(use_environment=False)
+        else:
+            credential = resolve_required_service_credential(
+                service_token=service_token, service_token_file=service_token_file
+            )
+            helper_auth = HelperTokenAuth(service_token=credential)
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.owner_lock = (self.root / ".owner.lock").open("a+")
         fcntl.flock(self.owner_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.upstream = upstream
         self.timeout = timeout
-        self.helper_auth = HelperTokenAuth(
-            service_token=service_token, service_token_file=service_token_file
-        )
+        self.helper_auth = helper_auth
         self.tasks: dict[str, asyncio.Task] = {}
         self.admission = asyncio.Lock()
         self.session: ClientSession | None = None
@@ -70,6 +86,18 @@ class NativeTaskHost:
             if record["status"] in {"accepted", "in_flight"}:
                 record.update(status="outcome_unknown", error="native_task_host_restarted")
                 self.save(path.parent, record)
+
+    @classmethod
+    def for_unauthenticated_test_app(
+        cls, root: Path, upstream: str, timeout: float
+    ) -> "NativeTaskHost":
+        """Construct a neutral unauthenticated host for in-process tests only."""
+        return cls(
+            root,
+            upstream,
+            timeout,
+            allow_unauthenticated_test_app=True,
+        )
 
     async def runtime_pid(self) -> int | None:
         process = await asyncio.create_subprocess_exec(

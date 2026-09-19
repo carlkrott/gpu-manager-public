@@ -466,8 +466,8 @@
     {
       "disposition": "core",
       "path": "scripts/native_task_host.py",
-      "sha256": "6c830bee2fc42ab2b5d17671b357d39c2907eee1483e089c5badfccd0e814ca0",
-      "size": 12035
+      "sha256": "bae5b7ffe086d65f99938622fa98c035c9f6d4db142dd5eb8325681907228c4d",
+      "size": 13156
     },
     {
       "disposition": "core",
@@ -556,14 +556,14 @@
     {
       "disposition": "core",
       "path": "scripts/runtime_host_client.py",
-      "sha256": "eb28d80067e22dc5b172c2bbe3403f791eef7d82ae88a34f2a14f04bde56018d",
-      "size": 10478
+      "sha256": "18a0db483be207271bca750c6c4bd73e1025e5522f4b9006aa02b3e866eb2267",
+      "size": 11865
     },
     {
       "disposition": "core",
       "path": "scripts/runtime_host_supervisor.py",
-      "sha256": "26add4e0f36a05fc224af571fb8ce33a798fe8645f27855322cc2de68699d880",
-      "size": 32545
+      "sha256": "2fcf3de9e65af3bb97cf84796210d2fdcdd351154862d971063f97bcd271ef39",
+      "size": 33499
     },
     {
       "disposition": "core",
@@ -688,8 +688,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_helper_auth.py",
-      "sha256": "aebd1f041956920192b884b2adbabd385eb648593954b176ef5ecf66e89f2793",
-      "size": 5453
+      "sha256": "b5dd068e275ff2bf8547598b1c189403da9c4f72eda635edd153fdbb9bf9eb18",
+      "size": 9049
     },
     {
       "disposition": "core",

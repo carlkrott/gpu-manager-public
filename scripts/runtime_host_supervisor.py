@@ -22,7 +22,12 @@ from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from runtime_host_client import ACTION_SCHEMA, HelperTokenAuth, RESULT_SCHEMA
+from runtime_host_client import (
+    ACTION_SCHEMA,
+    HelperTokenAuth,
+    RESULT_SCHEMA,
+    resolve_required_service_credential,
+)
 from runtime_contracts import (
     model_set_fingerprint,
     runtime_profile_fingerprint,
@@ -624,10 +629,22 @@ def create_app(
     *,
     service_token: str | None = None,
     service_token_file: str | os.PathLike[str] | None = None,
+    allow_unauthenticated_test_app: bool = False,
 ) -> web.Application:
-    helper_auth = HelperTokenAuth(
-        service_token=service_token, service_token_file=service_token_file
-    )
+    """Build the supervisor service app with startup-time auth resolution.
+
+    ``allow_unauthenticated_test_app`` is an explicit in-process test seam;
+    production entrypoints must leave it false.
+    """
+    if allow_unauthenticated_test_app:
+        if service_token is not None or service_token_file is not None:
+            raise ValueError("unauthenticated test app cannot receive credentials")
+        helper_auth = HelperTokenAuth(use_environment=False)
+    else:
+        credential = resolve_required_service_credential(
+            service_token=service_token, service_token_file=service_token_file
+        )
+        helper_auth = HelperTokenAuth(service_token=credential)
 
     async def handle(request: web.Request) -> web.Response:
         if not helper_auth.available():
@@ -660,6 +677,11 @@ def create_app(
     app = web.Application(client_max_size=128 * 1024)
     app.router.add_post("/v1/runtime/{action}", handle)
     return app
+
+
+def create_unauthenticated_test_app(supervisor: HostRuntimeSupervisor) -> web.Application:
+    """Return a neutral unauthenticated app for in-process tests only."""
+    return create_app(supervisor, allow_unauthenticated_test_app=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -711,5 +733,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "FENCE_SCHEMA", "FenceLedger", "HostRuntimeSupervisor", "HostSupervisorError",
-    "OVERLAY_SCHEMA", "create_app", "validate_overlay", "validate_overlay_profiles",
+    "OVERLAY_SCHEMA", "create_app", "create_unauthenticated_test_app",
+    "validate_overlay", "validate_overlay_profiles",
 ]
