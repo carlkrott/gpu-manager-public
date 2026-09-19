@@ -8,6 +8,8 @@ import json
 
 from aiohttp import ClientError, ClientTimeout
 
+from runtime_host_client import HelperTokenAuth, HostRuntimeClientError
+
 
 class NativeResponse:
     def __init__(self, status: int, body: bytes):
@@ -23,7 +25,17 @@ class NativeObservationError(RuntimeError):
 
 
 @asynccontextmanager
-async def native_task_request(session, *, host_url, task_id, body, on_state, admission_started=False):
+async def native_task_request(
+    session,
+    *,
+    host_url,
+    task_id,
+    body,
+    on_state,
+    admission_started=False,
+    service_token=None,
+    service_token_file=None,
+):
     """Admit once by immutable identity, then poll until a proved outcome.
 
     Cancellation disconnects this observer only. The native task host remains
@@ -34,6 +46,10 @@ async def native_task_request(session, *, host_url, task_id, body, on_state, adm
     request_sha = hashlib.sha256(json.dumps(json.loads(body), sort_keys=True,
                                            separators=(",", ":")).encode()).hexdigest()
     timeout = ClientTimeout(total=15, sock_connect=3)
+    helper_auth = HelperTokenAuth(
+        service_token=service_token, service_token_file=service_token_file
+    )
+    headers = helper_auth.headers()
     def observe(record):
         try:
             on_state(record)
@@ -45,7 +61,7 @@ async def native_task_request(session, *, host_url, task_id, body, on_state, adm
         try:
             # Before replaying even an idempotent admission, inspect its
             # durable identity. An earlier lost response may already own it.
-            async with session.get(task_url, timeout=timeout) as response:
+            async with session.get(task_url, timeout=timeout, headers=headers) as response:
                 if response.status == 404 and not accepted:
                     record = None
                 elif response.status == 200:
@@ -61,7 +77,7 @@ async def native_task_request(session, *, host_url, task_id, body, on_state, adm
                     raise NativeObservationError('native task submit intent could not be persisted')
                 accepted = True
                 async with session.post(task_url, data=body,
-                                        headers={"Content-Type": "application/json"},
+                                        headers={**headers, "Content-Type": "application/json"},
                                         timeout=timeout) as response:
                     if response.status not in {200, 202}:
                         message = (await response.text())[:250]
@@ -73,7 +89,8 @@ async def native_task_request(session, *, host_url, task_id, body, on_state, adm
             state = record.get("status", "outcome_unknown")
             observe(record)
             if state in {"completed", "failed"}:
-                async with session.get(task_url + "/result", timeout=timeout) as response:
+                async with session.get(task_url + "/result", timeout=timeout,
+                                       headers=headers) as response:
                     if response.status != 200:
                         raise NativeObservationError(f"native_task_result_http_{response.status}")
                     raw = await response.read()
@@ -95,14 +112,25 @@ async def native_task_request(session, *, host_url, task_id, body, on_state, adm
         await asyncio.sleep(2)
 
 
-async def native_host_has_unresolved(session, host_url: str) -> bool:
+async def native_host_has_unresolved(
+    session,
+    host_url: str,
+    *,
+    service_token=None,
+    service_token_file=None,
+) -> bool:
     """Fail closed before unloading an engine owned by the task host."""
     try:
+        helper_auth = HelperTokenAuth(
+            service_token=service_token, service_token_file=service_token_file
+        )
+        headers = helper_auth.headers()
         async with session.get(host_url.rstrip("/") + "/health",
-                               timeout=ClientTimeout(total=5)) as response:
+                               timeout=ClientTimeout(total=5),
+                               headers=headers) as response:
             if response.status != 200:
                 return True
             data = await response.json()
         return data.get("status") != "ok" or not isinstance(data.get("unresolved_tasks"), list) or bool(data["unresolved_tasks"])
-    except (ClientError, asyncio.TimeoutError, ValueError):
+    except (ClientError, asyncio.TimeoutError, ValueError, HostRuntimeClientError):
         return True

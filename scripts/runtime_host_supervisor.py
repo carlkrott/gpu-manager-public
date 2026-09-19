@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from runtime_host_client import ACTION_SCHEMA, RESULT_SCHEMA
+from runtime_host_client import ACTION_SCHEMA, HelperTokenAuth, RESULT_SCHEMA
 from runtime_contracts import (
     model_set_fingerprint,
     runtime_profile_fingerprint,
@@ -619,8 +619,32 @@ class HostRuntimeSupervisor:
             return result
 
 
-def create_app(supervisor: HostRuntimeSupervisor) -> web.Application:
+def create_app(
+    supervisor: HostRuntimeSupervisor,
+    *,
+    service_token: str | None = None,
+    service_token_file: str | os.PathLike[str] | None = None,
+) -> web.Application:
+    helper_auth = HelperTokenAuth(
+        service_token=service_token, service_token_file=service_token_file
+    )
+
     async def handle(request: web.Request) -> web.Response:
+        if not helper_auth.available():
+            return web.json_response(
+                {"error": "helper service authentication is unavailable"},
+                status=503,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not helper_auth.authorized(request):
+            return web.json_response(
+                {"error": "helper service authentication required"},
+                status=401,
+                headers={
+                    "Cache-Control": "no-store",
+                    "WWW-Authenticate": "Bearer",
+                },
+            )
         try:
             body = await request.json()
             if not isinstance(body, Mapping):
@@ -645,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fence-ledger", type=Path, default=Path("/var/lib/gpu-manager-host/fences.json"))
     parser.add_argument("--profiles-root", type=Path)
     parser.add_argument("--model-sets-root", type=Path)
+    parser.add_argument("--token-file", type=Path)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     overlay = _load_json(args.overlay)
@@ -670,7 +695,11 @@ def main(argv: list[str] | None = None) -> int:
     supervisor = HostRuntimeSupervisor(overlay, FenceLedger(args.fence_ledger))
     old_umask = os.umask(0o007)
     try:
-        web.run_app(create_app(supervisor), path=str(args.socket), print=None)
+        web.run_app(
+            create_app(supervisor, service_token_file=args.token_file),
+            path=str(args.socket),
+            print=None,
+        )
     finally:
         os.umask(old_umask)
     return 0

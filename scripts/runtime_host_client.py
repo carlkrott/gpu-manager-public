@@ -8,6 +8,7 @@ the host supervisor's separately reviewed overlay.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hmac
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,68 @@ _ACTIONS = frozenset(
 )
 _OBSERVATION_ACTIONS = frozenset({"inspect", "health", "reconcile"})
 _MAX_RESPONSE_BYTES = 1024 * 1024
+HELPER_TOKEN_FILE_ENV = "GPU_MANAGER_HELPER_TOKEN_FILE"
+_MAX_TOKEN_BYTES = 4096
+
+
+class HelperTokenAuth:
+    """Small bearer boundary shared by the portable helper clients/hosts.
+
+    Authentication is opt-in so neutral examples remain usable. Once a token
+    value or token file is configured, an unreadable/invalid file is treated as
+    unavailable and every request must carry the exact bearer token.
+    """
+
+    def __init__(
+        self,
+        *,
+        service_token: str | None = None,
+        service_token_file: str | os.PathLike[str] | None = None,
+    ) -> None:
+        if service_token_file is None and service_token is None:
+            service_token_file = os.environ.get(HELPER_TOKEN_FILE_ENV)
+        self._explicit_token = service_token
+        self.token_file = Path(service_token_file) if service_token_file else None
+        self.configured = service_token is not None or self.token_file is not None
+
+    def _token(self) -> str | None:
+        if self._explicit_token is not None:
+            token = self._explicit_token
+        elif self.token_file is not None:
+            try:
+                token = self.token_file.read_text(encoding="utf-8")[: _MAX_TOKEN_BYTES + 1].strip()
+            except (OSError, UnicodeError):
+                return None
+        else:
+            return None
+        if not isinstance(token, str) or not token or len(token) > _MAX_TOKEN_BYTES:
+            return None
+        return token
+
+    def headers(self) -> dict[str, str]:
+        if not self.configured:
+            return {}
+        token = self._token()
+        if token is None:
+            raise HostRuntimeClientError("helper service token is unavailable")
+        return {"Authorization": f"Bearer {token}"}
+
+    def available(self) -> bool:
+        return not self.configured or self._token() is not None
+
+    def authorized(self, request: Any) -> bool:
+        if not self.configured:
+            return True
+        expected = self._token()
+        if expected is None:
+            return False
+        provided = request.headers.get("Authorization", "")
+        prefix = "Bearer "
+        return (
+            provided.startswith(prefix)
+            and bool(provided[len(prefix) :])
+            and hmac.compare_digest(provided[len(prefix) :], expected)
+        )
 
 
 class HostRuntimeClientError(RuntimeError):
@@ -41,6 +104,8 @@ class HostSupervisorRuntimeAdapter:
         profile_name: str,
         socket_path: str | os.PathLike[str] | None = None,
         timeout_seconds: float = 30.0,
+        service_token: str | None = None,
+        service_token_file: str | os.PathLike[str] | None = None,
     ) -> None:
         if not isinstance(profile_name, str) or not profile_name.strip():
             raise HostRuntimeClientError("profile_name must be non-empty")
@@ -51,6 +116,9 @@ class HostSupervisorRuntimeAdapter:
             or DEFAULT_SOCKET_PATH
         )
         self.timeout_seconds = max(1.0, min(float(timeout_seconds), 300.0))
+        self._helper_auth = HelperTokenAuth(
+            service_token=service_token, service_token_file=service_token_file
+        )
         self._transition_owner: str | None = None
         self._transition_fence: int | None = None
 
@@ -76,6 +144,7 @@ class HostSupervisorRuntimeAdapter:
             raise HostRuntimeClientError("instance_id must be non-empty")
         if self._transition_owner is None or self._transition_fence is None:
             raise HostRuntimeClientError("runtime adapter has no bound transition fence")
+        self._helper_auth.headers()
         errors = validate_runtime_profile(self.profile_name, profile)
         if errors:
             raise HostRuntimeClientError("invalid runtime profile: " + "; ".join(errors))
@@ -96,12 +165,14 @@ class HostSupervisorRuntimeAdapter:
         self, action: str, instance_id: str, profile: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         payload = self._request(action, instance_id, profile)
+        headers = self._helper_auth.headers()
         connector = UnixConnector(path=str(self.socket_path))
         timeout = ClientTimeout(total=self.timeout_seconds)
         try:
             async with ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.post(
-                    f"http://localhost/v1/runtime/{action}", json=payload
+                    f"http://localhost/v1/runtime/{action}", json=payload,
+                    headers=headers,
                 ) as response:
                     raw = await response.content.read(_MAX_RESPONSE_BYTES + 1)
                     if len(raw) > _MAX_RESPONSE_BYTES:
@@ -178,6 +249,8 @@ class HostSupervisorRuntimeAdapter:
 __all__ = [
     "ACTION_SCHEMA",
     "DEFAULT_SOCKET_PATH",
+    "HELPER_TOKEN_FILE_ENV",
+    "HelperTokenAuth",
     "HostRuntimeClientError",
     "HostSupervisorRuntimeAdapter",
     "RESULT_SCHEMA",

@@ -20,6 +20,8 @@ import time
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from runtime_host_client import HelperTokenAuth
+
 
 def atomic_write(path: Path, content: bytes) -> None:
     fd, temporary = tempfile.mkstemp(prefix=".commit-", dir=path.parent)
@@ -40,13 +42,24 @@ def atomic_write(path: Path, content: bytes) -> None:
 
 
 class NativeTaskHost:
-    def __init__(self, root: Path, upstream: str, timeout: float):
+    def __init__(
+        self,
+        root: Path,
+        upstream: str,
+        timeout: float,
+        *,
+        service_token: str | None = None,
+        service_token_file: str | os.PathLike[str] | None = None,
+    ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.owner_lock = (self.root / ".owner.lock").open("a+")
         fcntl.flock(self.owner_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.upstream = upstream
         self.timeout = timeout
+        self.helper_auth = HelperTokenAuth(
+            service_token=service_token, service_token_file=service_token_file
+        )
         self.tasks: dict[str, asyncio.Task] = {}
         self.admission = asyncio.Lock()
         self.session: ClientSession | None = None
@@ -191,7 +204,28 @@ class NativeTaskHost:
                 await asyncio.gather(*list(self.tasks.values()), return_exceptions=True)
 
     def app(self) -> web.Application:
-        app = web.Application(client_max_size=1024 * 1024)
+        @web.middleware
+        async def helper_auth_middleware(request: web.Request, handler):
+            if not self.helper_auth.available():
+                return web.json_response(
+                    {"error": "helper service authentication is unavailable"},
+                    status=503,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if not self.helper_auth.authorized(request):
+                return web.json_response(
+                    {"error": "helper service authentication required"},
+                    status=401,
+                    headers={
+                        "Cache-Control": "no-store",
+                        "WWW-Authenticate": "Bearer",
+                    },
+                )
+            return await handler(request)
+
+        app = web.Application(
+            client_max_size=1024 * 1024, middlewares=[helper_auth_middleware]
+        )
         app.cleanup_ctx.append(self.lifecycle)
         app.router.add_get("/health", self.health)
         app.router.add_post("/tasks/{task_id}", self.submit)
@@ -207,8 +241,14 @@ def main():
     parser.add_argument("--upstream", default="http://127.0.0.1:8133/v1/tasks/run")
     parser.add_argument("--port", type=int, default=8134)
     parser.add_argument("--timeout", type=float, default=7200)
+    parser.add_argument("--token-file", type=Path)
     args = parser.parse_args()
-    host = NativeTaskHost(args.state_dir, args.upstream, args.timeout)
+    host = NativeTaskHost(
+        args.state_dir,
+        args.upstream,
+        args.timeout,
+        service_token_file=args.token_file,
+    )
     # Loopback only: this is a controller adapter, never public generation ingress.
     web.run_app(host.app(), host="127.0.0.1", port=args.port)
 
