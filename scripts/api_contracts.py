@@ -19,6 +19,7 @@ MAX_IDENTIFIER_LENGTH = 128
 MAX_STRING_LENGTH = 256
 MAX_LIST_ITEMS = 100
 MAX_ERROR_MESSAGE_LENGTH = 256
+MAX_REDACT_KEY_LENGTH = 64
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _AUTH_VALUE_RE = re.compile(r"(?i)(\bAuthorization\s*:\s*)(Bearer\s+)?[^\s,;&]+")
@@ -32,13 +33,20 @@ _SECRET_KEYS = frozenset(
         "api_key",
         "authorization",
         "client_secret",
+        "cookie",
         "credential",
         "credentials",
+        "csrf",
+        "csrf_token",
+        "jwt",
         "password",
         "private_key",
         "refresh_token",
         "secret",
+        "session",
         "token",
+        "xsrf",
+        "xsrf_token",
     }
 )
 
@@ -222,14 +230,34 @@ def _redact_text(value: str) -> str:
     return _SECRET_VALUE_RE.sub(r"\1<redacted>", value)
 
 
+def _safe_key_text(key: Any) -> str | None:
+    """Normalise a mapping key to a bounded UTF-8 string, skipping unsafe ones."""
+    if isinstance(key, str):
+        text = key
+    elif isinstance(key, (bytes, bytearray, memoryview)):
+        try:
+            text = bytes(key).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    else:
+        # Non-string/bytes keys (ints, tuples, objects) are skipped so the
+        # caller cannot leak arbitrary repr noise through the envelope.
+        return None
+    if not text:
+        return None
+    return text[:MAX_REDACT_KEY_LENGTH]
+
+
 def _redact(value: Any, *, depth: int = 0) -> Any:
     if depth > 4:
         return "<redacted>"
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for key, child in list(value.items())[:MAX_LIST_ITEMS]:
-            key_text = str(key)
-            if key_text.lower() in _SECRET_KEYS:
+            key_text = _safe_key_text(key)
+            if key_text is None:
+                continue
+            if any(needle in key_text.lower() for needle in _SECRET_KEYS):
                 result[key_text] = "<redacted>"
             else:
                 result[key_text] = _redact(child, depth=depth + 1)
@@ -253,6 +281,11 @@ def error_envelope(
     details: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the stable public error shape without leaking secret material."""
+    if details is not None and not isinstance(details, Mapping):
+        raise ContractError(
+            "invalid_details",
+            "details must be a mapping of string keys to JSON values",
+        )
     safe_code = code if is_safe_identifier(code) else "internal_error"
     safe_status = (
         status
