@@ -519,6 +519,12 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/reseal_service_package.py",
+      "sha256": "45b3d7d2887c26a8372dd505c5e8241c0ac3af1bd03c86f81d7f3e3b7f2ecdeb",
+      "size": 10804
+    },
+    {
+      "disposition": "core",
       "path": "scripts/retry_failed_coordinator_qc.py",
       "sha256": "98f0db6694966f0eb7c23c876055da31efdb654338bb0f776399b0397c929187",
       "size": 4675
@@ -678,6 +684,12 @@
       "path": "tests/publication/test_public_payload.py",
       "sha256": "4017aa5e8f9b2a4436fe984c091c6ada402ee06592184fb66c5b4bc207ee0bcc",
       "size": 6036
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_reseal_service_package.py",
+      "sha256": "f9f841c7d4d257263b5c5f8463c317d08bf7dd9d80ec020ea51234c5f24afbe4",
+      "size": 5740
     },
     {
       "disposition": "core",
