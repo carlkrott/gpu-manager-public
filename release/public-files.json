@@ -1,5 +1,5 @@
 {
-  "file_count": 114,
+  "file_count": 121,
   "files": [
     {
       "disposition": "utility",
@@ -76,6 +76,10 @@
     {
       "disposition": "core",
       "path": "scripts/api_auth.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/api_contracts.py"
     },
     {
       "disposition": "core",
@@ -347,6 +351,10 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/reseal_service_package.py"
+    },
+    {
+      "disposition": "core",
       "path": "scripts/retry_failed_coordinator_qc.py"
     },
     {
@@ -427,6 +435,10 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_api_contracts.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_broker_portability.py"
     },
     {
@@ -439,7 +451,15 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_embedded_broker_visibility.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_export_public_source.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_helper_auth.py"
     },
     {
       "disposition": "core",
@@ -452,6 +472,14 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_public_payload.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_reaper_state_and_probe.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_reseal_service_package.py"
     },
     {
       "disposition": "core",

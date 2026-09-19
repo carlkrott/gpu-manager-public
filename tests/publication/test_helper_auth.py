@@ -10,7 +10,11 @@ import pytest
 
 from native_task_client import native_host_has_unresolved
 from native_task_host import NativeTaskHost
-from runtime_host_client import HostRuntimeClientError, HostSupervisorRuntimeAdapter
+from runtime_host_client import (
+    HelperTokenAuth,
+    HostRuntimeClientError,
+    HostSupervisorRuntimeAdapter,
+)
 from runtime_host_supervisor import create_app
 
 
@@ -40,6 +44,13 @@ def test_runtime_client_uses_dedicated_token_file_and_never_controller_token(tmp
     payload = adapter._request("inspect", "instance", _profile())
     assert adapter._helper_auth.headers() == {"Authorization": f"Bearer {TOKEN}"}
     assert "GPU_MANAGER_API_TOKEN" not in json.dumps(payload)
+
+
+def test_helper_auth_scheme_is_case_insensitive_but_token_remains_exact():
+    auth = HelperTokenAuth(service_token=TOKEN)
+    request = type("Request", (), {"headers": {"Authorization": f"bEaReR {TOKEN}"}})()
+
+    assert auth.authorized(request)
 
 
 def test_runtime_client_rejects_configured_missing_token_without_connecting(tmp_path):

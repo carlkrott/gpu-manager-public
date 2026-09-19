@@ -83,11 +83,12 @@ class HelperTokenAuth:
         if expected is None:
             return False
         provided = request.headers.get("Authorization", "")
-        prefix = "Bearer "
+        scheme, separator, token = provided.partition(" ")
         return (
-            provided.startswith(prefix)
-            and bool(provided[len(prefix) :])
-            and hmac.compare_digest(provided[len(prefix) :], expected)
+            separator == " "
+            and scheme.lower() == "bearer"
+            and bool(token)
+            and hmac.compare_digest(token, expected)
         )
 
 

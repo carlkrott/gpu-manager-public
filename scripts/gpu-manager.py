@@ -3430,6 +3430,55 @@ ORPHAN_REAPER_TARGET_NAMES = (
     "sglang",
 )
 
+
+def _orphan_reaper_status(*, now: float | None = None) -> dict[str, Any]:
+    """Return explicit orphan-reaper state without treating maintenance as healthy."""
+    current = time.time() if now is None else float(now)
+    state: dict[str, Any] = {
+        "enabled": bool(ORPHAN_REAPER_ENABLED),
+        "interval_s": ORPHAN_REAPER_INTERVAL_S,
+        "grace_s": ORPHAN_REAPER_GRACE_S,
+        "vram_threshold_mib": ORPHAN_REAPER_VRAM_THRESHOLD_MB,
+        "target_names": list(ORPHAN_REAPER_TARGET_NAMES),
+        "state": "disabled",
+        "reason": "configuration_disabled",
+        "last_tick_age_s": None,
+        "last_tick_ts": None,
+        "expected_pids": [],
+        "terminated_pids": {},
+    }
+    if not ORPHAN_REAPER_ENABLED:
+        return state
+
+    manager = scheduler
+    last_tick = float(getattr(manager, "_last_orphan_reaper_at", 0.0) or 0.0)
+    state["last_tick_ts"] = last_tick or None
+    state["last_tick_age_s"] = current - last_tick if last_tick > 0 else None
+    if manager is not None:
+        state["expected_pids"] = sorted(
+            int(pid) for pid in (getattr(manager, "_expected_pids", set()) or set())
+        )
+        state["terminated_pids"] = {
+            int(pid): float(ts)
+            for pid, ts in (getattr(manager, "_terminated_pids", {}) or {}).items()
+        }
+
+    config = _services_config if isinstance(_services_config, Mapping) else {}
+    scheduling = config.get("scheduling", {}) or {}
+    if scheduling.get("maintenance_mode") is True:
+        state.update(state="paused", reason="maintenance_mode")
+    elif manager is None or getattr(manager, "_running", False) is not True:
+        state.update(state="paused", reason="scheduler_not_running")
+    elif (
+        state["last_tick_age_s"] is None
+        or state["last_tick_age_s"] > max(ORPHAN_REAPER_INTERVAL_S * 2, 60.0)
+    ):
+        state.update(state="paused", reason="stale_tick")
+    else:
+        state.update(state="running", reason="fresh_tick")
+    return state
+
+
 # ── Lifecycle Transition Templates ─────────────────────────────────────
 
 TRANSITION_STEPS = {
@@ -3579,6 +3628,46 @@ def _get_idle_service_name(gpu_id: str | None = None) -> str:
         if unit:
             return unit
     return LLM_SERVICE_NAME_DEFAULT
+
+
+def _configured_llm_health_target(config: Mapping[str, Any] | None = None) -> tuple[str, str] | None:
+    """Resolve an explicit registry-owned LLM health target.
+
+    The controller must not probe an environment default when the registry has
+    no idle service.  A target is valid only when its service is enabled and
+    supplies a bounded port and path.
+    """
+    selected = _load_services_config() if config is None else config
+    scheduling = selected.get("scheduling", {}) or {}
+    services = selected.get("services", {}) or {}
+    candidates: list[str] = []
+    global_idle = scheduling.get("idle_service")
+    if isinstance(global_idle, str) and global_idle:
+        candidates.append(global_idle)
+    per_gpu = scheduling.get("idle_services", {}) or {}
+    if isinstance(per_gpu, Mapping):
+        candidates.extend(
+            name for name in per_gpu.values()
+            if isinstance(name, str) and name
+        )
+    for service_name in dict.fromkeys(candidates):
+        service = services.get(service_name)
+        if not isinstance(service, Mapping) or service.get("enabled") is not True:
+            continue
+        port = service.get("port")
+        health_path = service.get("health_path") or "/health"
+        if type(port) is not int or not (1 <= port <= 65535):
+            continue
+        if (
+            not isinstance(health_path, str)
+            or not health_path.startswith("/")
+            or "//" in health_path
+            or len(health_path) > 256
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in health_path)
+        ):
+            continue
+        return f"http://127.0.0.1:{port}{health_path}", service_name
+    return None
 
 
 def _get_loaded_runtime_snapshot() -> dict:
@@ -9001,16 +9090,29 @@ class LLMProxy:
         self._llm_ready_event.set()
 
     async def check_health(self) -> bool:
+        target = _configured_llm_health_target()
+        if target is None:
+            self.logger.debug("LLM health check skipped: no configured registry idle service")
+            return False
+        if self.session is None or self.session.closed:
+            self.logger.debug("LLM health check skipped: HTTP session unavailable")
+            return False
+        url, service_name = target
         try:
             async with self.session.get(
-                f"{LLM_BACKEND_URL}/health",
+                url,
                 timeout=ClientTimeout(total=5, connect=3),
             ) as resp:
                 ok = resp.status == 200
                 if ok:
                     body = await resp.json()
                     ok = body.get("status") == "ok"
-                self.logger.debug(f"LLM health check: {resp.status} ok={ok}")
+                self.logger.debug(
+                    "LLM health check service=%s status=%s ok=%s",
+                    service_name,
+                    resp.status,
+                    ok,
+                )
                 return ok
         except Exception as e:
             self.logger.warning(f"LLM health check failed: {e}")
@@ -17539,35 +17641,9 @@ async def handle_health(request: web.Request):
         now=now_ts,
     )
     # ── Phase 5.2.69: orphan-reaper summary ──────────────────────────
-    # Surface the reaper state on /health so dashboards can show
-    # 'expected_pids / terminated_pids / last_tick_age'. Read-only;
-    # all counters live on the scheduler.
-    try:
-        _reaper_state = {
-            "enabled": bool(ORPHAN_REAPER_ENABLED),
-            "interval_s": ORPHAN_REAPER_INTERVAL_S,
-            "grace_s": ORPHAN_REAPER_GRACE_S,
-            "vram_threshold_mib": ORPHAN_REAPER_VRAM_THRESHOLD_MB,
-            "target_names": list(ORPHAN_REAPER_TARGET_NAMES),
-        }
-        if scheduler is not None:
-            _now = time.time()
-            _last = float(getattr(scheduler, "_last_orphan_reaper_at", 0.0) or 0.0)
-            _reaper_state["expected_pids"] = sorted(
-                int(p) for p in (getattr(scheduler, "_expected_pids", set()) or set())
-            )
-            _reaper_state["terminated_pids"] = {
-                int(pid): float(ts)
-                for pid, ts in (getattr(scheduler, "_terminated_pids", {}) or {}).items()
-            }
-            _reaper_state["last_tick_age_s"] = (
-                (_now - _last) if _last > 0 else None
-            )
-            _reaper_state["last_tick_ts"] = _last
-        status["orphan_reaper"] = _reaper_state
-    except Exception as _orphan_health_err:
-        logger.debug(f"orphan reaper health summary failed: {_orphan_health_err}")
-        status["orphan_reaper"] = {"enabled": bool(ORPHAN_REAPER_ENABLED), "error": str(_orphan_health_err)}
+    # Keep maintenance, disabled and stale-tick states explicit; an enabled
+    # reaper that cannot tick is not healthy.
+    status["orphan_reaper"] = _orphan_reaper_status()
     _apply_runtime_semantics(status, readiness)
     return web.json_response(status)
 
@@ -22511,6 +22587,16 @@ def _apply_combined_gemma_visibility(
 
 
 async def _fetch_combined_gemma_visibility() -> tuple[dict | None, str | None]:
+    if _combined_gemma_broker_embedded():
+        try:
+            payload = _combined_gemma_api_proxy.broker_metrics()
+            if inspect.isawaitable(payload):
+                payload = await payload
+            if not isinstance(payload, dict):
+                return None, "broker_invalid_json"
+            return payload, None
+        except Exception as exc:
+            return None, f"broker_unavailable:{type(exc).__name__}"
     if session is None or session.closed:
         return None, "http_session_unavailable"
     url = os.environ.get(
@@ -22659,9 +22745,14 @@ async def _llm_readiness_snapshot(config: dict) -> dict:
     pinned = await _probe_configured_llm_service(
         config, runtime_pin or scheduling.get("pinned_service")
     )
+    idle_target = _configured_llm_health_target(config)
     idle = {
         "configured": scheduling.get("idle_service"), "healthy": bool(llm._llm_healthy),
-        "reason": "ready" if llm._llm_healthy else "legacy_idle_probe_unready",
+        "reason": (
+            "ready"
+            if llm._llm_healthy
+            else ("not_configured" if idle_target is None else "registry_probe_unready")
+        ),
     }
     return _reduce_llm_readiness(combined_router=combined, pinned_route=pinned, idle_route=idle)
 

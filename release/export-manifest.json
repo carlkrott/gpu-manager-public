@@ -1,5 +1,5 @@
 {
-  "file_count": 114,
+  "file_count": 121,
   "files": [
     {
       "disposition": "utility",
@@ -88,8 +88,8 @@
     {
       "disposition": "utility",
       "path": "release/public-files.json",
-      "sha256": "129143747656929d535b95bcf05458827c7f64039614edfd2db1fcf247bd4e5c",
-      "size": 10572
+      "sha256": "572629f72882d049d768c9adfb0be16883b762c47b0c0e6d0324c016e843ff02",
+      "size": 11266
     },
     {
       "disposition": "utility",
@@ -114,6 +114,12 @@
       "path": "scripts/api_auth.py",
       "sha256": "f2b9e3905578c6c18ec986974abde6b092f510913c6e5e07d84790dbe8f49419",
       "size": 6372
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/api_contracts.py",
+      "sha256": "134841625424abf2145d86fc96ca8d95a0949714e7b5ece42548ef13012b7733",
+      "size": 10540
     },
     {
       "disposition": "core",
@@ -388,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "4834d98a484e5e79b74efe928bdb7be10ba874530ea25c6b3ae54ecc58032f78",
-      "size": 1888307
+      "sha256": "efacc4798cb440225cd78052aa696a7cd29c52a0600fa5500c2b2174e860ae86",
+      "size": 1891817
     },
     {
       "disposition": "core",
@@ -454,14 +460,14 @@
     {
       "disposition": "core",
       "path": "scripts/native_task_client.py",
-      "sha256": "657649b776b5766937d6006c0918f6a104603ef715a602946a3560bb6e6b963e",
-      "size": 5219
+      "sha256": "f0842f337e70235d60238cfe5fddc919b4b9dbb4cf7823cbac19724c9da4ffc0",
+      "size": 5923
     },
     {
       "disposition": "core",
       "path": "scripts/native_task_host.py",
-      "sha256": "93166c31bbc89e336e667ed9a30a43845f6c5e5da0520f60b8c9a252f52e308b",
-      "size": 10708
+      "sha256": "6c830bee2fc42ab2b5d17671b357d39c2907eee1483e089c5badfccd0e814ca0",
+      "size": 12035
     },
     {
       "disposition": "core",
@@ -550,14 +556,14 @@
     {
       "disposition": "core",
       "path": "scripts/runtime_host_client.py",
-      "sha256": "9635676c61685798c9de94e244f799da438e449cf1b565926fd18e6e92335f63",
-      "size": 7729
+      "sha256": "eb28d80067e22dc5b172c2bbe3403f791eef7d82ae88a34f2a14f04bde56018d",
+      "size": 10478
     },
     {
       "disposition": "core",
       "path": "scripts/runtime_host_supervisor.py",
-      "sha256": "6085aaa51eaa6ee6a26bf8a4f34afff7f6e3afa4cff744b94deb040d8d32689f",
-      "size": 31572
+      "sha256": "26add4e0f36a05fc224af571fb8ce33a798fe8645f27855322cc2de68699d880",
+      "size": 32545
     },
     {
       "disposition": "core",
@@ -645,6 +651,12 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_api_contracts.py",
+      "sha256": "a528caa899321b790f851fcecb8347ffc6ed3312e36cbbb3ffeb62ab8d4ff57f",
+      "size": 5934
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_broker_portability.py",
       "sha256": "69071b410b00a63145bf93b7a1257827f8df5b7ab976a314be2814f0665448ce",
       "size": 3726
@@ -663,9 +675,21 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_embedded_broker_visibility.py",
+      "sha256": "6fbe9a4bc93d7c510e2268adffe3bf496ff92c0c8beb0fe3cb6c5b2632736eac",
+      "size": 2407
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_export_public_source.py",
       "sha256": "bf61827fc373ab4c98bfc3d31725c437262a06293739a836a49f3e872546ba4a",
       "size": 5462
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_helper_auth.py",
+      "sha256": "aebd1f041956920192b884b2adbabd385eb648593954b176ef5ecf66e89f2793",
+      "size": 5453
     },
     {
       "disposition": "core",
@@ -687,6 +711,12 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_reaper_state_and_probe.py",
+      "sha256": "7727f83fb1458ab08870f4eefa0011144b8d144ba2ab33a6f22bc3a713fa5643",
+      "size": 3981
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_reseal_service_package.py",
       "sha256": "f9f841c7d4d257263b5c5f8463c317d08bf7dd9d80ec020ea51234c5f24afbe4",
       "size": 5740
@@ -699,5 +729,5 @@
     }
   ],
   "schema_version": "gpumanager.exported-files.v1",
-  "source_manifest_sha256": "129143747656929d535b95bcf05458827c7f64039614edfd2db1fcf247bd4e5c"
+  "source_manifest_sha256": "572629f72882d049d768c9adfb0be16883b762c47b0c0e6d0324c016e843ff02"
 }
