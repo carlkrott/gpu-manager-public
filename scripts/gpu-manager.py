@@ -82,6 +82,11 @@ from api_auth import (
     loopback_compatibility_enabled as _allow_unauthenticated_loopback,
     ws_enforce_first_frame_auth,
 )
+from api_contracts import (
+    ContractError as _ContractError,
+    error_envelope as _error_envelope,
+    parse_json_object as _parse_json_object,
+)
 from execution_boundary import (
     DispatchMode,
     ExecutionBoundary,
@@ -17948,6 +17953,18 @@ def _idempotency_outcome_response(
     return web.json_response(payload, status=200 if terminal else 202)
 
 
+def _submit_request_envelope(code: str, message: str, *, status: int) -> web.Response:
+    """Wrap :func:`api_contracts.error_envelope` into a stable JSON response.
+
+    Lives next to the submit handlers because the helper exists only to
+    translate :class:`api_contracts.ContractError` outcomes into the
+    controller's public envelope shape — without leaking either raw
+    exception text or partial parse state to the caller.
+    """
+    envelope = _error_envelope(code, message, status=status)
+    return web.json_response(envelope, status=status)
+
+
 async def handle_submit_job(request: web.Request):
     """POST /v1/submit — Submit a job to the Redis queue."""
     _owner_fence = _queue_owner_route_fence('durable', '/v1/submit')
@@ -17958,11 +17975,22 @@ async def handle_submit_job(request: web.Request):
     if not session:
         return web.json_response({"error": "HTTP session not initialized, try again shortly"}, status=503)
     try:
-        data = await request.json()
+        raw_body = await request.read()
+    except web.HTTPRequestEntityTooLarge:
+        # aiohttp's default client_max_size fired before parse_json_object
+        # could see the body; treat it the same as the contract's size gate.
+        return _submit_request_envelope(
+            "body_too_large", "request body is too large", status=413
+        )
     except Exception:
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-    if not isinstance(data, Mapping):
-        return web.json_response({"error": "JSON body must be an object"}, status=400)
+        return _submit_request_envelope(
+            "invalid_json", "valid JSON required", status=400
+        )
+    try:
+        data = _parse_json_object(raw_body)
+    except _ContractError as exc:
+        status = 413 if exc.code == "body_too_large" else 400
+        return _submit_request_envelope(exc.code, exc.message, status=status)
     try:
         _idempotency_key, _request_sha256 = _request_idempotency_contract(
             request, data, operation="submit.llm.v1"
@@ -21626,13 +21654,22 @@ async def handle_submit_generation(
         return _owner_fence
     if data_override is None:
         try:
-            data = await request.json()
+            raw_body = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return _submit_request_envelope(
+                "body_too_large", "request body is too large", status=413
+            )
         except Exception:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
+            return _submit_request_envelope(
+                "invalid_json", "valid JSON required", status=400
+            )
+        try:
+            data = _parse_json_object(raw_body)
+        except _ContractError as exc:
+            status = 413 if exc.code == "body_too_large" else 400
+            return _submit_request_envelope(exc.code, exc.message, status=status)
     else:
         data = dict(data_override)
-    if not isinstance(data, Mapping):
-        return web.json_response({"error": "JSON body must be an object"}, status=400)
     try:
         _idempotency_key, _request_sha256 = _request_idempotency_contract(
             request, data, operation="submit.generation.v1"

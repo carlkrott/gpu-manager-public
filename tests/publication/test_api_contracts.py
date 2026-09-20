@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
 import math
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -193,3 +198,360 @@ def test_error_envelope_replaces_non_finite_details_and_is_strict_json():
         "nested": {"positive": "<redacted>", "negative": "<redacted>"},
         "items": ["<redacted>", {"value": "<redacted>"}],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Wired behaviour: handle_submit_job + handle_submit_generation must
+# route request reading through parse_json_object and return stable
+# error envelopes BEFORE any queue side effect.
+# ─────────────────────────────────────────────────────────────────────
+
+
+_ROOT = Path(__file__).resolve().parents[2]
+_CONTROLLER = _ROOT / "scripts" / "gpu-manager.py"
+
+
+class _FakeProto:
+    """Minimal stand-in for an asyncio protocol that aiohttp streams need."""
+
+    def __init__(self) -> None:
+        self._reading_paused = False
+
+    def pause_reading(self) -> None:  # pragma: no cover - trivial
+        pass
+
+    def resume_reading(self) -> None:  # pragma: no cover - trivial
+        pass
+
+
+def _build_request(body: bytes, *, path: str = "/v1/submit") -> object:
+    """Build an aiohttp Request whose raw body is the supplied bytes."""
+    from aiohttp.streams import StreamReader
+    from aiohttp.test_utils import make_mocked_request
+
+    async def _make():
+        stream = StreamReader(protocol=_FakeProto(), limit=2**26)
+        stream.feed_data(body)
+        stream.feed_eof()
+        return make_mocked_request(
+            "POST",
+            path,
+            payload=stream,
+            client_max_size=10 * 1024 * 1024,
+        )
+
+    return asyncio.run(_make())
+
+
+def _load_controller():
+    spec = importlib.util.spec_from_file_location(
+        "candidate_gpu_manager_submit_contracts", _CONTROLLER
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _install_submit_mocks(module) -> dict[str, MagicMock]:
+    """Wire lightweight mocks so queue side effects can be observed.
+
+    Returns the mocks so tests can assert they were not invoked for
+    malformed / oversized input.  Valid requests intentionally fail
+    later (no real Redis / routing state) — those assertions live in
+    dedicated tests.
+    """
+    capacity_tracker = MagicMock(name="capacity_tracker")
+    job_tracker = MagicMock(name="job_tracker")
+    queue_engine = MagicMock(name="queue_engine")
+    routing_engine = MagicMock(name="routing_engine")
+    routing_engine.find_service_for_group.return_value = None
+    routing_engine.get_group_members.return_value = []
+    async_gossiper = MagicMock(name="async_gossiper")
+    async_gossiper.find_remote_service = AsyncMock_shim(None)
+
+    module.capacity_tracker = capacity_tracker
+    module.job_tracker = job_tracker
+    module.queue_engine = queue_engine
+    module.routing_engine = routing_engine
+    module.async_gossiper = async_gossiper
+    module.session = MagicMock(name="session")
+    module._services_config = {"services": {}, "generation_templates": {}}
+
+    return {
+        "capacity_tracker": capacity_tracker,
+        "job_tracker": job_tracker,
+        "queue_engine": queue_engine,
+        "routing_engine": routing_engine,
+        "async_gossiper": async_gossiper,
+    }
+
+
+class AsyncMock_shim:
+    """Minimal async mock for the few coroutines the handler calls."""
+
+    def __init__(self, return_value=None):
+        self.return_value = return_value
+        self.calls: list = []
+
+    async def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.return_value
+
+
+def _envelope(payload: dict) -> tuple[int, dict]:
+    """Decode a handler response into ``(status, body)``."""
+    status = payload.status
+    body = json.loads(payload.text)
+    return status, body
+
+
+def _assert_safe_envelope(status: int, body: dict, *, expected_code: str,
+                          expected_status: int) -> None:
+    """Stable envelope shape: top-level ``error.code`` + ``status`` fields."""
+    assert status == expected_status, (status, body)
+    assert set(body) == {"error", "status"}, body
+    assert body["status"] == expected_status, body
+    assert set(body["error"]) == {"code", "message"}, body
+    assert body["error"]["code"] == expected_code, body
+    assert isinstance(body["error"]["message"], str) and body["error"]["message"], body
+
+
+def test_handle_submit_job_rejects_duplicate_keys_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(b'{"name": "first", "name": "second"}')
+
+    status, body = _envelope(asyncio.run(module.handle_submit_job(request)))
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_job_rejects_nan_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(b'{"x": NaN}')
+
+    status, body = _envelope(asyncio.run(module.handle_submit_job(request)))
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    # NaN must never be allowed to leak into the envelope payload.
+    assert "NaN" not in json.dumps(body)
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_job_rejects_infinity_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(b'{"x": Infinity}')
+
+    status, body = _envelope(asyncio.run(module.handle_submit_job(request)))
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    assert "Infinity" not in json.dumps(body)
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_job_rejects_non_object_body_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(b'["not", "an", "object"]')
+
+    status, body = _envelope(asyncio.run(module.handle_submit_job(request)))
+
+    _assert_safe_envelope(
+        status, body, expected_code="object_required", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_job_rejects_malformed_json_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(b"{unterminated")
+
+    status, body = _envelope(asyncio.run(module.handle_submit_job(request)))
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_job_rejects_malformed_utf8_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    # 0xC3 0x28 is an invalid UTF-8 sequence.
+    request = _build_request(b'{"x": "\xc3\x28"}')
+
+    status, body = _envelope(asyncio.run(module.handle_submit_job(request)))
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_job_rejects_oversize_body_with_413_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    # Just above the public 1 MiB limit; well-formed JSON so size is the
+    # only reason to refuse.
+    body = b'{"x":"' + b"A" * (api_contracts.MAX_JSON_BODY_BYTES + 16) + b'"}'
+    request = _build_request(body)
+
+    status, payload = _envelope(asyncio.run(module.handle_submit_job(request)))
+
+    _assert_safe_envelope(
+        status, payload, expected_code="body_too_large", expected_status=413
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_generation_rejects_duplicate_keys_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(
+        b'{"type":"image","name":"first","name":"second"}',
+        path="/v1/submit/generation",
+    )
+
+    status, body = _envelope(
+        asyncio.run(module.handle_submit_generation(request))
+    )
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_generation_rejects_nan_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(
+        b'{"type":"image","x": NaN}',
+        path="/v1/submit/generation",
+    )
+
+    status, body = _envelope(
+        asyncio.run(module.handle_submit_generation(request))
+    )
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    assert "NaN" not in json.dumps(body)
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_generation_rejects_non_object_body_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(b'["array","body"]', path="/v1/submit/generation")
+
+    status, body = _envelope(
+        asyncio.run(module.handle_submit_generation(request))
+    )
+
+    _assert_safe_envelope(
+        status, body, expected_code="object_required", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_generation_rejects_malformed_json_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(b"{not-json", path="/v1/submit/generation")
+
+    status, body = _envelope(
+        asyncio.run(module.handle_submit_generation(request))
+    )
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_generation_rejects_malformed_utf8_with_stable_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    request = _build_request(
+        b'{"type":"image","x": "\xc3\x28"}',
+        path="/v1/submit/generation",
+    )
+
+    status, body = _envelope(
+        asyncio.run(module.handle_submit_generation(request))
+    )
+
+    _assert_safe_envelope(
+        status, body, expected_code="invalid_json", expected_status=400
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_generation_rejects_oversize_body_with_413_envelope():
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    body = b'{"type":"image","x":"' + b"A" * (
+        api_contracts.MAX_JSON_BODY_BYTES + 16
+    ) + b'"}'
+    request = _build_request(body, path="/v1/submit/generation")
+
+    status, payload = _envelope(
+        asyncio.run(module.handle_submit_generation(request))
+    )
+
+    _assert_safe_envelope(
+        status, payload, expected_code="body_too_large", expected_status=413
+    )
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+def test_handle_submit_generation_data_override_skips_json_reading():
+    """data_override callers (MCP) must bypass request-body parsing entirely."""
+    module = _load_controller()
+    mocks = _install_submit_mocks(module)
+    # A real Request that would explode if .read() or .json() were called.
+    exploding_request = SimpleNamespace(
+        read=lambda: (_ for _ in ()).throw(
+            AssertionError("request.read must not run when data_override is set")
+        ),
+        json=lambda: (_ for _ in ()).throw(
+            AssertionError("request.json must not run when data_override is set")
+        ),
+        headers={},
+    )
+    # Empty override — handler should still proceed through the rest of
+    # the validation pipeline without touching the request body.  We only
+    # assert that the request body was NOT read here.
+    asyncio.run(
+        module.handle_submit_generation(
+            exploding_request, data_override={}
+        )
+    )
+    # Sanity: nothing mutated shared queue state during the parse step.
+    mocks["capacity_tracker"].assert_not_called()

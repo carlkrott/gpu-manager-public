@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "4ef2101cdeaf56786dbc014c7043c7f8b4f926ed056382991344593f79c15ea3",
-      "size": 1892455
+      "sha256": "72f8f50890de8ce43776996cb634c3cdaaedd3d70273227a796f021b161766a4",
+      "size": 1893971
     },
     {
       "disposition": "core",
@@ -652,8 +652,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_api_contracts.py",
-      "sha256": "4c880ebc2ceac248e788d889e81b71667f3af8e9b2c11caf750d0884a931b94c",
-      "size": 6999
+      "sha256": "f91e0bad65a3a2f83277cad9079ac07508274a0fe29e75bd932c0faede7b03fc",
+      "size": 19399
     },
     {
       "disposition": "core",
