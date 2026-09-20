@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROLLER = ROOT / "scripts" / "gpu-manager.py"
@@ -160,6 +162,87 @@ def test_external_visibility_uses_broker_metrics_url_never_alt_constant(monkeypa
     assert module._COMBINED_GEMMA_URL not in session.urls
     # The session must not have observed any URL other than the metrics URL.
     assert all(url == metrics_url for url in session.urls)
+
+
+def test_member_refresh_uses_configured_ordered_members_only():
+    module = _load_controller()
+    configured = ("member-primary", "member-secondary", "member-fallback")
+    calls: list[str] = []
+
+    class _Cache:
+        _configs = {
+            name: {"enabled": True, "cpu_only": True}
+            for name in configured
+        }
+        _snapshots = {}
+
+        def update(self, name, _probes, *, now):
+            calls.append(name)
+            raise RuntimeError("bounded test stop after member selection")
+
+    class _Repository:
+        @staticmethod
+        def lease_count(_name):
+            return 0
+
+    module._services_config = {
+        "services": {name: {"enabled": True, "cpu_only": True} for name in configured},
+        "combined_gemma_broker": {
+            "enabled": True,
+            "ordered_members": list(configured),
+        },
+        "combined_gemma_deployment": {"mode": "embedded"},
+    }
+    module._combined_gemma_member_cache = _Cache()
+    module._combined_gemma_broker = SimpleNamespace(
+        dispatch_loop=SimpleNamespace(is_running=True),
+        _repository=_Repository(),
+    )
+    module.session = SimpleNamespace(closed=False)
+
+    asyncio.run(module._refresh_combined_gemma_member_snapshots())
+
+    assert calls == list(configured)
+    assert not {"LLM-Primary", "LLM-Secondary", "LLM-CPU"}.intersection(calls)
+
+
+@pytest.mark.parametrize(
+    "ordered_members",
+    [None, [], "member-primary", ["member-primary", "member-primary"], [""], ["member-primary", 7]],
+)
+def test_member_refresh_refuses_invalid_ordered_members(ordered_members, caplog):
+    module = _load_controller()
+    calls: list[str] = []
+
+    class _Cache:
+        def update(self, name, _probes, *, now):
+            calls.append(name)
+
+    class _Repository:
+        @staticmethod
+        def lease_count(_name):
+            return 0
+
+    broker_config = {"enabled": True}
+    if ordered_members is not None:
+        broker_config["ordered_members"] = ordered_members
+    module._services_config = {
+        "services": {},
+        "combined_gemma_broker": broker_config,
+        "combined_gemma_deployment": {"mode": "embedded"},
+    }
+    module._combined_gemma_member_cache = _Cache()
+    module._combined_gemma_broker = SimpleNamespace(
+        dispatch_loop=SimpleNamespace(is_running=True),
+        _repository=_Repository(),
+    )
+    module.session = SimpleNamespace(closed=False)
+
+    with caplog.at_level("ERROR", logger="gpu-manager"):
+        asyncio.run(module._refresh_combined_gemma_member_snapshots())
+
+    assert calls == []
+    assert any("refused invalid ordered_members" in record.message for record in caplog.records)
 
 
 def test_summarize_requires_non_stale_accepting_member_with_capacity():

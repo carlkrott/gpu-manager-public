@@ -23874,7 +23874,17 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
     services = (_services_config or {}).get("services", {}) if isinstance(_services_config, dict) else {}
     if cache is None or broker is None or session is None or session.closed:
         return
-    for name in ("LLM-Primary", "LLM-Secondary", "LLM-CPU"):
+    broker_config = (_services_config or {}).get("combined_gemma_broker", {})
+    ordered_members = broker_config.get("ordered_members") if isinstance(broker_config, Mapping) else None
+    if (
+        not isinstance(ordered_members, (list, tuple))
+        or not ordered_members
+        or any(not isinstance(name, str) or not name for name in ordered_members)
+        or len(set(ordered_members)) != len(ordered_members)
+    ):
+        logger.error("Combined Gemma readiness refresh refused invalid ordered_members")
+        return
+    for name in ordered_members:
         # Use the cache-owned config (which carries ``idle_service_configured``)
         # so the readiness reducer sees the per-member synthetic fields that
         # were set at construction time. The live services.json does NOT carry

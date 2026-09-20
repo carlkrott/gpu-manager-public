@@ -29,7 +29,7 @@ def test_controller_has_neutral_default_identifiers_and_no_private_topology_lite
     assert "/mnt/" not in source
 
 
-def test_default_registry_is_empty_and_durable_only():
+def test_default_registry_is_empty_and_durable():
     tree = ast.parse(_source())
     assignment = next(
         node for node in ast.walk(tree)

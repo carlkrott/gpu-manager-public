@@ -76,8 +76,8 @@
     {
       "disposition": "core",
       "path": "examples/empty/services.json",
-      "sha256": "5afb5dd1583f762e3c61be6696eb8c858ec9707c648f0ab3efbd7f05d1b192ea",
-      "size": 391
+      "sha256": "f422f02ac3388e4c0937f0adc5a306d3c72253faba5dc6edf028f397b93c0ea7",
+      "size": 386
     },
     {
       "disposition": "utility",
@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "7a489a91599272b8250a090fbaabe462819a5811116480c5bea4240c82672eaf",
-      "size": 1905098
+      "sha256": "72eda076b9ebf7564f192461ed7e1c03e2fd29e99f98408a93782feae30af93d",
+      "size": 1905604
     },
     {
       "disposition": "core",
@@ -490,8 +490,8 @@
     {
       "disposition": "core",
       "path": "scripts/portable_defaults.py",
-      "sha256": "ba7bcacbeb89797b3bbb27dd8df9b4a29b7eb9f792e44de02aa70a6be736828e",
-      "size": 1392
+      "sha256": "4db291d1ca469fc34db56b18063a0c698fd120477f0a37d1e2b05067888a3743",
+      "size": 1387
     },
     {
       "disposition": "core",
@@ -670,14 +670,14 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_combined_gemma_example.py",
-      "sha256": "b7484829b613f8a7618afa9b58c1c35cb881a1d757d548724bbb00c953a90dd2",
-      "size": 5088
+      "sha256": "f99079ed69fd376754847d1091e48621e2f98960f9ab26c1d639f6c8a3104d7f",
+      "size": 5146
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_embedded_broker_visibility.py",
-      "sha256": "6bd0bdb1f647c62643d9c260bc03be499768418c7ed5ed60ec91ba2234b66c60",
-      "size": 9138
+      "sha256": "fb708bb2debbfe084fce210c2b4faa59a10a79c5a498af15e9bf0d140c19fd43",
+      "size": 11814
     },
     {
       "disposition": "core",
@@ -700,8 +700,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_portable_controller.py",
-      "sha256": "c92da17b600f44608d80fd0acd12acc22ad1437af1ea46616ae3c419e8e1e7c6",
-      "size": 1672
+      "sha256": "b0c04b2f61e1c0b605835eb7a39ccfdf5792c695394d038f7c12e46401c1fb27",
+      "size": 1667
     },
     {
       "disposition": "core",

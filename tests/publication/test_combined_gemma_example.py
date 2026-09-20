@@ -36,6 +36,7 @@ def test_empty_example_matches_portable_defaults() -> None:
     data = json.loads(EMPTY_PATH.read_text(encoding="utf-8"))
     assert data == empty_services_config()
     assert data["services"] == {}
+    assert data["scheduling"]["queue_owner"] == "durable"
     assert validate_registry(data) == []
 
 
