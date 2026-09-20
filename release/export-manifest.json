@@ -1,5 +1,5 @@
 {
-  "file_count": 121,
+  "file_count": 122,
   "files": [
     {
       "disposition": "utility",
@@ -88,8 +88,8 @@
     {
       "disposition": "utility",
       "path": "release/public-files.json",
-      "sha256": "572629f72882d049d768c9adfb0be16883b762c47b0c0e6d0324c016e843ff02",
-      "size": 11266
+      "sha256": "99067949fea4f202f7940be6a2111396ee313ede98ed694cc253a512406c6c4d",
+      "size": 11365
     },
     {
       "disposition": "utility",
@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "72f8f50890de8ce43776996cb634c3cdaaedd3d70273227a796f021b161766a4",
-      "size": 1893971
+      "sha256": "d14bd56d8a19ab14783a302b33974bf83865a8acfec82000fc82195878747494",
+      "size": 1901767
     },
     {
       "disposition": "core",
@@ -717,6 +717,12 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_request_safety.py",
+      "sha256": "e2347631e6c8afafab8fac12e326bb8cef76787d58d8e3c573c128baad9aaee2",
+      "size": 25816
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_reseal_service_package.py",
       "sha256": "f9f841c7d4d257263b5c5f8463c317d08bf7dd9d80ec020ea51234c5f24afbe4",
       "size": 5740
@@ -729,5 +735,5 @@
     }
   ],
   "schema_version": "gpumanager.exported-files.v1",
-  "source_manifest_sha256": "572629f72882d049d768c9adfb0be16883b762c47b0c0e6d0324c016e843ff02"
+  "source_manifest_sha256": "99067949fea4f202f7940be6a2111396ee313ede98ed694cc253a512406c6c4d"
 }

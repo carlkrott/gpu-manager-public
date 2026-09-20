@@ -1,5 +1,5 @@
 {
-  "file_count": 121,
+  "file_count": 122,
   "files": [
     {
       "disposition": "utility",
@@ -476,6 +476,10 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_reaper_state_and_probe.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_request_safety.py"
     },
     {
       "disposition": "core",

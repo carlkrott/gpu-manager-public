@@ -25195,13 +25195,46 @@ async def handle_llm_proxy(request: web.Request):
         llm.queued_requests -= 1
 
 
+_FORWARD_LLM_STRIPPED_HEADERS = frozenset(
+    {
+        # Credentials that must not leak past this controller.
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+        # Hop-by-hop headers that aiohttp / the upstream will set from
+        # the outgoing request itself; echoing caller-supplied values
+        # either contradicts the framework's framing or smuggles
+        # transport-layer controls past the public boundary.
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "upgrade",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailers",
+        "trailer",
+        "expect",
+    }
+)
+
+
 async def _forward_llm(method: str, path: str, body: bytes | None, headers: dict, backend_url: str = None) -> web.Response:
     llm.active_requests += 1
     llm.forward_attempts += 1
     url = f"{backend_url or LLM_BACKEND_URL}{path}"
     try:
-        fwd_headers = {k: v for k, v in headers.items()
-                       if k.lower() not in ("host", "content-length", "transfer-encoding")}
+        # Strip both caller-supplied credential headers AND hop-by-hop
+        # transport headers so a malicious upstream cannot impersonate
+        # the controller via headers smuggled on a forwarded request.
+        fwd_headers = {
+            key: value
+            for key, value in headers.items()
+            if isinstance(key, str) and key.lower() not in _FORWARD_LLM_STRIPPED_HEADERS
+        }
         async with session.request(
             method=method, url=url,
             data=body, headers=fwd_headers,
@@ -26947,16 +26980,79 @@ async def handle_generate_types(request: web.Request):
     return web.json_response(types)
 
 
+_GENERATE_OUTPUT_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """Return True iff ``candidate`` is the same file as ``root`` or
+    lives beneath it (after symlink resolution)."""
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_generate_output_name(raw: Any) -> str | None:
+    """Validate and normalize a generated-output filename.
+
+    Rejects:
+      * non-strings, empty strings, strings with control characters
+      * absolute paths (``/etc/passwd``)
+      * path separators (``subdir/file``, ``..\\windows.png``)
+      * dot segments (``.`` or ``..``)
+      * URL-decoded traversal (``%2e%2e%2fsecret``)
+
+    Returns the basename on success, ``None`` on rejection.  The
+    returned value is intentionally not ``os.path.normpath``-ed so a
+    legitimate trailing dot is preserved; the regex already forbids
+    path separators and dot-only names.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw):
+        return None
+    if "%" in raw:
+        # Any URL-encoded form is suspicious: percent-decoded segments
+        # may have slipped past the route regex.  Refuse outright so a
+        # caller cannot bypass the separator / dot-segment checks.
+        return None
+    if os.path.isabs(raw) or os.sep in raw or "/" in raw or "\\" in raw:
+        return None
+    if raw in {".", ".."}:
+        return None
+    if not _GENERATE_OUTPUT_FILENAME_RE.fullmatch(raw):
+        return None
+    return raw
+
+
 async def handle_generate_output(request: web.Request):
-    """GET /generate/output/{filename} — Serve a generated file."""
-    filename = request.match_info["filename"]
+    """GET /generate/output/{filename} — Serve a generated file.
 
-    for directory in (str(COMFYUI_ROOT / "output"), str(COMFYUI_ROOT / "input")):
-        filepath = os.path.join(directory, filename)
-        if os.path.isfile(filepath):
-            return web.FileResponse(filepath)
+    Only basenames are accepted; any absolute path, path separator,
+    dot segment, or URL-decoded traversal is rejected before the file
+    system is touched, and the resolved path must remain inside one
+    of the configured COMFYUI output/input roots.
+    """
+    raw_filename = request.match_info["filename"]
+    safe_filename = _safe_generate_output_name(raw_filename)
+    if safe_filename is None:
+        return web.json_response(
+            {"error": f"Invalid filename: {raw_filename!r}"}, status=400
+        )
 
-    return web.json_response({"error": f"File not found: {filename}"}, status=404)
+    output_root = (COMFYUI_ROOT / "output").resolve()
+    input_root = (COMFYUI_ROOT / "input").resolve()
+    candidate = (output_root / safe_filename).resolve()
+    if candidate.is_file() and _is_within(candidate, output_root):
+        return web.FileResponse(str(candidate))
+    candidate = (input_root / safe_filename).resolve()
+    if candidate.is_file() and _is_within(candidate, input_root):
+        return web.FileResponse(str(candidate))
+
+    return web.json_response(
+        {"error": f"File not found: {safe_filename}"}, status=404
+    )
 
 
 async def handle_generate_library(request: web.Request):
@@ -36825,9 +36921,26 @@ function addChatMessage(role, content) {
     div.style.color = '#e0e0e0';
   }
 
-  div.innerHTML = '<span style="font-size:11px;color:#888;display:block;margin-bottom:4px">' +
-    (role === 'user' ? 'You' : svcName) + '</span>' +
-    content.replace(/\n/g, '<br>');
+  // Static role/service header — values come from the controlled
+  // registry, not from a user, so the span itself is built via
+  // createElement (no innerHTML assignment) and its label is set via
+  // textContent.
+  const header = document.createElement('span');
+  header.style.fontSize = '11px';
+  header.style.color = '#888';
+  header.style.display = 'block';
+  header.style.marginBottom = '4px';
+  header.textContent = role === 'user' ? 'You' : svcName;
+  div.appendChild(header);
+
+  // Caller-supplied content (model output or user input) MUST be
+  // inserted as text so a malicious payload cannot inject HTML or
+  // script tags into the dashboard.
+  const body = document.createElement('div');
+  body.style.whiteSpace = 'pre-wrap';
+  body.style.wordBreak = 'break-word';
+  body.textContent = content;
+  div.appendChild(body);
 
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
@@ -40006,8 +40119,111 @@ a:hover {{ text-decoration: underline; }}
     return web.Response(text=html, content_type="text/html")
 
 
+# Headers whose presence on caller-supplied outbound requests would
+# smuggle a credential past the upstream.  Forwarding them unchanged
+# defeats the loopback allowlist.
+_FORBIDDEN_PROXY_HEADER_NAMES = frozenset(
+    {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+)
+
+
+def _strip_credential_headers(headers: Any) -> dict[str, str]:
+    """Return a copy of *headers* with credential headers removed.
+
+    Non-dict inputs return an empty dict.  String values are preserved
+    unchanged; bytes values are decoded as UTF-8 with replacement so
+    that header construction cannot fail on caller-supplied garbage.
+    """
+    if not isinstance(headers, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in headers.items():
+        if not isinstance(key, str) or not key:
+            continue
+        # Header field names cannot legally contain surrounding whitespace,
+        # but normalize it here so malformed caller-supplied mappings cannot
+        # evade the credential denylist before aiohttp serializes them.
+        if key.strip().lower() in _FORBIDDEN_PROXY_HEADER_NAMES:
+            continue
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError:
+                value = value.decode("utf-8", errors="replace")
+        if not isinstance(value, str):
+            continue
+        result[key] = value
+    return result
+
+
+def _api_proxy_target_is_allowed(url: Any) -> bool:
+    """Return True iff *url* points at an enabled service's declared port.
+
+    Only http/https loopback URLs are considered.  Userinfo, missing
+    or malformed ports, the controller's own LISTEN_PORT, and ports
+    that are not declared on any enabled service in
+    ``_services_config`` are rejected.
+    """
+    from urllib.parse import urlparse
+
+    if not isinstance(url, str) or not url:
+        return False
+    if any(ord(char) < 0x20 for char in url):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    hostname = parsed.hostname
+    if hostname is None:
+        return False
+    if hostname.lower() not in {"localhost", "127.0.0.1", "::1"}:
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    if port is None:
+        return False
+    if port == LISTEN_PORT:
+        return False
+
+    cfg = _services_config if isinstance(_services_config, Mapping) else {}
+    services = cfg.get("services") if isinstance(cfg, Mapping) else None
+    if not isinstance(services, Mapping):
+        return False
+    for svc in services.values():
+        if not isinstance(svc, Mapping):
+            continue
+        if not svc.get("enabled", False):
+            continue
+        declared_ports = set()
+        for field in ("port", "proxy_port"):
+            value = svc.get(field)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and 0 < value < 65536:
+                declared_ports.add(value)
+        if port in declared_ports:
+            return True
+    return False
+
+
 async def handle_api_proxy(request: web.Request) -> web.Response:
-    """POST /api/proxy — Forward arbitrary HTTP requests to localhost backends (CORS proxy)."""
+    """POST /api/proxy — Forward arbitrary HTTP requests to localhost backends (CORS proxy).
+
+    Only explicit loopback http/https URLs whose port is declared as
+    ``port`` or ``proxy_port`` on an enabled service in
+    ``_services_config`` are accepted.  Userinfo, missing/malformed
+    ports, the controller's own LISTEN_PORT, and undeclared ports are
+    all rejected before any I/O.  Authorization, Cookie,
+    Proxy-Authorization and X-API-Key headers are stripped from
+    caller-supplied headers before forwarding.
+    """
     from urllib.parse import urlparse
 
     try:
@@ -40024,12 +40240,14 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
     if method not in allowed_methods:
         return web.json_response({"error": f"Unsupported method: {method}"}, status=400)
 
-    parsed = urlparse(url)
-    hostname = parsed.hostname or ""
-    if hostname not in ("localhost", "127.0.0.1", "::1", "[::1]"):
-        return web.json_response({"error": "Only localhost targets are allowed (SSRF blocked)"}, status=403)
+    if not _api_proxy_target_is_allowed(url):
+        return web.json_response(
+            {"error": "proxy target is not an enabled service port"},
+            status=403,
+        )
 
     req_headers = body.get("headers", {})
+    safe_headers = _strip_credential_headers(req_headers)
     req_body = body.get("body")
 
     if req_body and isinstance(req_body, str):
@@ -40042,9 +40260,10 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
     if body_bytes and len(body_bytes) > 10 * 1024 * 1024:
         return web.json_response({"error": "Request body exceeds 10MB limit"}, status=413)
 
-    target_url = url if url.startswith("http") else f"http://localhost{parsed.path}"
-    if parsed.query:
-        target_url = f"{target_url}?{parsed.query}"
+    target_url = url if url.startswith("http") else f"http://localhost{urlparse(url).path}"
+    parsed_qs = urlparse(url).query
+    if parsed_qs:
+        target_url = f"{target_url}?{parsed_qs}"
 
     timeout = ClientTimeout(total=30)
     start = time.monotonic()
@@ -40052,7 +40271,7 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
         async with session.request(
             method,
             target_url,
-            headers=req_headers,
+            headers=safe_headers,
             data=body_bytes,
             timeout=timeout,
             ssl=False,
