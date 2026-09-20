@@ -63,6 +63,20 @@ def test_embedded_broker_uses_process_independent_epoch_leadership_clock():
     assert leadership_clock.attr == "time"
 
 
+def test_embedded_api_proxy_exposes_live_repository_for_attempt_status():
+    module = _load_controller()
+    repository = object()
+    setattr(
+        module,
+        "_combined_gemma_broker",
+        SimpleNamespace(api_service=SimpleNamespace(repository=repository)),
+    )
+
+    proxy = module._CombinedGemmaAPIProxy()
+
+    assert proxy.repository is repository
+
+
 def test_embedded_visibility_uses_in_process_proxy_without_http_session(monkeypatch):
     module = _load_controller()
     module._services_config = {

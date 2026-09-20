@@ -24253,6 +24253,11 @@ class _CombinedGemmaAPIProxy:
     def cancel(self, job_id: str):
         return self._service().cancel(job_id)
 
+    @property
+    def repository(self):
+        """Expose the live repository required by status/cancel attempt lookup."""
+        return self._service().repository
+
     @staticmethod
     def _runtime():
         from gemma_broker.api import APIError
