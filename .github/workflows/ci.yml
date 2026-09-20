@@ -50,10 +50,28 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q scripts examples tests/publication
 
-      - name: Check the public payload
+      - name: Export the public payload to a guaranteed-new temporary destination
         env:
           PYTHONPATH: scripts
-        run: python scripts/check_public_payload.py . --manifest release/export-manifest.json
+        run: |
+          export_parent="$(mktemp -d "${RUNNER_TEMP}/gpumanager-public-export.XXXXXX")"
+          export_dir="$export_parent/payload"
+          printf 'PUBLIC_EXPORT_DIR=%s\n' "$export_dir" >> "$GITHUB_ENV"
+          python scripts/export_public_source.py --manifest release/public-files.json "$export_dir"
+
+      - name: Check the exported public payload and its generated receipt
+        env:
+          PYTHONPATH: scripts
+        run: |
+          if [ ! -d "$PUBLIC_EXPORT_DIR" ]; then
+            echo "export destination is missing: $PUBLIC_EXPORT_DIR" >&2
+            exit 1
+          fi
+          if [ ! -f "$PUBLIC_EXPORT_DIR/release/export-manifest.json" ]; then
+            echo "export did not generate a receipt: $PUBLIC_EXPORT_DIR/release/export-manifest.json" >&2
+            exit 1
+          fi
+          python scripts/check_public_payload.py "$PUBLIC_EXPORT_DIR" --manifest "$PUBLIC_EXPORT_DIR/release/export-manifest.json"
 
       - name: Check dependency versions and license metadata
         run: |
