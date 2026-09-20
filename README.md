@@ -208,10 +208,16 @@ Run the source-only test suite:
 PYTHONPATH=scripts .venv/bin/python -m pytest -q tests/publication
 ```
 
-Run the public payload gate:
+After the test suite, re-export to a fresh destination so the public payload gate operates on a clean copy rather than a source tree that now contains pytest and `__pycache__` artifacts:
 
 ```bash
-PYTHONPATH=scripts .venv/bin/python scripts/check_public_payload.py .
+.venv/bin/python scripts/export_public_source.py /tmp/gpumanager-export
+```
+
+Run the public payload gate against the exact export and its fresh receipt:
+
+```bash
+PYTHONPATH=scripts .venv/bin/python scripts/check_public_payload.py /tmp/gpumanager-export --manifest /tmp/gpumanager-export/release/export-manifest.json
 ```
 
 Inspect CLI surfaces without starting a service:
@@ -269,17 +275,17 @@ The broker has no implicit configuration-file discovery. Supply `--config` or `G
 | `scripts/runtime_host_supervisor.py` | Allowlisted host-runtime action boundary |
 | `examples/` | Empty and Combined Gemma neutral fixtures |
 | `tests/publication/` | Hermetic auth, isolation, portability, source-closure and payload tests |
-| `release/` | Exact exported release manifest |
+| `release/` | Committed path/disposition allowlist and generated exact-byte release receipt |
 
 ## Publication and contribution checks
 
-The public release is bound to an explicit file manifest. The exporter rejects files outside that manifest, and the payload checker rejects private paths, credentials, model artifacts, archives and unsupported binary content.
+The public release is bound to `release/public-files.json`, a committed path/disposition allowlist. The exporter copies only allowlisted files, omits unlisted source files, and generates `release/export-manifest.json` as an exact-byte SHA-256/size receipt. The payload checker verifies the receipt and rejects private paths, credentials, model artifacts, archives and unsupported binary content.
 
 For manifest-affecting changes:
 
-1. Update the candidate manifest with the new file hash and size.
-2. Export to a new destination.
-3. Re-run the payload checker against the exact export.
+1. Update the path/disposition allowlist only when the public file set changes; do not hand-edit receipt hashes or sizes.
+2. Export to a new destination, which generates a fresh exact-byte receipt.
+3. Re-run the payload checker against the exact export and its receipt.
 4. Run the publication tests and secret scanner.
 5. Review the staged tree before committing.
 

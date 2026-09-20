@@ -26,8 +26,11 @@ OPTIONAL_ADAPTERS = (
 
 
 def _manifest() -> dict:
-    path = MANIFEST if MANIFEST.is_file() else EXPORT_MANIFEST
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(MANIFEST.read_text(encoding="utf-8"))
+
+
+def _receipt() -> dict:
+    return json.loads(EXPORT_MANIFEST.read_text(encoding="utf-8"))
 
 
 def _sha256(path: Path) -> str:
@@ -48,17 +51,18 @@ def _local_module_path(name: str) -> Path | None:
     return None
 
 
-def test_manifest_is_complete_and_hash_bound() -> None:
+def test_manifest_is_complete_and_disposition_bound() -> None:
     entries = _manifest()["files"]
     paths = [entry["path"] for entry in entries]
     assert len(paths) == len(set(paths))
     assert all(not Path(path).is_absolute() for path in paths)
+    assert all(set(entry) == {"path", "disposition"} for entry in entries)
 
     for entry in entries:
         path = ROOT / entry["path"]
         assert path.is_file() and not path.is_symlink(), entry["path"]
-        assert entry["size"] == path.stat().st_size, entry["path"]
-        assert entry["sha256"] == _sha256(path), entry["path"]
+
+    assert _manifest()["file_count"] == len(entries)
 
     shipped_python = {
         path.relative_to(ROOT).as_posix()
@@ -67,6 +71,19 @@ def test_manifest_is_complete_and_hash_bound() -> None:
         if "__pycache__" not in path.parts
     }
     assert shipped_python <= set(paths)
+
+
+def test_generated_receipt_is_exact_byte_bound() -> None:
+    entries = _receipt()["files"]
+    paths = [entry["path"] for entry in entries]
+    assert len(paths) == len(set(paths))
+    assert _receipt()["file_count"] == len(entries)
+
+    for entry in entries:
+        path = ROOT / entry["path"]
+        assert path.is_file() and not path.is_symlink(), entry["path"]
+        assert entry["size"] == path.stat().st_size, entry["path"]
+        assert entry["sha256"] == _sha256(path), entry["path"]
 
 
 def test_direct_local_imports_are_manifested() -> None:

@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from aiohttp import WSMsgType, web
+from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
@@ -189,6 +189,57 @@ def test_mcp_preload_uses_shared_bearer_policy_against_synthetic_server(
 
     asyncio.run(run())
     assert seen["authorization"] == "Bearer synthetic-publication-token"
+
+
+def test_pipeline_transport_injects_api_token_only_for_own_loopback_origin(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GPU_MANAGER_API_TOKEN_FILE", str(_write_token(tmp_path)))
+    monkeypatch.delenv("GPU_MANAGER_ALLOW_UNAUTHENTICATED_LOOPBACK", raising=False)
+    module = _load_controller()
+    seen: list[str | None] = []
+
+    async def handler(request):
+        seen.append(request.headers.get("Authorization"))
+        return web.json_response({"ok": True})
+
+    async def run():
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handler)
+        async with TestServer(app) as server, ClientSession() as session:
+            transport = module._AiohttpTransport(session)
+            module.LISTEN_PORT = server.port
+            status, _, _ = await transport(
+                {},
+                "POST",
+                str(server.make_url("/v1/chat/completions")),
+                b"{}",
+            )
+            assert status == 200
+
+            status, _, _ = await transport(
+                {"Authorization": "Bearer caller-supplied"},
+                "POST",
+                str(server.make_url("/v1/chat/completions")),
+                b"{}",
+            )
+            assert status == 200
+
+            module.LISTEN_PORT = server.port + 1
+            status, _, _ = await transport(
+                {},
+                "POST",
+                str(server.make_url("/v1/chat/completions")),
+                b"{}",
+            )
+            assert status == 200
+
+    asyncio.run(run())
+    assert seen == [
+        "Bearer synthetic-publication-token",
+        "Bearer caller-supplied",
+        None,
+    ]
 
 
 def test_mcp_tool_names_are_unique_and_preload_mapping_is_present():

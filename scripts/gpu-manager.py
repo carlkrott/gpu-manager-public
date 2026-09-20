@@ -82,6 +82,11 @@ from api_auth import (
     loopback_compatibility_enabled as _allow_unauthenticated_loopback,
     ws_enforce_first_frame_auth,
 )
+from api_contracts import (
+    ContractError as _ContractError,
+    error_envelope as _error_envelope,
+    parse_json_object as _parse_json_object,
+)
 from execution_boundary import (
     DispatchMode,
     ExecutionBoundary,
@@ -219,6 +224,15 @@ _current_selected_group = None
 _drain_cutoffs = {}
 _last_next_decision = {}
 
+
+def _maintenance_mode_enabled(scheduling: Mapping[str, Any] | None) -> bool:
+    """Normalize maintenance mode, failing closed on malformed values."""
+    if not isinstance(scheduling, Mapping):
+        return True
+    raw = scheduling.get("maintenance_mode", False)
+    return raw if isinstance(raw, bool) else True
+
+
 def _phase3_scheduling_config():
     global _services_config
     try:
@@ -242,6 +256,7 @@ def _phase3_scheduling_config():
     # services.json (the source of truth when env-var is unset) is loaded from
     # SERVICES_CONFIG_PATH; see top-of-file for the resolved runtime location.
     env_owns = os.environ.get('GPU_MANAGER_SCHEDULER_OWNS_LOAD', 'false').strip().lower() == 'true'
+    maintenance_mode = _maintenance_mode_enabled(sched)
     return {
         'grace_period_seconds': sched.get('grace_period_seconds', 30),
         'grace_min_resume_interval_s': sched.get('grace_min_resume_interval_s', 60),
@@ -258,10 +273,18 @@ def _phase3_scheduling_config():
         # current compatibility behavior while the durable/legacy modes give
         # operators a reversible way to fence one owner during cutover.
         'queue_owner': sched.get('queue_owner', 'split'),
-        'scheduler_owns_load': env_owns or sched.get('scheduler_owns_load', False),
-        'scheduler_dry_run_mode': sched.get('scheduler_dry_run_mode', True),
-        'proactive_scheduling_enabled': sched.get('proactive_scheduling_enabled', False),
-        'maintenance_mode': sched.get('maintenance_mode', False)
+        # Maintenance is an overriding safety fence. An environment override
+        # must never grant scheduler ownership while the controller is paused.
+        'scheduler_owns_load': False if maintenance_mode else (
+            env_owns or sched.get('scheduler_owns_load', False)
+        ),
+        'scheduler_dry_run_mode': True if maintenance_mode else sched.get(
+            'scheduler_dry_run_mode', True
+        ),
+        'proactive_scheduling_enabled': False if maintenance_mode else sched.get(
+            'proactive_scheduling_enabled', False
+        ),
+        'maintenance_mode': maintenance_mode
     }
 
 
@@ -1220,7 +1243,29 @@ class _AiohttpTransport:
                 self(headers, method, url, body, timeout), self._owner_loop,
             )
             return await asyncio.wrap_future(pending)
-        kwargs: dict = {"headers": headers, "allow_redirects": True}
+        request_headers = dict(headers)
+        self_authenticated = False
+        if not any(str(name).lower() == "authorization" for name in request_headers):
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            try:
+                target_port = parsed.port
+            except ValueError:
+                target_port = None
+            if (
+                parsed.scheme == "http"
+                and (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+                and target_port == int(LISTEN_PORT)
+            ):
+                token = _api_token()
+                if token:
+                    request_headers["Authorization"] = f"Bearer {token}"
+                    self_authenticated = True
+        kwargs: dict = {
+            "headers": request_headers,
+            "allow_redirects": not self_authenticated,
+        }
         if body:
             kwargs["data"] = body
         timeout_obj = __import__("aiohttp", fromlist=["ClientTimeout"]).ClientTimeout(
@@ -3430,6 +3475,55 @@ ORPHAN_REAPER_TARGET_NAMES = (
     "sglang",
 )
 
+
+def _orphan_reaper_status(*, now: float | None = None) -> dict[str, Any]:
+    """Return explicit orphan-reaper state without treating maintenance as healthy."""
+    current = time.time() if now is None else float(now)
+    state: dict[str, Any] = {
+        "enabled": bool(ORPHAN_REAPER_ENABLED),
+        "interval_s": ORPHAN_REAPER_INTERVAL_S,
+        "grace_s": ORPHAN_REAPER_GRACE_S,
+        "vram_threshold_mib": ORPHAN_REAPER_VRAM_THRESHOLD_MB,
+        "target_names": list(ORPHAN_REAPER_TARGET_NAMES),
+        "state": "disabled",
+        "reason": "configuration_disabled",
+        "last_tick_age_s": None,
+        "last_tick_ts": None,
+        "expected_pids": [],
+        "terminated_pids": {},
+    }
+    if not ORPHAN_REAPER_ENABLED:
+        return state
+
+    manager = scheduler
+    last_tick = float(getattr(manager, "_last_orphan_reaper_at", 0.0) or 0.0)
+    state["last_tick_ts"] = last_tick or None
+    state["last_tick_age_s"] = current - last_tick if last_tick > 0 else None
+    if manager is not None:
+        state["expected_pids"] = sorted(
+            int(pid) for pid in (getattr(manager, "_expected_pids", set()) or set())
+        )
+        state["terminated_pids"] = {
+            int(pid): float(ts)
+            for pid, ts in (getattr(manager, "_terminated_pids", {}) or {}).items()
+        }
+
+    config = _services_config if isinstance(_services_config, Mapping) else {}
+    scheduling = config.get("scheduling", {}) or {}
+    if _maintenance_mode_enabled(scheduling):
+        state.update(state="paused", reason="maintenance_mode")
+    elif manager is None or getattr(manager, "_running", False) is not True:
+        state.update(state="paused", reason="scheduler_not_running")
+    elif (
+        state["last_tick_age_s"] is None
+        or state["last_tick_age_s"] > max(ORPHAN_REAPER_INTERVAL_S * 2, 60.0)
+    ):
+        state.update(state="paused", reason="stale_tick")
+    else:
+        state.update(state="running", reason="fresh_tick")
+    return state
+
+
 # ── Lifecycle Transition Templates ─────────────────────────────────────
 
 TRANSITION_STEPS = {
@@ -3581,6 +3675,46 @@ def _get_idle_service_name(gpu_id: str | None = None) -> str:
     return LLM_SERVICE_NAME_DEFAULT
 
 
+def _configured_llm_health_target(config: Mapping[str, Any] | None = None) -> tuple[str, str] | None:
+    """Resolve an explicit registry-owned LLM health target.
+
+    The controller must not probe an environment default when the registry has
+    no idle service.  A target is valid only when its service is enabled and
+    supplies a bounded port and path.
+    """
+    selected = _load_services_config() if config is None else config
+    scheduling = selected.get("scheduling", {}) or {}
+    services = selected.get("services", {}) or {}
+    candidates: list[str] = []
+    global_idle = scheduling.get("idle_service")
+    if isinstance(global_idle, str) and global_idle:
+        candidates.append(global_idle)
+    per_gpu = scheduling.get("idle_services", {}) or {}
+    if isinstance(per_gpu, Mapping):
+        candidates.extend(
+            name for name in per_gpu.values()
+            if isinstance(name, str) and name
+        )
+    for service_name in dict.fromkeys(candidates):
+        service = services.get(service_name)
+        if not isinstance(service, Mapping) or service.get("enabled") is not True:
+            continue
+        port = service.get("port")
+        health_path = service.get("health_path") or "/health"
+        if type(port) is not int or not (1 <= port <= 65535):
+            continue
+        if (
+            not isinstance(health_path, str)
+            or not health_path.startswith("/")
+            or "//" in health_path
+            or len(health_path) > 256
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in health_path)
+        ):
+            continue
+        return f"http://127.0.0.1:{port}{health_path}", service_name
+    return None
+
+
 def _get_loaded_runtime_snapshot() -> dict:
     """Describe bundles/services actually tracked as loaded at runtime.
 
@@ -3655,7 +3789,7 @@ def _canonical_runtime_semantics(readiness: dict | None = None) -> dict:
         configured_idle_service=_get_idle_service_name(),
         configured_idle_services_by_gpu=idle_by_gpu,
         pinned_service=str(pinned or ""),
-        maintenance_mode=bool(scheduling.get("maintenance_mode", False)),
+        maintenance_mode=_maintenance_mode_enabled(scheduling),
         enabled_service_names=enabled_units,
         disabled_service_names=disabled_units,
         loaded_runtime_services=runtime["services"],
@@ -9001,16 +9135,29 @@ class LLMProxy:
         self._llm_ready_event.set()
 
     async def check_health(self) -> bool:
+        target = _configured_llm_health_target()
+        if target is None:
+            self.logger.debug("LLM health check skipped: no configured registry idle service")
+            return False
+        if self.session is None or self.session.closed:
+            self.logger.debug("LLM health check skipped: HTTP session unavailable")
+            return False
+        url, service_name = target
         try:
             async with self.session.get(
-                f"{LLM_BACKEND_URL}/health",
+                url,
                 timeout=ClientTimeout(total=5, connect=3),
             ) as resp:
                 ok = resp.status == 200
                 if ok:
                     body = await resp.json()
                     ok = body.get("status") == "ok"
-                self.logger.debug(f"LLM health check: {resp.status} ok={ok}")
+                self.logger.debug(
+                    "LLM health check service=%s status=%s ok=%s",
+                    service_name,
+                    resp.status,
+                    ok,
+                )
                 return ok
         except Exception as e:
             self.logger.warning(f"LLM health check failed: {e}")
@@ -10498,7 +10645,7 @@ class GPUScheduler:
             return
 
         config = _load_services_config()
-        if config.get("scheduling", {}).get("maintenance_mode", False):
+        if _maintenance_mode_enabled(config.get("scheduling", {})):
             self.logger.info("Maintenance mode active — skipping service restore")
             return
 
@@ -10619,7 +10766,7 @@ class GPUScheduler:
 
         # Maintenance mode: don't interrupt LLM or attempt relief
         config = _load_services_config()
-        if config.get("scheduling", {}).get("maintenance_mode", False):
+        if _maintenance_mode_enabled(config.get("scheduling", {})):
             self.logger.info("Maintenance mode — skipping LLM relief")
             return
 
@@ -10745,7 +10892,7 @@ class GPUScheduler:
         # We still need the full config below for bundles/templates/etc.
         config = _load_services_config()
         scheduling = config.get("scheduling", {})
-        if scheduling.get("maintenance_mode", False):
+        if _maintenance_mode_enabled(scheduling):
             return
         # Skip if any legacy ComfyUI/ACE-Step queue is active; those paths
         # manage their own lifecycle.
@@ -11307,7 +11454,7 @@ class GPUScheduler:
         scheduling = config.get("scheduling", {})
 
         # Maintenance mode: hands off
-        if scheduling.get("maintenance_mode", False):
+        if _maintenance_mode_enabled(scheduling):
             return
 
         # Phase 5.2.66: coexistence mode (manual SRE pause).
@@ -11502,7 +11649,7 @@ class GPUScheduler:
                 RecoveryObservation(
                     enabled=bool(idle_svc.get("enabled")),
                     desired_state=DesiredState.IDLE,
-                    maintenance_mode=bool(scheduling.get("maintenance_mode", False)),
+                    maintenance_mode=_maintenance_mode_enabled(scheduling),
                     planned_stop=planned_stop,
                     coexistence_paused=bool(self._coexistence_paused),
                     now=now,
@@ -11565,7 +11712,7 @@ class GPUScheduler:
                 RecoveryObservation(
                     enabled=bool(idle_svc.get("enabled")),
                     desired_state=DesiredState.IDLE,
-                    maintenance_mode=bool(scheduling.get("maintenance_mode", False)),
+                    maintenance_mode=_maintenance_mode_enabled(scheduling),
                     planned_stop=planned_stop,
                     coexistence_paused=bool(self._coexistence_paused),
                     probe_ok=is_healthy,
@@ -12791,7 +12938,7 @@ class VRAMLifecycleManager:
                 skip_bundle_name=skip_bundle_name,
             )
         config = _load_services_config()
-        if config.get("scheduling", {}).get("maintenance_mode", False):
+        if _maintenance_mode_enabled(config.get("scheduling", {})):
             self.logger.info(f"VRAM: Maintenance mode — skipping LLM eviction ({reason})")
             return False
 
@@ -14419,6 +14566,30 @@ def _persist_generated_image(job_id: str, image: Mapping[str, Any], index: int) 
             "byte_size": len(raw), "produced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+def _required_native_helper_token_file() -> str:
+    """Resolve the dedicated native-task helper credential before network I/O."""
+    from runtime_host_client import (
+        HELPER_TOKEN_FILE_ENV,
+        NATIVE_TASK_TOKEN_FILE_ENV,
+        resolve_required_service_credential,
+    )
+
+    token_file = os.environ.get(NATIVE_TASK_TOKEN_FILE_ENV)
+    if not token_file:
+        if os.environ.get(HELPER_TOKEN_FILE_ENV):
+            logger.warning(
+                "%s is deprecated and ignored; configure %s for native-task authentication",
+                HELPER_TOKEN_FILE_ENV,
+                NATIVE_TASK_TOKEN_FILE_ENV,
+            )
+        raise RuntimeError("native task helper credential is required")
+    try:
+        resolve_required_service_credential(service_token_file=token_file)
+    except Exception as exc:
+        raise RuntimeError("native task helper credential is unavailable") from exc
+    return token_file
+
+
 class WorkerPool:
     """Pool of persistent workers for a single service.
 
@@ -15876,6 +16047,7 @@ class WorkerPool:
             if job.get("request_kind") == "audio_cpp_task" and self.service_config.get("native_task_host_url"):
                 from native_task_client import native_task_request
                 host_url = self.service_config["native_task_host_url"]
+                native_helper_token_file = _required_native_helper_token_file()
                 if job_tracker is None:
                     raise RuntimeError("native task ownership requires durable job tracking")
                 native_tracked = _coordinator_job_dict(job_tracker.get_job(job_id)) or {}
@@ -15898,6 +16070,7 @@ class WorkerPool:
                 forward_request = native_task_request(
                     self.session, host_url=host_url, task_id=job_id,
                     body=body, on_state=native_state, admission_started=native_admission_started,
+                    service_token_file=native_helper_token_file,
                 )
             else:
                 forward_request = self.session.request(
@@ -17501,7 +17674,7 @@ async def handle_health(request: web.Request):
     status["llm_readiness"] = readiness
     status["llm_available"] = readiness["available"]
     status["llm_healthy"] = readiness["available"]
-    status["maintenance_mode"] = config.get("scheduling", {}).get("maintenance_mode", False)
+    status["maintenance_mode"] = _maintenance_mode_enabled(config.get("scheduling", {}))
     # ── Phase 1: OOM state surfaced for dashboard ────────────────────
     gpu_states_map = globals().get("_gpu_states", {})
     # Phase 2: include the recent OOM events (last hour) so the dashboard
@@ -17539,35 +17712,9 @@ async def handle_health(request: web.Request):
         now=now_ts,
     )
     # ── Phase 5.2.69: orphan-reaper summary ──────────────────────────
-    # Surface the reaper state on /health so dashboards can show
-    # 'expected_pids / terminated_pids / last_tick_age'. Read-only;
-    # all counters live on the scheduler.
-    try:
-        _reaper_state = {
-            "enabled": bool(ORPHAN_REAPER_ENABLED),
-            "interval_s": ORPHAN_REAPER_INTERVAL_S,
-            "grace_s": ORPHAN_REAPER_GRACE_S,
-            "vram_threshold_mib": ORPHAN_REAPER_VRAM_THRESHOLD_MB,
-            "target_names": list(ORPHAN_REAPER_TARGET_NAMES),
-        }
-        if scheduler is not None:
-            _now = time.time()
-            _last = float(getattr(scheduler, "_last_orphan_reaper_at", 0.0) or 0.0)
-            _reaper_state["expected_pids"] = sorted(
-                int(p) for p in (getattr(scheduler, "_expected_pids", set()) or set())
-            )
-            _reaper_state["terminated_pids"] = {
-                int(pid): float(ts)
-                for pid, ts in (getattr(scheduler, "_terminated_pids", {}) or {}).items()
-            }
-            _reaper_state["last_tick_age_s"] = (
-                (_now - _last) if _last > 0 else None
-            )
-            _reaper_state["last_tick_ts"] = _last
-        status["orphan_reaper"] = _reaper_state
-    except Exception as _orphan_health_err:
-        logger.debug(f"orphan reaper health summary failed: {_orphan_health_err}")
-        status["orphan_reaper"] = {"enabled": bool(ORPHAN_REAPER_ENABLED), "error": str(_orphan_health_err)}
+    # Keep maintenance, disabled and stale-tick states explicit; an enabled
+    # reaper that cannot tick is not healthy.
+    status["orphan_reaper"] = _orphan_reaper_status()
     _apply_runtime_semantics(status, readiness)
     return web.json_response(status)
 
@@ -17872,6 +18019,18 @@ def _idempotency_outcome_response(
     return web.json_response(payload, status=200 if terminal else 202)
 
 
+def _submit_request_envelope(code: str, message: str, *, status: int) -> web.Response:
+    """Wrap :func:`api_contracts.error_envelope` into a stable JSON response.
+
+    Lives next to the submit handlers because the helper exists only to
+    translate :class:`api_contracts.ContractError` outcomes into the
+    controller's public envelope shape — without leaking either raw
+    exception text or partial parse state to the caller.
+    """
+    envelope = _error_envelope(code, message, status=status)
+    return web.json_response(envelope, status=status)
+
+
 async def handle_submit_job(request: web.Request):
     """POST /v1/submit — Submit a job to the Redis queue."""
     _owner_fence = _queue_owner_route_fence('durable', '/v1/submit')
@@ -17882,11 +18041,22 @@ async def handle_submit_job(request: web.Request):
     if not session:
         return web.json_response({"error": "HTTP session not initialized, try again shortly"}, status=503)
     try:
-        data = await request.json()
+        raw_body = await request.read()
+    except web.HTTPRequestEntityTooLarge:
+        # aiohttp's default client_max_size fired before parse_json_object
+        # could see the body; treat it the same as the contract's size gate.
+        return _submit_request_envelope(
+            "body_too_large", "request body is too large", status=413
+        )
     except Exception:
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-    if not isinstance(data, Mapping):
-        return web.json_response({"error": "JSON body must be an object"}, status=400)
+        return _submit_request_envelope(
+            "invalid_json", "valid JSON required", status=400
+        )
+    try:
+        data = _parse_json_object(raw_body)
+    except _ContractError as exc:
+        status = 413 if exc.code == "body_too_large" else 400
+        return _submit_request_envelope(exc.code, exc.message, status=status)
     try:
         _idempotency_key, _request_sha256 = _request_idempotency_contract(
             request, data, operation="submit.llm.v1"
@@ -21550,13 +21720,22 @@ async def handle_submit_generation(
         return _owner_fence
     if data_override is None:
         try:
-            data = await request.json()
+            raw_body = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return _submit_request_envelope(
+                "body_too_large", "request body is too large", status=413
+            )
         except Exception:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
+            return _submit_request_envelope(
+                "invalid_json", "valid JSON required", status=400
+            )
+        try:
+            data = _parse_json_object(raw_body)
+        except _ContractError as exc:
+            status = 413 if exc.code == "body_too_large" else 400
+            return _submit_request_envelope(exc.code, exc.message, status=status)
     else:
         data = dict(data_override)
-    if not isinstance(data, Mapping):
-        return web.json_response({"error": "JSON body must be an object"}, status=400)
     try:
         _idempotency_key, _request_sha256 = _request_idempotency_contract(
             request, data, operation="submit.generation.v1"
@@ -22511,6 +22690,22 @@ def _apply_combined_gemma_visibility(
 
 
 async def _fetch_combined_gemma_visibility() -> tuple[dict | None, str | None]:
+    if not _combined_gemma_broker_enabled():
+        # The broker feature is opt-in. Disabled controllers must neither
+        # touch the embedded proxy nor open any HTTP session; doing so would
+        # silently leak probes into a production broker just because the
+        # loopback default happens to be reachable.
+        return None, "broker_disabled"
+    if _combined_gemma_broker_embedded():
+        try:
+            payload = _combined_gemma_api_proxy.broker_metrics()
+            if inspect.isawaitable(payload):
+                payload = await payload
+            if not isinstance(payload, dict):
+                return None, "broker_invalid_json"
+            return payload, None
+        except Exception as exc:
+            return None, f"broker_unavailable:{type(exc).__name__}"
     if session is None or session.closed:
         return None, "http_session_unavailable"
     url = os.environ.get(
@@ -22608,7 +22803,11 @@ def _summarize_combined_router_readiness(broker_payload: dict | None, error: str
         }
         result["live_member_count"] += int(live)
         result["accepting_member_count"] += int(accepting)
-    result["available"] = result["live_member_count"] > 0
+    # available requires the broker snapshot to be schema-valid AND at least
+    # one constituent to be live (fresh, non-stale, non-unknown, with positive
+    # backend capacity) AND actively accepting work. A live-but-draining
+    # member must not flip this gate green.
+    result["available"] = result["accepting_member_count"] > 0
     result["reason"] = "ready" if result["available"] else "no_live_constituents"
     return result
 
@@ -22659,9 +22858,14 @@ async def _llm_readiness_snapshot(config: dict) -> dict:
     pinned = await _probe_configured_llm_service(
         config, runtime_pin or scheduling.get("pinned_service")
     )
+    idle_target = _configured_llm_health_target(config)
     idle = {
         "configured": scheduling.get("idle_service"), "healthy": bool(llm._llm_healthy),
-        "reason": "ready" if llm._llm_healthy else "legacy_idle_probe_unready",
+        "reason": (
+            "ready"
+            if llm._llm_healthy
+            else ("not_configured" if idle_target is None else "registry_probe_unready")
+        ),
     }
     return _reduce_llm_readiness(combined_router=combined, pinned_route=pinned, idle_route=idle)
 
@@ -23688,7 +23892,17 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
     services = (_services_config or {}).get("services", {}) if isinstance(_services_config, dict) else {}
     if cache is None or broker is None or session is None or session.closed:
         return
-    for name in ("LLM-Primary", "LLM-Secondary", "LLM-CPU"):
+    broker_config = (_services_config or {}).get("combined_gemma_broker", {})
+    ordered_members = broker_config.get("ordered_members") if isinstance(broker_config, Mapping) else None
+    if (
+        not isinstance(ordered_members, (list, tuple))
+        or not ordered_members
+        or any(not isinstance(name, str) or not name for name in ordered_members)
+        or len(set(ordered_members)) != len(ordered_members)
+    ):
+        logger.error("Combined Gemma readiness refresh refused invalid ordered_members")
+        return
+    for name in ordered_members:
         # Use the cache-owned config (which carries ``idle_service_configured``)
         # so the readiness reducer sees the per-member synthetic fields that
         # were set at construction time. The live services.json does NOT carry
@@ -25057,13 +25271,46 @@ async def handle_llm_proxy(request: web.Request):
         llm.queued_requests -= 1
 
 
+_FORWARD_LLM_STRIPPED_HEADERS = frozenset(
+    {
+        # Credentials that must not leak past this controller.
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+        # Hop-by-hop headers that aiohttp / the upstream will set from
+        # the outgoing request itself; echoing caller-supplied values
+        # either contradicts the framework's framing or smuggles
+        # transport-layer controls past the public boundary.
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "upgrade",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailers",
+        "trailer",
+        "expect",
+    }
+)
+
+
 async def _forward_llm(method: str, path: str, body: bytes | None, headers: dict, backend_url: str = None) -> web.Response:
     llm.active_requests += 1
     llm.forward_attempts += 1
     url = f"{backend_url or LLM_BACKEND_URL}{path}"
     try:
-        fwd_headers = {k: v for k, v in headers.items()
-                       if k.lower() not in ("host", "content-length", "transfer-encoding")}
+        # Strip both caller-supplied credential headers AND hop-by-hop
+        # transport headers so a malicious upstream cannot impersonate
+        # the controller via headers smuggled on a forwarded request.
+        fwd_headers = {
+            key: value
+            for key, value in headers.items()
+            if isinstance(key, str) and key.lower() not in _FORWARD_LLM_STRIPPED_HEADERS
+        }
         async with session.request(
             method=method, url=url,
             data=body, headers=fwd_headers,
@@ -26809,16 +27056,79 @@ async def handle_generate_types(request: web.Request):
     return web.json_response(types)
 
 
+_GENERATE_OUTPUT_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """Return True iff ``candidate`` is the same file as ``root`` or
+    lives beneath it (after symlink resolution)."""
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_generate_output_name(raw: Any) -> str | None:
+    """Validate and normalize a generated-output filename.
+
+    Rejects:
+      * non-strings, empty strings, strings with control characters
+      * absolute paths (``/etc/passwd``)
+      * path separators (``subdir/file``, ``..\\windows.png``)
+      * dot segments (``.`` or ``..``)
+      * URL-decoded traversal (``%2e%2e%2fsecret``)
+
+    Returns the basename on success, ``None`` on rejection.  The
+    returned value is intentionally not ``os.path.normpath``-ed so a
+    legitimate trailing dot is preserved; the regex already forbids
+    path separators and dot-only names.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw):
+        return None
+    if "%" in raw:
+        # Any URL-encoded form is suspicious: percent-decoded segments
+        # may have slipped past the route regex.  Refuse outright so a
+        # caller cannot bypass the separator / dot-segment checks.
+        return None
+    if os.path.isabs(raw) or os.sep in raw or "/" in raw or "\\" in raw:
+        return None
+    if raw in {".", ".."}:
+        return None
+    if not _GENERATE_OUTPUT_FILENAME_RE.fullmatch(raw):
+        return None
+    return raw
+
+
 async def handle_generate_output(request: web.Request):
-    """GET /generate/output/{filename} — Serve a generated file."""
-    filename = request.match_info["filename"]
+    """GET /generate/output/{filename} — Serve a generated file.
 
-    for directory in (str(COMFYUI_ROOT / "output"), str(COMFYUI_ROOT / "input")):
-        filepath = os.path.join(directory, filename)
-        if os.path.isfile(filepath):
-            return web.FileResponse(filepath)
+    Only basenames are accepted; any absolute path, path separator,
+    dot segment, or URL-decoded traversal is rejected before the file
+    system is touched, and the resolved path must remain inside one
+    of the configured COMFYUI output/input roots.
+    """
+    raw_filename = request.match_info["filename"]
+    safe_filename = _safe_generate_output_name(raw_filename)
+    if safe_filename is None:
+        return web.json_response(
+            {"error": f"Invalid filename: {raw_filename!r}"}, status=400
+        )
 
-    return web.json_response({"error": f"File not found: {filename}"}, status=404)
+    output_root = (COMFYUI_ROOT / "output").resolve()
+    input_root = (COMFYUI_ROOT / "input").resolve()
+    candidate = (output_root / safe_filename).resolve()
+    if candidate.is_file() and _is_within(candidate, output_root):
+        return web.FileResponse(str(candidate))
+    candidate = (input_root / safe_filename).resolve()
+    if candidate.is_file() and _is_within(candidate, input_root):
+        return web.FileResponse(str(candidate))
+
+    return web.json_response(
+        {"error": f"File not found: {safe_filename}"}, status=404
+    )
 
 
 async def handle_generate_library(request: web.Request):
@@ -26981,7 +27291,7 @@ async def background_loop(app: web.Application):
             # ── Maintenance mode timeout check ──
             _cfg = _load_services_config()
             _scheduling = _cfg.get("scheduling", {})
-            if _scheduling.get("maintenance_mode") and _scheduling.get("maintenance_mode_expires"):
+            if _scheduling.get("maintenance_mode") is True and _scheduling.get("maintenance_mode_expires"):
                 if time.time() > _scheduling["maintenance_mode_expires"]:
                     _cfg["scheduling"]["maintenance_mode"] = False
                     _cfg["scheduling"].pop("maintenance_mode_expires", None)
@@ -27012,7 +27322,7 @@ async def background_loop(app: web.Application):
             elif vram._llm_evicted and not scheduler._current_backend and not scheduler._swapping and not scheduler._restoring:
                 # Maintenance mode: skip auto-restore
                 cfg = _load_services_config()
-                if cfg.get("scheduling", {}).get("maintenance_mode", False):
+                if _maintenance_mode_enabled(cfg.get("scheduling", {})):
                     pass  # Hands off
                 else:
                     # LLM evicted but no active GPU work — check if queues are empty
@@ -32641,12 +32951,25 @@ async def _unload_bundle(bundle_name: str) -> bool:
     member_names = bundle.get("services", [])
     config = _load_services_config()
     services_cfg = config.get("services", {})
+    native_helper_token_file = None
+    if any(
+        isinstance(services_cfg.get(member_name), Mapping)
+        and (services_cfg.get(member_name) or {}).get("native_task_host_url")
+        for member_name in member_names
+    ):
+        try:
+            native_helper_token_file = _required_native_helper_token_file()
+        except Exception as exc:
+            logger.warning("UnloadBundle: native-task helper credential unavailable: %s", exc)
+            return False
 
     for member_name in member_names:
         host_url = (services_cfg.get(member_name) or {}).get("native_task_host_url")
         if host_url:
             from native_task_client import native_host_has_unresolved
-            if session is None or await native_host_has_unresolved(session, host_url):
+            if session is None or await native_host_has_unresolved(
+                session, host_url, service_token_file=native_helper_token_file
+            ):
                 logger.warning("UnloadBundle: %s retains an unresolved native task", bundle_name)
                 return False
 
@@ -33458,7 +33781,9 @@ def _save_state(shutdown: bool = False):
             "llm_service_semantics": "configured_idle_service_legacy_alias",
             "scheduler_running": scheduler._running if scheduler else False,
             "pinned_service": scheduler._pinned_service if scheduler else None,
-            "maintenance_mode": _services_config.get("scheduling", {}).get("maintenance_mode", False) if _services_config else False,
+            "maintenance_mode": _maintenance_mode_enabled(
+                _services_config.get("scheduling", {}) if _services_config else {}
+            ),
             "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "gpu_states": gpu_states_dict,
         }
@@ -33985,7 +34310,7 @@ async def handle_maintenance(request: web.Request):
     """GET /maintenance — Return current maintenance mode status."""
     config = _load_services_config()
     scheduling = config.get("scheduling", {})
-    enabled = scheduling.get("maintenance_mode", False)
+    enabled = _maintenance_mode_enabled(scheduling)
     expires = scheduling.get("maintenance_mode_expires")
     remaining = None
     if enabled and expires:
@@ -36583,13 +36908,26 @@ let editingSvc = null;
 let chatHistory = [];  // [{role, content}]
 let currentServiceName = null;
 
+function serviceDisplayText(value, fallback) {
+  const candidate = typeof value === 'string' ? value.trim() : '';
+  if (candidate && candidate.length <= 200) return candidate;
+  const fallbackText = typeof fallback === 'string' ? fallback.trim() : '';
+  return fallbackText.slice(0, 200);
+}
+
+function safeServiceDisplay(value, fallback) {
+  return serviceDisplayText(value, fallback).replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[char]);
+}
+
 function populateDirectServiceSelector() {
   const sel = document.getElementById('direct-service');
   const svcs = state.services?.services || {};
   let html = '<option value="">-- Select a service --</option>';
   for (const [name, svc] of Object.entries(svcs)) {
     if (svc.type === 'llm_backend' || svc.type === 'generation_backend') {
-      html += `<option value="${name}">${svc.display || name}</option>`;
+      html += `<option value="${name}">${safeServiceDisplay(svc.display, name)}</option>`;
     }
   }
   sel.innerHTML = html;
@@ -36687,9 +37025,26 @@ function addChatMessage(role, content) {
     div.style.color = '#e0e0e0';
   }
 
-  div.innerHTML = '<span style="font-size:11px;color:#888;display:block;margin-bottom:4px">' +
-    (role === 'user' ? 'You' : svcName) + '</span>' +
-    content.replace(/\n/g, '<br>');
+  // Static role/service header — values come from the controlled
+  // registry, not from a user, so the span itself is built via
+  // createElement (no innerHTML assignment) and its label is set via
+  // textContent.
+  const header = document.createElement('span');
+  header.style.fontSize = '11px';
+  header.style.color = '#888';
+  header.style.display = 'block';
+  header.style.marginBottom = '4px';
+  header.textContent = role === 'user' ? 'You' : svcName;
+  div.appendChild(header);
+
+  // Caller-supplied content (model output or user input) MUST be
+  // inserted as text so a malicious payload cannot inject HTML or
+  // script tags into the dashboard.
+  const body = document.createElement('div');
+  body.style.whiteSpace = 'pre-wrap';
+  body.style.wordBreak = 'break-word';
+  body.textContent = content;
+  div.appendChild(body);
 
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
@@ -36987,7 +37342,7 @@ function renderBundlesTab() {
           const svc = (state.services?.services || {})[svcName];
           const health = (state.service_health || {})[svcName] || {};
           const dotColor = health.overall === 'healthy' ? '#4ade80' : health.overall === 'degraded' ? '#fbbf24' : '#666';
-          const displayName = svc?.display || svcName;
+          const displayName = safeServiceDisplay(svc?.display, svcName);
           html += `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px">`;
           html += `<span style="width:6px;height:6px;border-radius:50%;background:${dotColor};flex-shrink:0"></span>`;
           html += `<span style="color:#e0e0e0">${displayName}</span>`;
@@ -37499,7 +37854,7 @@ function renderServices() {
     return `<div class="${rowClass}" data-gpu-id="${gpuId}">
       <div class="svc-header">
         <span class="health-dot" title="${dotTitle}" style="background:${dotColor}"></span>
-        <span class="svc-name">${svc.display || svc.name}</span>
+        <span class="svc-name">${safeServiceDisplay(svc.display, svc.name)}</span>
         <label class="svc-toggle">
           <input type="checkbox" ${h.overall === 'healthy' || h.overall === 'degraded' ? 'checked' : ''}
                  onchange="toggleService('${name}')"
@@ -37715,9 +38070,9 @@ function editService(name) {
   editingSvc = name;
   const svc = state.services?.services?.[name];
   if (!svc) return;
-  document.getElementById('edit-modal-title').textContent = 'Edit Service: ' + (svc.display || name);
+  document.getElementById('edit-modal-title').textContent = 'Edit Service: ' + serviceDisplayText(svc.display, name);
   document.getElementById('edit-name').value = name;
-  document.getElementById('edit-display').value = svc.display || '';
+  document.getElementById('edit-display').value = serviceDisplayText(svc.display, '');
   document.getElementById('edit-port').value = svc.port != null ? svc.port : '';
   document.getElementById('edit-type').value = svc.type || 'other';
   document.getElementById('edit-enabled').checked = svc.enabled !== false;
@@ -37916,9 +38271,9 @@ function copyService(name) {
   copyingSvc = name;
   const svc = state.services?.services?.[name];
   if (!svc) return;
-  document.getElementById('copy-modal-title').textContent = 'COPY OF ' + (svc.display || name);
+  document.getElementById('copy-modal-title').textContent = 'COPY OF ' + serviceDisplayText(svc.display, name);
   document.getElementById('copy-name').value = name + '-copy';
-  document.getElementById('copy-display').value = (svc.display || name) + ' (copy)';
+  document.getElementById('copy-display').value = serviceDisplayText(svc.display, name) + ' (copy)';
   document.getElementById('copy-port').value = (svc.port || 0) + 1;
   document.getElementById('copy-type').value = svc.type || 'other';
   document.getElementById('copy-enabled').checked = svc.enabled !== false;
@@ -38021,7 +38376,7 @@ async function deleteServiceFromRow(name) {
   const svc = state.services?.services?.[name];
   if (!svc) return;
   if (svc.protected) { showToast(name + ' is protected', true); return; }
-  if (!confirm('Delete service ' + (svc.display || name) + '?')) return;
+  if (!confirm('Delete service ' + serviceDisplayText(svc.display, name) + '?')) return;
   const resp = await fetch('/services/' + name, { method: 'DELETE' });
   const data = await resp.json();
   if (resp.ok) {
@@ -38815,7 +39170,7 @@ function showServiceNode(nodeName) {
             svcHtml += `<div class="svc-row">
               <div class="svc-header">
                 <span class="health-dot" title="${dotTitle}" style="background:${dotColor}"></span>
-                <span class="svc-name">${svc.display || name}</span>
+                <span class="svc-name">${safeServiceDisplay(svc.display, name)}</span>
                 <label class="svc-toggle">
                   <input type="checkbox" ${active ? 'checked' : ''}
                     onchange="remoteServiceAction('${node.host}',${agentPort},'${name}','${active ? 'stop' : 'start'}')"
@@ -38913,9 +39268,9 @@ function editRemoteService(host, agentPort, svcName) {
       window._remoteEditSvcName = svcName;
 
       // Populate the existing modal with ALL fields from the service
-      document.getElementById('edit-modal-title').textContent = 'Edit Remote Service: ' + (svc.display || svcName);
+      document.getElementById('edit-modal-title').textContent = 'Edit Remote Service: ' + serviceDisplayText(svc.display, svcName);
       document.getElementById('edit-name').value = svcName;
-      document.getElementById('edit-display').value = svc.display || '';
+      document.getElementById('edit-display').value = serviceDisplayText(svc.display, '');
       document.getElementById('edit-port').value = svc.port != null ? svc.port : '';
       document.getElementById('edit-type').value = svc.type || 'llm_backend';
       document.getElementById('edit-enabled').checked = svc.enabled !== false;
@@ -39031,7 +39386,7 @@ async function remoteCopyService(host, agentPort, svcName) {
   const svc = await resp.json();
   const name = prompt('New service name:', svcName + '_copy');
   if (!name) return;
-  const display = prompt('Display name:', svc.display || svcName);
+  const display = prompt('Display name:', serviceDisplayText(svc.display, svcName));
   const port = parseInt(prompt('Port:', svc.port || '8080') || '0');
   const unit = prompt('Systemd unit:', svc.systemd_unit || name + '.service');
   const model = prompt('Model path:', svc.model_path || svc.model || '');
@@ -39224,17 +39579,11 @@ function fillEndpoint() {
   }
 }
 
-function prettyJson(str) {
+function formatResponseBody(str) {
   try {
-    const obj = JSON.parse(str);
-    return JSON.stringify(obj, null, 2)
-      .replace(/(".*?")\s*:/g, '<span class="json-key">$1</span>:')
-      .replace(/:\s*(".*?")/g, ': <span class="json-str">$1</span>')
-      .replace(/:\s*(true|false)/g, ': <span class="json-bool">$1</span>')
-      .replace(/:\s*(null)/g, ': <span class="json-null">$1</span>')
-      .replace(/:\s*(-?\d+\.?\d*)/g, ': <span class="json-num">$1</span>');
+    return JSON.stringify(JSON.parse(str), null, 2);
   } catch (_) {
-    return str;
+    return String(str);
   }
 }
 
@@ -39256,7 +39605,7 @@ function renderResponse(data) {
   headersEl.style.display = 'none';
 
   const bodyEl = document.getElementById('console-resp-body');
-  bodyEl.innerHTML = prettyJson(data.body || '');
+  bodyEl.textContent = formatResponseBody(data.body || '');
 }
 
 function renderHistory() {
@@ -39376,7 +39725,7 @@ function populateSchedulingSelectors() {
     if (name === 'gpu-manager') continue;
     const opt = document.createElement('option');
     opt.value = name;
-    opt.textContent = info.display || name;
+    opt.textContent = serviceDisplayText(info.display, name);
     pinSelect.appendChild(opt);
   }
   pinSelect.value = prevPin || state.pinnedService || '';
@@ -39413,7 +39762,7 @@ function populateIdleServices() {
     for (const [name, info] of llmBackends) {
       const h = health[name]?.overall || 'unknown';
       const selected = prevVal === name ? ' selected' : '';
-      html += `<option value="${name}"${selected}>${info.display || name} [${h}]</option>`;
+      html += `<option value="${name}"${selected}>${safeServiceDisplay(info.display, name)} [${h}]</option>`;
     }
     html += `</select>`;
     html += `</div>`;
@@ -39868,10 +40217,127 @@ a:hover {{ text-decoration: underline; }}
     return web.Response(text=html, content_type="text/html")
 
 
-async def handle_api_proxy(request: web.Request) -> web.Response:
-    """POST /api/proxy — Forward arbitrary HTTP requests to localhost backends (CORS proxy)."""
-    from urllib.parse import urlparse
+# Headers whose presence on caller-supplied outbound requests would
+# smuggle a credential past the upstream.  Forwarding them unchanged
+# defeats the loopback allowlist.
+_FORBIDDEN_PROXY_HEADER_NAMES = frozenset(
+    {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+)
 
+
+def _strip_credential_headers(headers: Any) -> dict[str, str]:
+    """Return a copy of *headers* with credential headers removed.
+
+    Non-dict inputs return an empty dict.  String values are preserved
+    unchanged; bytes values are decoded as UTF-8 with replacement so
+    that header construction cannot fail on caller-supplied garbage.
+    """
+    if not isinstance(headers, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in headers.items():
+        if not isinstance(key, str) or not key:
+            continue
+        # Header field names cannot legally contain surrounding whitespace,
+        # but normalize it here so malformed caller-supplied mappings cannot
+        # evade the credential denylist before aiohttp serializes them.
+        if key.strip().lower() in _FORBIDDEN_PROXY_HEADER_NAMES:
+            continue
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError:
+                value = value.decode("utf-8", errors="replace")
+        if not isinstance(value, str):
+            continue
+        result[key] = value
+    return result
+
+
+def _api_proxy_target_url(url: Any) -> str | None:
+    """Validate *url* and return its canonical loopback target URL.
+
+    Only http/https loopback URLs are considered.  Userinfo, missing
+    or malformed ports, the controller's own LISTEN_PORT, and ports
+    that are not declared on any enabled service in
+    ``_services_config`` are rejected.  The returned URL is rebuilt from
+    these validated parsed components, never from the caller's raw string.
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    if not isinstance(url, str) or not url:
+        return None
+    if any(ord(char) < 0x20 for char in url):
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    hostname = parsed.hostname
+    if hostname is None:
+        return None
+    hostname = hostname.lower()
+    if hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        return None
+    if port == LISTEN_PORT:
+        return None
+
+    cfg = _services_config if isinstance(_services_config, Mapping) else {}
+    services = cfg.get("services") if isinstance(cfg, Mapping) else None
+    if not isinstance(services, Mapping):
+        return None
+    declared = False
+    for svc in services.values():
+        if not isinstance(svc, Mapping):
+            continue
+        if not svc.get("enabled", False):
+            continue
+        declared_ports = set()
+        for field in ("port", "proxy_port"):
+            value = svc.get(field)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and 0 < value < 65536:
+                declared_ports.add(value)
+        if port in declared_ports:
+            declared = True
+            break
+    if not declared:
+        return None
+
+    # Rebuild the authority from the validated hostname and explicit port.
+    # Brackets are required for the IPv6 loopback literal.
+    authority_host = f"[{hostname}]" if ":" in hostname else hostname
+    return urlunparse((scheme, f"{authority_host}:{port}", parsed.path, "", parsed.query, ""))
+
+
+def _api_proxy_target_is_allowed(url: Any) -> bool:
+    """Return True iff *url* points at an enabled service's declared port."""
+    return _api_proxy_target_url(url) is not None
+
+
+async def handle_api_proxy(request: web.Request) -> web.Response:
+    """POST /api/proxy — Forward arbitrary HTTP requests to localhost backends (CORS proxy).
+
+    Only explicit loopback http/https URLs whose port is declared as
+    ``port`` or ``proxy_port`` on an enabled service in
+    ``_services_config`` are accepted.  Userinfo, missing/malformed
+    ports, the controller's own LISTEN_PORT, and undeclared ports are
+    all rejected before any I/O.  Authorization, Cookie,
+    Proxy-Authorization and X-API-Key headers are stripped from
+    caller-supplied headers before forwarding.
+    """
     try:
         body = await request.json()
     except (ValueError, json.JSONDecodeError):
@@ -39886,12 +40352,15 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
     if method not in allowed_methods:
         return web.json_response({"error": f"Unsupported method: {method}"}, status=400)
 
-    parsed = urlparse(url)
-    hostname = parsed.hostname or ""
-    if hostname not in ("localhost", "127.0.0.1", "::1", "[::1]"):
-        return web.json_response({"error": "Only localhost targets are allowed (SSRF blocked)"}, status=403)
+    target_url = _api_proxy_target_url(url)
+    if target_url is None:
+        return web.json_response(
+            {"error": "proxy target is not an enabled service port"},
+            status=403,
+        )
 
     req_headers = body.get("headers", {})
+    safe_headers = _strip_credential_headers(req_headers)
     req_body = body.get("body")
 
     if req_body and isinstance(req_body, str):
@@ -39904,17 +40373,13 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
     if body_bytes and len(body_bytes) > 10 * 1024 * 1024:
         return web.json_response({"error": "Request body exceeds 10MB limit"}, status=413)
 
-    target_url = url if url.startswith("http") else f"http://localhost{parsed.path}"
-    if parsed.query:
-        target_url = f"{target_url}?{parsed.query}"
-
     timeout = ClientTimeout(total=30)
     start = time.monotonic()
     try:
         async with session.request(
             method,
             target_url,
-            headers=req_headers,
+            headers=safe_headers,
             data=body_bytes,
             timeout=timeout,
             ssl=False,
@@ -41357,13 +41822,13 @@ async def ensure_services_running():
     if saved_state.get("maintenance_mode"):
         if _services_config is None:
             _services_config = _load_services_config()
-        if not _services_config.get("scheduling", {}).get("maintenance_mode", False):
+        if not _maintenance_mode_enabled(_services_config.get("scheduling", {})):
             _services_config.setdefault("scheduling", {})["maintenance_mode"] = True
             _save_services_config(_services_config)
             logger.info("State restore: maintenance_mode restored from state file")
 
     # Maintenance mode: hands off everything
-    if _services_config.get("scheduling", {}).get("maintenance_mode", False):
+    if _maintenance_mode_enabled(_services_config.get("scheduling", {})):
         logger.info("Maintenance mode active — skipping auto-start of critical services")
         return
 

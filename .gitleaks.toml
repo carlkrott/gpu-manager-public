@@ -4,12 +4,9 @@ title = "GPUManager source-only gitleaks configuration"
 useDefault = true
 
 [allowlist]
-description = "Known public identifiers that trigger generic-api-key heuristics"
-paths = [
-    '''scripts/gemma_broker/runtime\.py$''',
-    '''scripts/gpu-manager\.py$''',
-]
+description = "Exact public identifiers that trigger generic-api-key heuristics"
+regexTarget = "secret"
 regexes = [
-    '''^(?:self\.)?api_service$''',
+    '''^polling_wait=self\._polling_wait$''',
     '''^wan-t2v-esrgan-rife$''',
 ]

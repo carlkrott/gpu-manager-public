@@ -19,14 +19,17 @@ Contributions should keep this repository source-only, portable and fail-closed.
 
 ## Verification
 
-From the repository root:
+From the repository root, export the public payload to a guaranteed-new temporary destination and then check that export together with the receipt the exporter just generated:
 
     PYTHONPATH=scripts python3 -m pytest -q tests/publication
-    PYTHONPATH=scripts python3 scripts/check_public_payload.py .
+    EXPORT_DIR="$(mktemp -d)/gpumanager-public-export"
+    mkdir -p "$(dirname "$EXPORT_DIR")"
+    PYTHONPATH=scripts python3 scripts/export_public_source.py --manifest release/public-files.json "$EXPORT_DIR"
+    PYTHONPATH=scripts python3 scripts/check_public_payload.py "$EXPORT_DIR" --manifest "$EXPORT_DIR/release/export-manifest.json"
     python3 examples/combined-gemma/demo.py --dry-run
     python3 examples/combined-gemma/demo.py --mock-demo
 
-For manifest-affecting changes, refresh the SHA-256 and size records in `release/public-files.json`, export to a new destination, and rerun the checker against the exact export. Do not reuse an old export directory.
+The checker runs against the freshly built export and the receipt the exporter wrote next to it; the developer source tree itself is not checked or cleaned. For public file-set changes, update only the path/disposition entries in `release/public-files.json`, re-run the export, then rerun the checker against that exact export. Do not hand-edit receipt fields or reuse an old export directory. There is no numeric coverage gate.
 
 ## Pull requests
 

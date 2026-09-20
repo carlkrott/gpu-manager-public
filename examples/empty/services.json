@@ -6,11 +6,11 @@
   "generation_templates": {},
   "pipeline_providers": {},
   "scheduling": {
-    "queue_owner": "durable_only",
+    "queue_owner": "durable",
     "scheduler_owns_load": false,
     "scheduler_dry_run_mode": true,
     "proactive_scheduling_enabled": false,
-    "maintenance_mode": false,
+    "maintenance_mode": true,
     "idle_service": "",
     "idle_services": {}
   }

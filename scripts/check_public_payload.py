@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -12,6 +13,11 @@ from sanitize_registry import sanitize_registry
 
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
+_PUBLIC_MANIFEST_SCHEMA = "gpumanager.public-files.v1"
+_EXPORT_MANIFEST_SCHEMA = "gpumanager.exported-files.v1"
+_ALLOWED_DISPOSITIONS = frozenset(
+    {"core", "portable_optional_integration", "installation_derived_rewrite", "utility"}
+)
 _BINARY_SUFFIXES = frozenset(
     {".gguf", ".bin", ".pt", ".ckpt", ".safetensors", ".onnx", ".pkl", ".db", ".sqlite", ".so", ".dll", ".exe", ".whl", ".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar"}
 )
@@ -35,25 +41,94 @@ def _record(violations: list[dict[str, str]], path: str, rule: str, detail: str)
     violations.append({"path": path, "rule": rule, "detail": detail})
 
 
-def _manifest_paths(root: Path, manifest: Path | None) -> list[Path]:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest_entries(root: Path, manifest: Path | None) -> tuple[list[dict[str, Any]], bool]:
     if manifest is None:
-        return sorted(
+        return ([{"path": path.relative_to(root).as_posix(), "file": path} for path in sorted(
             path for path in root.rglob("*")
             if path.is_file() and ".git" not in path.parts and "__pycache__" not in path.parts
-        )
+        )], False)
     document = json.loads(manifest.read_text(encoding="utf-8"))
     entries = document.get("files") if isinstance(document, dict) else None
     if not isinstance(entries, list):
         raise ValueError("manifest files must be a list")
-    paths: list[Path] = []
+    schema = document.get("schema_version") if isinstance(document, dict) else None
+    is_receipt = schema == _EXPORT_MANIFEST_SCHEMA
+    is_public_manifest = schema == _PUBLIC_MANIFEST_SCHEMA
+    if is_public_manifest and document.get("file_count") != len(entries):
+        raise ValueError("manifest file_count does not match files")
+    if is_receipt and document.get("file_count") != len(entries):
+        raise ValueError("receipt file_count does not match files")
+    if is_receipt:
+        source_digest = document.get("source_manifest_sha256")
+        if not isinstance(source_digest, str) or len(source_digest) != 64 or any(c not in "0123456789abcdef" for c in source_digest):
+            raise ValueError("receipt source_manifest_sha256 must be lowercase hexadecimal")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise ValueError("manifest entries must contain path strings")
         relative = Path(entry["path"])
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(f"manifest path is not relative: {entry['path']!r}")
-        paths.append(root / relative)
-    return paths
+        normalized = relative.as_posix()
+        if normalized in seen:
+            raise ValueError(f"manifest contains duplicate path: {normalized}")
+        seen.add(normalized)
+        if is_public_manifest or is_receipt:
+            if entry.get("disposition") not in _ALLOWED_DISPOSITIONS:
+                raise ValueError(f"unsupported disposition for {relative}: {entry.get('disposition')!r}")
+        if is_public_manifest and ("sha256" in entry or "size" in entry):
+            raise ValueError("path/disposition manifest must not contain receipt fields")
+        item: dict[str, Any] = {
+            "path": normalized,
+            "file": root / relative,
+            "disposition": entry.get("disposition"),
+        }
+        if is_receipt:
+            digest = entry.get("sha256")
+            size = entry.get("size")
+            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError(f"receipt sha256 must be lowercase hexadecimal for {relative}")
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ValueError(f"receipt size must be a non-negative integer for {relative}")
+            item.update({"sha256": digest, "size": size})
+        result.append(item)
+    return result, is_receipt
+
+
+def _regular_file_paths(root: Path) -> set[str]:
+    return {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink() and ".git" not in path.parts and "__pycache__" not in path.parts
+    }
+
+
+def _symlink_paths(root: Path) -> set[str]:
+    """Return every payload symlink (file or directory) under ``root``.
+
+    Symlinks are rejected for the entire publication payload because receipt
+    validation would otherwise follow them and silently hash external
+    targets.  ``.git`` is excluded so checkout metadata does not trigger
+    the rule.
+    """
+    return {
+        path.relative_to(root).as_posix()
+        for path in sorted(root.rglob("*"))
+        if path.is_symlink() and ".git" not in path.parts
+    }
+
+
+def _path_disposition_map(entries: list[dict[str, Any]]) -> dict[str, str]:
+    return {entry["path"]: entry["disposition"] for entry in entries}
 
 
 def _check_structured(path: Path, relative: str, violations: list[dict[str, str]]) -> None:
@@ -76,22 +151,77 @@ def _check_structured(path: Path, relative: str, violations: list[dict[str, str]
 def check_public_payload(root: Path, *, manifest: Path | None = None) -> dict[str, Any]:
     root = Path(root).resolve(strict=True)
     violations: list[dict[str, str]] = []
+    # Symlinks must be rejected for the entire payload before any hashing.
+    # Receipt validation would otherwise follow a symlink and silently hash
+    # the external target, defeating the bound-byte receipt.
+    for relative in sorted(_symlink_paths(root)):
+        _record(
+            violations,
+            relative,
+            "payload_symlink_forbidden",
+            "payload symlinks are not publishable; remove before re-exporting",
+        )
     try:
-        paths = _manifest_paths(root, manifest)
+        entries, is_receipt = _manifest_entries(root, manifest)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         return {"ok": False, "file_count": 0, "violations": [{"path": str(manifest or root), "rule": "invalid_manifest", "detail": str(exc)}]}
 
     checked = 0
-    for path in paths:
+    if is_receipt:
+        source_manifest = root / "release/public-files.json"
+        if not source_manifest.is_file():
+            _record(
+                violations,
+                "release/public-files.json",
+                "receipt_manifest_mismatch",
+                "receipt is not bound to a public-files manifest in the payload",
+            )
+        else:
+            assert manifest is not None
+            try:
+                source_entries, source_is_receipt = _manifest_entries(root, source_manifest)
+                receipt_map = _path_disposition_map(entries)
+                source_map = _path_disposition_map(source_entries)
+                if source_is_receipt or source_map != receipt_map:
+                    _record(
+                        violations,
+                        "release/public-files.json",
+                        "receipt_manifest_parity_mismatch",
+                        "receipt paths/dispositions do not match the bound public-files manifest",
+                    )
+                receipt_document = json.loads(manifest.read_text(encoding="utf-8"))
+                if _sha256(source_manifest) != receipt_document["source_manifest_sha256"]:
+                    _record(violations, "release/public-files.json", "receipt_manifest_mismatch", "receipt does not bind the path/disposition manifest")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                _record(violations, "release/public-files.json", "receipt_manifest_mismatch", str(exc))
+    symlinked_paths = {
+        relative
+        for relative in {entry["path"] for entry in entries}
+        if (root / relative).is_symlink()
+    }
+    for entry in entries:
+        path = entry["file"]
+        relative = entry["path"]
         try:
-            relative = path.relative_to(root).as_posix()
+            path.relative_to(root)
         except ValueError:
             _record(violations, str(path), "path_outside_root", "manifest path escapes payload root")
             continue
         checked += 1
+        if relative in symlinked_paths:
+            # Already recorded as payload_symlink_forbidden; do not hash the
+            # symlink target, which would silently pass receipt validation.
+            continue
         if not path.is_file():
             _record(violations, relative, "missing_file", "manifested payload file is missing")
             continue
+        if is_receipt:
+            size = path.stat().st_size
+            if size != entry["size"]:
+                _record(violations, relative, "receipt_size_mismatch", f"receipt={entry['size']} actual={size}")
+            actual_digest = _sha256(path)
+            if actual_digest != entry["sha256"]:
+                _record(violations, relative, "receipt_hash_mismatch", "SHA-256 receipt does not match payload")
         if _PRIVATE_REPORT_NAME.search(path.name):
             _record(violations, relative, "private_report_filename", "private audit/report filename is not publishable")
         size = path.stat().st_size
@@ -117,6 +247,25 @@ def check_public_payload(root: Path, *, manifest: Path | None = None) -> dict[st
             for match in _PEM.finditer(text):
                 _record(violations, relative, "key_or_certificate_forbidden", match.group(0))
         _check_structured(path, relative, violations)
+
+    if is_receipt:
+        actual_paths = _regular_file_paths(root)
+        expected_paths = {entry["path"] for entry in entries}
+        expected_paths.add("release/export-manifest.json")
+        for relative in sorted(actual_paths - expected_paths):
+            _record(
+                violations,
+                relative,
+                "receipt_unlisted_file",
+                "regular file is not listed in the export receipt",
+            )
+        if "release/export-manifest.json" not in actual_paths:
+            _record(
+                violations,
+                "release/export-manifest.json",
+                "receipt_missing_file",
+                "export receipt is missing from the payload",
+            )
 
     return {"ok": not violations, "file_count": checked, "violations": violations}
 

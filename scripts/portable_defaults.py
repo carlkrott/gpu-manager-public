@@ -31,11 +31,11 @@ def empty_services_config() -> dict:
         "generation_templates": {},
         "pipeline_providers": {},
         "scheduling": {
-            "queue_owner": "durable_only",
+            "queue_owner": "durable",
             "scheduler_owns_load": False,
             "scheduler_dry_run_mode": True,
             "proactive_scheduling_enabled": False,
-            "maintenance_mode": False,
+            "maintenance_mode": True,
             "idle_service": "",
             "idle_services": {},
         },

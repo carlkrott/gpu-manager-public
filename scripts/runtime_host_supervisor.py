@@ -22,7 +22,12 @@ from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from runtime_host_client import ACTION_SCHEMA, RESULT_SCHEMA
+from runtime_host_client import (
+    ACTION_SCHEMA,
+    HelperTokenAuth,
+    RESULT_SCHEMA,
+    resolve_required_service_credential,
+)
 from runtime_contracts import (
     model_set_fingerprint,
     runtime_profile_fingerprint,
@@ -619,8 +624,44 @@ class HostRuntimeSupervisor:
             return result
 
 
-def create_app(supervisor: HostRuntimeSupervisor) -> web.Application:
+def create_app(
+    supervisor: HostRuntimeSupervisor,
+    *,
+    service_token: str | None = None,
+    service_token_file: str | os.PathLike[str] | None = None,
+    allow_unauthenticated_test_app: bool = False,
+) -> web.Application:
+    """Build the supervisor service app with startup-time auth resolution.
+
+    ``allow_unauthenticated_test_app`` is an explicit in-process test seam;
+    production entrypoints must leave it false.
+    """
+    if allow_unauthenticated_test_app:
+        if service_token is not None or service_token_file is not None:
+            raise ValueError("unauthenticated test app cannot receive credentials")
+        helper_auth = HelperTokenAuth(use_environment=False)
+    else:
+        credential = resolve_required_service_credential(
+            service_token=service_token, service_token_file=service_token_file
+        )
+        helper_auth = HelperTokenAuth(service_token=credential)
+
     async def handle(request: web.Request) -> web.Response:
+        if not helper_auth.available():
+            return web.json_response(
+                {"error": "helper service authentication is unavailable"},
+                status=503,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not helper_auth.authorized(request):
+            return web.json_response(
+                {"error": "helper service authentication required"},
+                status=401,
+                headers={
+                    "Cache-Control": "no-store",
+                    "WWW-Authenticate": "Bearer",
+                },
+            )
         try:
             body = await request.json()
             if not isinstance(body, Mapping):
@@ -638,6 +679,11 @@ def create_app(supervisor: HostRuntimeSupervisor) -> web.Application:
     return app
 
 
+def create_unauthenticated_test_app(supervisor: HostRuntimeSupervisor) -> web.Application:
+    """Return a neutral unauthenticated app for in-process tests only."""
+    return create_app(supervisor, allow_unauthenticated_test_app=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--overlay", required=True, type=Path)
@@ -645,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fence-ledger", type=Path, default=Path("/var/lib/gpu-manager-host/fences.json"))
     parser.add_argument("--profiles-root", type=Path)
     parser.add_argument("--model-sets-root", type=Path)
+    parser.add_argument("--token-file", type=Path)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     overlay = _load_json(args.overlay)
@@ -670,7 +717,11 @@ def main(argv: list[str] | None = None) -> int:
     supervisor = HostRuntimeSupervisor(overlay, FenceLedger(args.fence_ledger))
     old_umask = os.umask(0o007)
     try:
-        web.run_app(create_app(supervisor), path=str(args.socket), print=None)
+        web.run_app(
+            create_app(supervisor, service_token_file=args.token_file),
+            path=str(args.socket),
+            print=None,
+        )
     finally:
         os.umask(old_umask)
     return 0
@@ -682,5 +733,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "FENCE_SCHEMA", "FenceLedger", "HostRuntimeSupervisor", "HostSupervisorError",
-    "OVERLAY_SCHEMA", "create_app", "validate_overlay", "validate_overlay_profiles",
+    "OVERLAY_SCHEMA", "create_app", "create_unauthenticated_test_app",
+    "validate_overlay", "validate_overlay_profiles",
 ]
