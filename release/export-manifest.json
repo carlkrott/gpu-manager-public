@@ -22,8 +22,8 @@
     {
       "disposition": "utility",
       "path": ".gitleaks.toml",
-      "sha256": "414349bd03271c3b535fee5903cd2c87e15e07a34d0e111bf52af6bf69b36dcf",
-      "size": 354
+      "sha256": "77dbd14500a0e8604c68a6c59b2cad6b162f6ff10b7722d0aa3ce068b10d4257",
+      "size": 294
     },
     {
       "disposition": "core",
@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "467c4f28fd46c186d3dc9cd4718ced06f8657b67121a3f6bcc93bc23b5169ce3",
-      "size": 1906092
+      "sha256": "74d48f07fbccdef41038cfb504dc5ec364fe3095a9e12b12b4303dcbebcc844b",
+      "size": 1906252
     },
     {
       "disposition": "core",
@@ -706,14 +706,14 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_public_payload.py",
-      "sha256": "4017aa5e8f9b2a4436fe984c091c6ada402ee06592184fb66c5b4bc207ee0bcc",
-      "size": 6036
+      "sha256": "a195178967beaaba9c667256bdbdcb76cffb7d79214eb7218aec2f16d5e08b10",
+      "size": 6451
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_reaper_state_and_probe.py",
-      "sha256": "2df7d70481c8290b12201125c5d77f5927bf1a1c32996091a39cf4d8397a16da",
-      "size": 5424
+      "sha256": "2ad51ce41767305b68687ccb0e670f2ce11ba12845c87f27384cfdb855194d4b",
+      "size": 7131
     },
     {
       "disposition": "core",

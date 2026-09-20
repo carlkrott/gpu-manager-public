@@ -224,6 +224,15 @@ _current_selected_group = None
 _drain_cutoffs = {}
 _last_next_decision = {}
 
+
+def _maintenance_mode_enabled(scheduling: Mapping[str, Any] | None) -> bool:
+    """Normalize maintenance mode, failing closed on malformed values."""
+    if not isinstance(scheduling, Mapping):
+        return True
+    raw = scheduling.get("maintenance_mode", False)
+    return raw if isinstance(raw, bool) else True
+
+
 def _phase3_scheduling_config():
     global _services_config
     try:
@@ -247,12 +256,7 @@ def _phase3_scheduling_config():
     # services.json (the source of truth when env-var is unset) is loaded from
     # SERVICES_CONFIG_PATH; see top-of-file for the resolved runtime location.
     env_owns = os.environ.get('GPU_MANAGER_SCHEDULER_OWNS_LOAD', 'false').strip().lower() == 'true'
-    raw_maintenance_mode = sched.get('maintenance_mode', False)
-    maintenance_mode = (
-        raw_maintenance_mode
-        if isinstance(raw_maintenance_mode, bool)
-        else True
-    )
+    maintenance_mode = _maintenance_mode_enabled(sched)
     return {
         'grace_period_seconds': sched.get('grace_period_seconds', 30),
         'grace_min_resume_interval_s': sched.get('grace_min_resume_interval_s', 60),
@@ -3506,7 +3510,7 @@ def _orphan_reaper_status(*, now: float | None = None) -> dict[str, Any]:
 
     config = _services_config if isinstance(_services_config, Mapping) else {}
     scheduling = config.get("scheduling", {}) or {}
-    if scheduling.get("maintenance_mode") is True:
+    if _maintenance_mode_enabled(scheduling):
         state.update(state="paused", reason="maintenance_mode")
     elif manager is None or getattr(manager, "_running", False) is not True:
         state.update(state="paused", reason="scheduler_not_running")
@@ -3785,7 +3789,7 @@ def _canonical_runtime_semantics(readiness: dict | None = None) -> dict:
         configured_idle_service=_get_idle_service_name(),
         configured_idle_services_by_gpu=idle_by_gpu,
         pinned_service=str(pinned or ""),
-        maintenance_mode=bool(scheduling.get("maintenance_mode", False)),
+        maintenance_mode=_maintenance_mode_enabled(scheduling),
         enabled_service_names=enabled_units,
         disabled_service_names=disabled_units,
         loaded_runtime_services=runtime["services"],
@@ -10641,7 +10645,7 @@ class GPUScheduler:
             return
 
         config = _load_services_config()
-        if config.get("scheduling", {}).get("maintenance_mode", False):
+        if _maintenance_mode_enabled(config.get("scheduling", {})):
             self.logger.info("Maintenance mode active — skipping service restore")
             return
 
@@ -10762,7 +10766,7 @@ class GPUScheduler:
 
         # Maintenance mode: don't interrupt LLM or attempt relief
         config = _load_services_config()
-        if config.get("scheduling", {}).get("maintenance_mode", False):
+        if _maintenance_mode_enabled(config.get("scheduling", {})):
             self.logger.info("Maintenance mode — skipping LLM relief")
             return
 
@@ -10888,7 +10892,7 @@ class GPUScheduler:
         # We still need the full config below for bundles/templates/etc.
         config = _load_services_config()
         scheduling = config.get("scheduling", {})
-        if scheduling.get("maintenance_mode", False):
+        if _maintenance_mode_enabled(scheduling):
             return
         # Skip if any legacy ComfyUI/ACE-Step queue is active; those paths
         # manage their own lifecycle.
@@ -11450,7 +11454,7 @@ class GPUScheduler:
         scheduling = config.get("scheduling", {})
 
         # Maintenance mode: hands off
-        if scheduling.get("maintenance_mode", False):
+        if _maintenance_mode_enabled(scheduling):
             return
 
         # Phase 5.2.66: coexistence mode (manual SRE pause).
@@ -12934,7 +12938,7 @@ class VRAMLifecycleManager:
                 skip_bundle_name=skip_bundle_name,
             )
         config = _load_services_config()
-        if config.get("scheduling", {}).get("maintenance_mode", False):
+        if _maintenance_mode_enabled(config.get("scheduling", {})):
             self.logger.info(f"VRAM: Maintenance mode — skipping LLM eviction ({reason})")
             return False
 
@@ -17670,7 +17674,7 @@ async def handle_health(request: web.Request):
     status["llm_readiness"] = readiness
     status["llm_available"] = readiness["available"]
     status["llm_healthy"] = readiness["available"]
-    status["maintenance_mode"] = config.get("scheduling", {}).get("maintenance_mode", False)
+    status["maintenance_mode"] = _maintenance_mode_enabled(config.get("scheduling", {}))
     # ── Phase 1: OOM state surfaced for dashboard ────────────────────
     gpu_states_map = globals().get("_gpu_states", {})
     # Phase 2: include the recent OOM events (last hour) so the dashboard
@@ -27287,7 +27291,7 @@ async def background_loop(app: web.Application):
             # ── Maintenance mode timeout check ──
             _cfg = _load_services_config()
             _scheduling = _cfg.get("scheduling", {})
-            if _scheduling.get("maintenance_mode") and _scheduling.get("maintenance_mode_expires"):
+            if _scheduling.get("maintenance_mode") is True and _scheduling.get("maintenance_mode_expires"):
                 if time.time() > _scheduling["maintenance_mode_expires"]:
                     _cfg["scheduling"]["maintenance_mode"] = False
                     _cfg["scheduling"].pop("maintenance_mode_expires", None)
@@ -27318,7 +27322,7 @@ async def background_loop(app: web.Application):
             elif vram._llm_evicted and not scheduler._current_backend and not scheduler._swapping and not scheduler._restoring:
                 # Maintenance mode: skip auto-restore
                 cfg = _load_services_config()
-                if cfg.get("scheduling", {}).get("maintenance_mode", False):
+                if _maintenance_mode_enabled(cfg.get("scheduling", {})):
                     pass  # Hands off
                 else:
                     # LLM evicted but no active GPU work — check if queues are empty
@@ -33777,7 +33781,9 @@ def _save_state(shutdown: bool = False):
             "llm_service_semantics": "configured_idle_service_legacy_alias",
             "scheduler_running": scheduler._running if scheduler else False,
             "pinned_service": scheduler._pinned_service if scheduler else None,
-            "maintenance_mode": _services_config.get("scheduling", {}).get("maintenance_mode", False) if _services_config else False,
+            "maintenance_mode": _maintenance_mode_enabled(
+                _services_config.get("scheduling", {}) if _services_config else {}
+            ),
             "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "gpu_states": gpu_states_dict,
         }
@@ -34304,7 +34310,7 @@ async def handle_maintenance(request: web.Request):
     """GET /maintenance — Return current maintenance mode status."""
     config = _load_services_config()
     scheduling = config.get("scheduling", {})
-    enabled = scheduling.get("maintenance_mode", False)
+    enabled = _maintenance_mode_enabled(scheduling)
     expires = scheduling.get("maintenance_mode_expires")
     remaining = None
     if enabled and expires:
@@ -41816,13 +41822,13 @@ async def ensure_services_running():
     if saved_state.get("maintenance_mode"):
         if _services_config is None:
             _services_config = _load_services_config()
-        if not _services_config.get("scheduling", {}).get("maintenance_mode", False):
+        if not _maintenance_mode_enabled(_services_config.get("scheduling", {})):
             _services_config.setdefault("scheduling", {})["maintenance_mode"] = True
             _save_services_config(_services_config)
             logger.info("State restore: maintenance_mode restored from state file")
 
     # Maintenance mode: hands off everything
-    if _services_config.get("scheduling", {}).get("maintenance_mode", False):
+    if _maintenance_mode_enabled(_services_config.get("scheduling", {})):
         logger.info("Maintenance mode active — skipping auto-start of critical services")
         return
 

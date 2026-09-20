@@ -43,6 +43,30 @@ def test_maintenance_mode_dominates_scheduler_ownership_and_dispatch(monkeypatch
 def test_invalid_maintenance_value_fails_safe(monkeypatch):
     module = _load_controller()
     monkeypatch.setenv("GPU_MANAGER_SCHEDULER_OWNS_LOAD", "true")
+    monkeypatch.setattr(module, "ORPHAN_REAPER_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        module,
+        "_get_loaded_runtime_snapshot",
+        lambda: {"services": [], "bundles": []},
+        raising=False,
+    )
+    monkeypatch.setattr(module, "_get_idle_service_name", lambda: "", raising=False)
+    monkeypatch.setattr(module, "_gpu_states", {}, raising=False)
+    monkeypatch.setattr(
+        module,
+        "vram",
+        SimpleNamespace(
+            gpu_state=SimpleNamespace(value="llm_loaded"),
+            _llm_evicted=False,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "llm",
+        SimpleNamespace(active_requests=0, queued_requests=0),
+        raising=False,
+    )
 
     for invalid in ("true", 1, None):
         module._services_config = {
@@ -53,13 +77,40 @@ def test_invalid_maintenance_value_fails_safe(monkeypatch):
                 "proactive_scheduling_enabled": True,
             }
         }
+        monkeypatch.setattr(
+            module,
+            "_load_services_config",
+            lambda: module._services_config,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            module,
+            "scheduler",
+            SimpleNamespace(
+                _running=True,
+                _last_orphan_reaper_at=99.0,
+                _expected_pids=set(),
+                _terminated_pids={},
+                _pinned_service="",
+                _restoring=False,
+            ),
+            raising=False,
+        )
 
         config = module._phase3_scheduling_config()
+        reaper = module._orphan_reaper_status(now=100.0)
+        semantics = module._canonical_runtime_semantics(
+            {"available": False, "availability_sources": []}
+        )
 
         assert config["maintenance_mode"] is True
         assert config["scheduler_owns_load"] is False
         assert config["scheduler_dry_run_mode"] is True
         assert config["proactive_scheduling_enabled"] is False
+        assert reaper["state"] == "paused"
+        assert reaper["reason"] == "maintenance_mode"
+        assert semantics["runtime_mode"] == "maintenance"
+        assert semantics["configured_intent"]["maintenance_mode"] is True
 
 
 def test_reaper_state_is_paused_during_maintenance():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tomllib
 
 import pytest
 
@@ -15,6 +16,18 @@ from sanitize_registry import sanitize_registry
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_gitleaks_allowlist_cannot_suppress_whole_source_files():
+    config = tomllib.loads((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+
+    allowlist = config["allowlist"]
+    assert "paths" not in allowlist
+    assert allowlist["regexTarget"] == "secret"
+    assert set(allowlist["regexes"]) == {
+        r"^polling_wait=self\._polling_wait$",
+        r"^wan-t2v-esrgan-rife$",
+    }
 
 
 def test_sanitize_private_hosts_and_paths_without_mutating_input():
