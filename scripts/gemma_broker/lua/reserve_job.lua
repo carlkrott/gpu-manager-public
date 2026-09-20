@@ -3,11 +3,11 @@
 --       dispatcher leader hash, attempt hash
 -- ARGV: job_id, member_name, expected member state_version, now, attempt_id,
 --       claimed_job_json, reserved_member_json, leader_owner, fencing_token,
---       expected_job_state_version, attempt_json
+--       expected_job_state_version, attempt_json, leadership_now
 local leader_owner = redis.call('HGET', KEYS[5], 'owner')
 local leader_token = redis.call('HGET', KEYS[5], 'token')
 local leader_expiry = tonumber(redis.call('HGET', KEYS[5], 'expires_at') or '-1')
-if leader_owner ~= ARGV[8] or leader_token ~= ARGV[9] or leader_expiry <= tonumber(ARGV[4]) then
+if leader_owner ~= ARGV[8] or leader_token ~= ARGV[9] or leader_expiry <= tonumber(ARGV[12]) then
   return {err='DISPATCHER_FENCE_STALE'}
 end
 local state = redis.call('HGET', KEYS[3], 'state')

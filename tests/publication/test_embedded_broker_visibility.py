@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib.util
 from pathlib import Path
@@ -28,6 +29,38 @@ def _load_controller():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_embedded_broker_uses_process_independent_epoch_leadership_clock():
+    source = CONTROLLER.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    initializer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_initialize_combined_gemma_broker"
+    )
+    repository_calls = [
+        node
+        for node in ast.walk(initializer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "RedisJobRepository"
+    ]
+
+    assert len(repository_calls) == 1
+    leadership_clock = next(
+        (
+            keyword.value
+            for keyword in repository_calls[0].keywords
+            if keyword.arg == "leadership_clock"
+        ),
+        None,
+    )
+    assert isinstance(leadership_clock, ast.Attribute)
+    assert isinstance(leadership_clock.value, ast.Name)
+    assert leadership_clock.value.id == "time"
+    assert leadership_clock.attr == "time"
 
 
 def test_embedded_visibility_uses_in_process_proxy_without_http_session(monkeypatch):

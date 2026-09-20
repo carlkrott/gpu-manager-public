@@ -1737,13 +1737,18 @@ class RedisJobRepository:
                 self._leader_key(),
                 self._attempt_key(attempt_id),
             )
+            leadership_now = (
+                float(self._leadership_clock())
+                if self._leadership_clock
+                else now
+            )
             try:
                 self.client.eval(
                     RESERVE_JOB_LUA, len(keys), *keys,
                     selected.job_id, member.name, member.state_version, now, attempt_id,
                     self._json(claimed.to_dict()), self._json(reserved_member.to_dict()),
                     leader_owner, fencing_token, selected.state_version,
-                    self._json(attempt.to_dict()),
+                    self._json(attempt.to_dict()), leadership_now,
                 )
             except ResponseError as exc:
                 message = str(exc)

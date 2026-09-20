@@ -24169,7 +24169,10 @@ async def _initialize_combined_gemma_broker() -> Any | None:
             member_forward_timeouts.append(forward_timeout)
         cache = StrictMemberSnapshotCache(member_configs, freshness_ms=int(broker_config.freshness_seconds * 1000))
         repository = RedisJobRepository(
-            _queue_redis, prefix=broker_config.redis_namespace, aging_seconds=broker_config.aging_interval_seconds,
+            _queue_redis,
+            prefix=broker_config.redis_namespace,
+            aging_seconds=broker_config.aging_interval_seconds,
+            leadership_clock=time.time,
         )
         recovered_claims = repository.recover_stale_pre_acceptance_claims(
             now=time.monotonic(),
