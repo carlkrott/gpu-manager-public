@@ -22587,6 +22587,12 @@ def _apply_combined_gemma_visibility(
 
 
 async def _fetch_combined_gemma_visibility() -> tuple[dict | None, str | None]:
+    if not _combined_gemma_broker_enabled():
+        # The broker feature is opt-in. Disabled controllers must neither
+        # touch the embedded proxy nor open any HTTP session; doing so would
+        # silently leak probes into a production broker just because the
+        # loopback default happens to be reachable.
+        return None, "broker_disabled"
     if _combined_gemma_broker_embedded():
         try:
             payload = _combined_gemma_api_proxy.broker_metrics()
@@ -22694,7 +22700,11 @@ def _summarize_combined_router_readiness(broker_payload: dict | None, error: str
         }
         result["live_member_count"] += int(live)
         result["accepting_member_count"] += int(accepting)
-    result["available"] = result["live_member_count"] > 0
+    # available requires the broker snapshot to be schema-valid AND at least
+    # one constituent to be live (fresh, non-stale, non-unknown, with positive
+    # backend capacity) AND actively accepting work. A live-but-draining
+    # member must not flip this gate green.
+    result["available"] = result["accepting_member_count"] > 0
     result["reason"] = "ready" if result["available"] else "no_live_constituents"
     return result
 
