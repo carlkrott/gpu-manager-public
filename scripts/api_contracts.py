@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import ipaddress
 import json
+import math
 import re
 from typing import Any
 from urllib.parse import urlsplit
@@ -75,6 +76,15 @@ def _reject_json_constant(_value: str) -> None:
     raise ValueError("non-finite JSON number")
 
 
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
 def parse_json_object(
     body: bytes | bytearray | memoryview | str,
     *,
@@ -94,6 +104,7 @@ def parse_json_object(
     try:
         value = json.loads(
             raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_object_keys,
             parse_constant=_reject_json_constant,
         )
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -268,8 +279,12 @@ def _redact(value: Any, *, depth: int = 0) -> Any:
         return [_redact(child, depth=depth + 1) for child in value[:MAX_LIST_ITEMS]]
     if isinstance(value, str):
         return _redact_text(value)[:MAX_ERROR_MESSAGE_LENGTH]
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else "<redacted>"
     return "<redacted>"
 
 
@@ -298,7 +313,9 @@ def error_envelope(
     error: dict[str, Any] = {"code": safe_code, "message": safe_message}
     if details is not None:
         error["details"] = _redact(details)
-    return {"error": error, "status": safe_status}
+    envelope = {"error": error, "status": safe_status}
+    json.dumps(envelope, allow_nan=False)
+    return envelope
 
 
 __all__ = [

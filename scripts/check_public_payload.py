@@ -87,7 +87,11 @@ def _manifest_entries(root: Path, manifest: Path | None) -> tuple[list[dict[str,
                 raise ValueError(f"unsupported disposition for {relative}: {entry.get('disposition')!r}")
         if is_public_manifest and ("sha256" in entry or "size" in entry):
             raise ValueError("path/disposition manifest must not contain receipt fields")
-        item: dict[str, Any] = {"path": normalized, "file": root / relative}
+        item: dict[str, Any] = {
+            "path": normalized,
+            "file": root / relative,
+            "disposition": entry.get("disposition"),
+        }
         if is_receipt:
             digest = entry.get("sha256")
             size = entry.get("size")
@@ -98,6 +102,18 @@ def _manifest_entries(root: Path, manifest: Path | None) -> tuple[list[dict[str,
             item.update({"sha256": digest, "size": size})
         result.append(item)
     return result, is_receipt
+
+
+def _regular_file_paths(root: Path) -> set[str]:
+    return {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink() and ".git" not in path.parts and "__pycache__" not in path.parts
+    }
+
+
+def _path_disposition_map(entries: list[dict[str, Any]]) -> dict[str, str]:
+    return {entry["path"]: entry["disposition"] for entry in entries}
 
 
 def _check_structured(path: Path, relative: str, violations: list[dict[str, str]]) -> None:
@@ -128,11 +144,31 @@ def check_public_payload(root: Path, *, manifest: Path | None = None) -> dict[st
     checked = 0
     if is_receipt:
         source_manifest = root / "release/public-files.json"
-        if source_manifest.is_file():
+        if not source_manifest.is_file():
+            _record(
+                violations,
+                "release/public-files.json",
+                "receipt_manifest_mismatch",
+                "receipt is not bound to a public-files manifest in the payload",
+            )
+        else:
             assert manifest is not None
-            receipt_document = json.loads(manifest.read_text(encoding="utf-8"))
-            if _sha256(source_manifest) != receipt_document["source_manifest_sha256"]:
-                _record(violations, "release/public-files.json", "receipt_manifest_mismatch", "receipt does not bind the path/disposition manifest")
+            try:
+                source_entries, source_is_receipt = _manifest_entries(root, source_manifest)
+                receipt_map = _path_disposition_map(entries)
+                source_map = _path_disposition_map(source_entries)
+                if source_is_receipt or source_map != receipt_map:
+                    _record(
+                        violations,
+                        "release/public-files.json",
+                        "receipt_manifest_parity_mismatch",
+                        "receipt paths/dispositions do not match the bound public-files manifest",
+                    )
+                receipt_document = json.loads(manifest.read_text(encoding="utf-8"))
+                if _sha256(source_manifest) != receipt_document["source_manifest_sha256"]:
+                    _record(violations, "release/public-files.json", "receipt_manifest_mismatch", "receipt does not bind the path/disposition manifest")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                _record(violations, "release/public-files.json", "receipt_manifest_mismatch", str(exc))
     for entry in entries:
         path = entry["file"]
         relative = entry["path"]
@@ -177,6 +213,25 @@ def check_public_payload(root: Path, *, manifest: Path | None = None) -> dict[st
             for match in _PEM.finditer(text):
                 _record(violations, relative, "key_or_certificate_forbidden", match.group(0))
         _check_structured(path, relative, violations)
+
+    if is_receipt:
+        actual_paths = _regular_file_paths(root)
+        expected_paths = {entry["path"] for entry in entries}
+        expected_paths.add("release/export-manifest.json")
+        for relative in sorted(actual_paths - expected_paths):
+            _record(
+                violations,
+                relative,
+                "receipt_unlisted_file",
+                "regular file is not listed in the export receipt",
+            )
+        if "release/export-manifest.json" not in actual_paths:
+            _record(
+                violations,
+                "release/export-manifest.json",
+                "receipt_missing_file",
+                "export receipt is missing from the payload",
+            )
 
     return {"ok": not violations, "file_count": checked, "violations": violations}
 

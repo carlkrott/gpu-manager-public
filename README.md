@@ -211,7 +211,7 @@ PYTHONPATH=scripts .venv/bin/python -m pytest -q tests/publication
 Run the public payload gate:
 
 ```bash
-PYTHONPATH=scripts .venv/bin/python scripts/check_public_payload.py .
+PYTHONPATH=scripts .venv/bin/python scripts/check_public_payload.py . --manifest release/export-manifest.json
 ```
 
 Inspect CLI surfaces without starting a service:
@@ -273,7 +273,7 @@ The broker has no implicit configuration-file discovery. Supply `--config` or `G
 
 ## Publication and contribution checks
 
-The public release is bound to `release/public-files.json`, a committed path/disposition allowlist. The exporter rejects files outside that allowlist and generates `release/export-manifest.json` as an exact-byte SHA-256/size receipt. The payload checker verifies the receipt and rejects private paths, credentials, model artifacts, archives and unsupported binary content.
+The public release is bound to `release/public-files.json`, a committed path/disposition allowlist. The exporter copies only allowlisted files, omits unlisted source files, and generates `release/export-manifest.json` as an exact-byte SHA-256/size receipt. The payload checker verifies the receipt and rejects private paths, credentials, model artifacts, archives and unsupported binary content.
 
 For manifest-affecting changes:
 

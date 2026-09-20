@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
@@ -21,6 +22,16 @@ from api_contracts import (
 def test_parse_json_object_accepts_bounded_utf8_object():
     payload = parse_json_object('{"name": "café"}')
     assert payload == {"name": "café"}
+
+
+def test_parse_json_object_rejects_duplicate_keys_at_every_nesting_level():
+    for body in (
+        '{"name": "first", "name": "second"}',
+        '{"outer": {"name": "first", "name": "second"}}',
+        '{"outer": [{"name": "first", "name": "second"}]}',
+    ):
+        with pytest.raises(ContractError, match="valid JSON required"):
+            parse_json_object(body)
 
 
 def test_parse_json_object_rejects_oversize_invalid_and_non_object_bodies():
@@ -161,3 +172,24 @@ def test_error_envelope_redacts_clear_bearer_token_to_redacted():
     assert token not in rendered
     assert "<redacted>" in envelope["error"]["message"]
     assert envelope["error"]["message"].startswith("Authorization: Bearer <redacted>")
+
+
+def test_error_envelope_replaces_non_finite_details_and_is_strict_json():
+    envelope = error_envelope(
+        "invalid_request",
+        "bad input",
+        details={
+            "nan": math.nan,
+            "nested": {"positive": math.inf, "negative": -math.inf},
+            "items": [math.nan, {"value": math.inf}],
+        },
+    )
+
+    rendered = json.dumps(envelope, allow_nan=False)
+    assert "NaN" not in rendered
+    assert "Infinity" not in rendered
+    assert envelope["error"]["details"] == {
+        "nan": "<redacted>",
+        "nested": {"positive": "<redacted>", "negative": "<redacted>"},
+        "items": ["<redacted>", {"value": "<redacted>"}],
+    }

@@ -12,18 +12,31 @@ from check_public_payload import check_public_payload  # noqa: E402
 from export_public_source import ExportError, export_public_source  # noqa: E402
 
 
-def _fixture(tmp_path: Path, *, path: str = "scripts/example.py", data: bytes = b"print('ok')\n"):
+def _fixture(
+    tmp_path: Path,
+    *,
+    path: str = "scripts/example.py",
+    data: bytes = b"print('ok')\n",
+    include_public_manifest: bool = False,
+):
     source = tmp_path / "source"
     source.mkdir(parents=True)
     target = source / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
+    files = [{
+        "path": path,
+        "disposition": "core",
+    }]
+    if include_public_manifest:
+        files.append({
+            "path": "release/public-files.json",
+            "disposition": "utility",
+        })
     manifest = {
         "schema_version": "gpumanager.public-files.v1",
-        "files": [{
-            "path": path,
-            "disposition": "core",
-        }],
+        "file_count": len(files),
+        "files": files,
     }
     manifest_path = source / "release" / "public-files.json"
     manifest_path.parent.mkdir()
@@ -32,15 +45,15 @@ def _fixture(tmp_path: Path, *, path: str = "scripts/example.py", data: bytes = 
 
 
 def test_allowlist_without_receipt_fields_generates_and_verifies_receipt(tmp_path):
-    source, manifest = _fixture(tmp_path)
+    source, manifest = _fixture(tmp_path, include_public_manifest=True)
     (source / "scripts/example.py").write_bytes(b"print('changed')\n")
     destination = tmp_path / "export"
 
     result = export_public_source(source, manifest, destination)
 
     receipt = json.loads((destination / "release/export-manifest.json").read_text())
-    entry = receipt["files"][0]
-    assert result["file_count"] == 1
+    entry = next(item for item in receipt["files"] if item["path"] == "scripts/example.py")
+    assert result["file_count"] == 2
     assert set(entry) == {"path", "sha256", "size", "disposition"}
     assert entry["path"] == "scripts/example.py"
     assert entry["size"] == len(b"print('changed')\n")
@@ -64,6 +77,37 @@ def test_exports_exact_allowlist_and_omits_unlisted_files(tmp_path):
     assert not (destination / "private.txt").exists()
     assert (destination / "release/export-manifest.json").is_file()
     assert (destination / "scripts/example.py").stat().st_mode & 0o777 == 0o644
+
+
+def test_receipt_rejects_extra_regular_files(tmp_path):
+    source, manifest = _fixture(tmp_path, include_public_manifest=True)
+    destination = tmp_path / "export"
+    export_public_source(source, manifest, destination)
+
+    (destination / "unlisted.py").write_text("not in the allowlist\n", encoding="utf-8")
+    report = check_public_payload(destination, manifest=destination / "release/export-manifest.json")
+
+    assert not report["ok"]
+    assert any(
+        item["rule"] == "receipt_unlisted_file" and item["path"] == "unlisted.py"
+        for item in report["violations"]
+    )
+
+
+def test_receipt_rejects_public_manifest_with_swapped_disposition(tmp_path):
+    source, manifest = _fixture(tmp_path, include_public_manifest=True)
+    destination = tmp_path / "export"
+    export_public_source(source, manifest, destination)
+
+    public_manifest = destination / "release/public-files.json"
+    swapped = json.loads(public_manifest.read_text())
+    swapped["files"][0]["disposition"] = "utility"
+    public_manifest.write_text(json.dumps(swapped), encoding="utf-8")
+    report = check_public_payload(destination, manifest=destination / "release/export-manifest.json")
+
+    assert not report["ok"]
+    assert any(item["rule"] == "receipt_manifest_mismatch" for item in report["violations"])
+    assert any(item["rule"] == "receipt_manifest_parity_mismatch" for item in report["violations"])
 
 
 def test_rejects_invalid_paths_before_writing(tmp_path):
