@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
+from gemma_broker.compatibility import RequestRequirements
 from gemma_broker.config import BrokerConfig, ConfigError
+from gemma_broker.contracts import JobRecord, MemberSnapshot, MemberState
+from gemma_broker.redis_store import RESERVE_JOB_LUA, RedisJobRepository
 from gemma_broker.runtime import validate_candidate_config
 from combined_gemma_broker_service import load_broker_settings
 
@@ -93,3 +96,71 @@ def test_runtime_rejects_disabled_config_and_missing_namespace_colon():
     )
     with pytest.raises(ConfigError, match="CANDIDATE_REDIS_NAMESPACE_TRAILING_COLON_REQUIRED"):
         validate_candidate_config(no_colon)
+
+
+def test_redis_reservation_uses_separate_durable_leadership_clock():
+    job_now = 123.5
+    leadership_now = 1_789_943_218.5
+    job = JobRecord.new(
+        job_id="job-clock-domain",
+        idempotency_key="idem-clock-domain",
+        request_sha256="0" * 64,
+        request_body={"messages": [{"role": "user", "content": "synthetic"}]},
+        submitted_at=120.0,
+        enqueue_sequence=1,
+    )
+    member = MemberSnapshot(
+        name="member-primary",
+        gpu_id=None,
+        state=MemberState.READY_ACCEPTING,
+        accepting=True,
+        configured_slots=1,
+        context_per_slot=4096,
+        state_version=7,
+        observed_at=job_now,
+        compatible_free_slots=1,
+        capabilities=("chat",),
+    )
+    requirements = RequestRequirements(
+        input_tokens_estimate=8,
+        max_output_tokens=16,
+        required_capabilities=("chat",),
+        estimate_source="synthetic",
+    )
+
+    class _RecordingRedis:
+        def __init__(self):
+            self.eval_calls = []
+
+        def eval(self, *args):
+            self.eval_calls.append(args)
+            return 1
+
+    class _Repository(RedisJobRepository):
+        def peek_next(self, *, now):
+            assert now == job_now
+            return job
+
+    client = _RecordingRedis()
+    repository = _Repository(
+        client,
+        prefix="qual:combined-gemma:clock-domain:",
+        leadership_clock=lambda: leadership_now,
+    )
+
+    reservation = repository.reserve_next(
+        now=job_now,
+        ordered_members=[member],
+        requirements=requirements,
+        leader_owner="synthetic-owner",
+        fencing_token=7,
+    )
+
+    assert reservation is not None
+    assert len(client.eval_calls) == 1
+    call = client.eval_calls[0]
+    assert call[11] == job_now
+    assert call[-1] == leadership_now
+    assert "leader_expiry <= tonumber(ARGV[12])" in RESERVE_JOB_LUA
+    assert "'queue_claimed_at', ARGV[4]" in RESERVE_JOB_LUA
+    assert "'reserved_at', ARGV[4]" in RESERVE_JOB_LUA

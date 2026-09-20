@@ -316,8 +316,8 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/lua/reserve_job.lua",
-      "sha256": "e79bd7423878efbf057969d36e01e573c0204a2328abda182930f43fae573f21",
-      "size": 3494
+      "sha256": "f00a03405a6548cb7f1f81b060754b63beb16480ee63895b88649c81ef75a801",
+      "size": 3511
     },
     {
       "disposition": "core",
@@ -376,8 +376,8 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/redis_store.py",
-      "sha256": "089e854c74948c4e3e5b3d444a277b9c3777041977e44b2f70c7bb196d8115b0",
-      "size": 94525
+      "sha256": "f146ce40bbd56afa1faed464d583bd661d802060b4b14baa8a3c7e80a9078335",
+      "size": 94701
     },
     {
       "disposition": "core",
@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "8d7b3644364c1a6660e9f613e485bd8e9d0fc13c023f22835c7e8d099f7a5608",
-      "size": 1906232
+      "sha256": "a51790873a25749581d34d2c16bb8699d0d399dca8d29ccaf5b5a0deb2622838",
+      "size": 1906296
     },
     {
       "disposition": "core",
@@ -658,8 +658,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_broker_portability.py",
-      "sha256": "69071b410b00a63145bf93b7a1257827f8df5b7ab976a314be2814f0665448ce",
-      "size": 3726
+      "sha256": "bbf69e16474b9382a5344df09fd8766137e74fcf87dbc47c713a38a2dbe942ef",
+      "size": 5928
     },
     {
       "disposition": "core",
@@ -676,8 +676,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_embedded_broker_visibility.py",
-      "sha256": "fb708bb2debbfe084fce210c2b4faa59a10a79c5a498af15e9bf0d140c19fd43",
-      "size": 11814
+      "sha256": "510957afa0c121a753382a93e0685cb1bf1af204e895c961cdc8621a08c51b99",
+      "size": 12831
     },
     {
       "disposition": "core",
