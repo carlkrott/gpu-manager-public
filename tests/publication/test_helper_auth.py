@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 from pathlib import Path
+import sys
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -21,6 +23,19 @@ from runtime_host_supervisor import create_app, create_unauthenticated_test_app
 
 
 TOKEN = "synthetic-helper-token"
+
+
+def _load_controller():
+    root = Path(__file__).resolve().parents[2]
+    source = root / "scripts" / "gpu-manager.py"
+    spec = importlib.util.spec_from_file_location(
+        "gpu_manager_distinct_helper_credentials", source
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _profile():
@@ -46,6 +61,70 @@ def test_runtime_client_uses_dedicated_token_file_and_never_controller_token(tmp
     payload = adapter._request("inspect", "instance", _profile())
     assert adapter._helper_auth.headers() == {"Authorization": f"Bearer {TOKEN}"}
     assert "GPU_MANAGER_API_TOKEN" not in json.dumps(payload)
+
+
+def test_runtime_client_environment_uses_host_supervisor_credential_only(
+    monkeypatch, tmp_path
+):
+    import runtime_host_client
+
+    host_token = tmp_path / "host-supervisor-token"
+    native_token = tmp_path / "native-task-token"
+    host_token.write_text("host-supervisor-secret", encoding="utf-8")
+    native_token.write_text("native-task-secret", encoding="utf-8")
+    monkeypatch.setenv(
+        "GPU_MANAGER_HOST_SUPERVISOR_TOKEN_FILE", str(host_token)
+    )
+    monkeypatch.setenv("GPU_MANAGER_NATIVE_TASK_TOKEN_FILE", str(native_token))
+    monkeypatch.delenv("GPU_MANAGER_HELPER_TOKEN_FILE", raising=False)
+
+    assert runtime_host_client.HOST_SUPERVISOR_TOKEN_FILE_ENV == (
+        "GPU_MANAGER_HOST_SUPERVISOR_TOKEN_FILE"
+    )
+    assert runtime_host_client.NATIVE_TASK_TOKEN_FILE_ENV == (
+        "GPU_MANAGER_NATIVE_TASK_TOKEN_FILE"
+    )
+    assert (
+        runtime_host_client.HOST_SUPERVISOR_TOKEN_FILE_ENV
+        != runtime_host_client.NATIVE_TASK_TOKEN_FILE_ENV
+    )
+    adapter = HostSupervisorRuntimeAdapter(
+        profile_name="synthetic",
+        socket_path=tmp_path / "supervisor.sock",
+    )
+    assert adapter._helper_auth.headers() == {
+        "Authorization": "Bearer host-supervisor-secret"
+    }
+
+
+def test_legacy_shared_helper_credential_is_warned_and_ignored(
+    monkeypatch, tmp_path, caplog
+):
+    legacy_token = tmp_path / "legacy-helper-token"
+    legacy_token.write_text("legacy-shared-secret", encoding="utf-8")
+    monkeypatch.setenv("GPU_MANAGER_HELPER_TOKEN_FILE", str(legacy_token))
+    monkeypatch.delenv("GPU_MANAGER_HOST_SUPERVISOR_TOKEN_FILE", raising=False)
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(HelperCredentialError, match="helper service credential"):
+            resolve_required_service_credential()
+
+    assert "GPU_MANAGER_HELPER_TOKEN_FILE is deprecated and ignored" in caplog.text
+
+
+def test_controller_native_helper_uses_native_task_credential_only(monkeypatch, tmp_path):
+    host_token = tmp_path / "host-supervisor-token"
+    native_token = tmp_path / "native-task-token"
+    host_token.write_text("host-supervisor-secret", encoding="utf-8")
+    native_token.write_text("native-task-secret", encoding="utf-8")
+    monkeypatch.setenv(
+        "GPU_MANAGER_HOST_SUPERVISOR_TOKEN_FILE", str(host_token)
+    )
+    monkeypatch.setenv("GPU_MANAGER_NATIVE_TASK_TOKEN_FILE", str(native_token))
+    monkeypatch.delenv("GPU_MANAGER_HELPER_TOKEN_FILE", raising=False)
+    controller = _load_controller()
+
+    assert controller._required_native_helper_token_file() == str(native_token)
 
 
 def test_helper_auth_scheme_is_case_insensitive_but_token_remains_exact():

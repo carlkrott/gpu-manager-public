@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,21 @@ _ACTIONS = frozenset(
 )
 _OBSERVATION_ACTIONS = frozenset({"inspect", "health", "reconcile"})
 _MAX_RESPONSE_BYTES = 1024 * 1024
+HOST_SUPERVISOR_TOKEN_FILE_ENV = "GPU_MANAGER_HOST_SUPERVISOR_TOKEN_FILE"
+NATIVE_TASK_TOKEN_FILE_ENV = "GPU_MANAGER_NATIVE_TASK_TOKEN_FILE"
 HELPER_TOKEN_FILE_ENV = "GPU_MANAGER_HELPER_TOKEN_FILE"
 _MAX_TOKEN_BYTES = 4096
+_LOGGER = logging.getLogger(__name__)
+
+
+def _warn_legacy_shared_credential() -> None:
+    if os.environ.get(HELPER_TOKEN_FILE_ENV):
+        _LOGGER.warning(
+            "%s is deprecated and ignored; configure %s and %s separately",
+            HELPER_TOKEN_FILE_ENV,
+            HOST_SUPERVISOR_TOKEN_FILE_ENV,
+            NATIVE_TASK_TOKEN_FILE_ENV,
+        )
 
 
 class HelperCredentialError(RuntimeError):
@@ -52,7 +66,9 @@ class HelperTokenAuth:
         use_environment: bool = True,
     ) -> None:
         if use_environment and service_token_file is None and service_token is None:
-            service_token_file = os.environ.get(HELPER_TOKEN_FILE_ENV)
+            service_token_file = os.environ.get(HOST_SUPERVISOR_TOKEN_FILE_ENV)
+            if service_token_file is None:
+                _warn_legacy_shared_credential()
         self._explicit_token = service_token
         self.token_file = Path(service_token_file) if service_token_file else None
         self.configured = service_token is not None or self.token_file is not None
@@ -110,7 +126,9 @@ def resolve_required_service_credential(
     credential material.
     """
     if service_token_file is None and service_token is None:
-        service_token_file = os.environ.get(HELPER_TOKEN_FILE_ENV)
+        service_token_file = os.environ.get(HOST_SUPERVISOR_TOKEN_FILE_ENV)
+        if service_token_file is None:
+            _warn_legacy_shared_credential()
     if service_token is not None:
         token = service_token
     elif service_token_file is not None:
@@ -286,6 +304,8 @@ __all__ = [
     "ACTION_SCHEMA",
     "DEFAULT_SOCKET_PATH",
     "HELPER_TOKEN_FILE_ENV",
+    "HOST_SUPERVISOR_TOKEN_FILE_ENV",
+    "NATIVE_TASK_TOKEN_FILE_ENV",
     "HelperTokenAuth",
     "HostRuntimeClientError",
     "HostSupervisorRuntimeAdapter",

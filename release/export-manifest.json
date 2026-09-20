@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "51c823910fa599504838bb9e9a6dcb2da4b40fe87dcd4091b6805c2fe3200fe5",
-      "size": 1903965
+      "sha256": "7a489a91599272b8250a090fbaabe462819a5811116480c5bea4240c82672eaf",
+      "size": 1905098
     },
     {
       "disposition": "core",
@@ -556,8 +556,8 @@
     {
       "disposition": "core",
       "path": "scripts/runtime_host_client.py",
-      "sha256": "18a0db483be207271bca750c6c4bd73e1025e5522f4b9006aa02b3e866eb2267",
-      "size": 11865
+      "sha256": "0722445ef263f9ed5aca771d384d8359547dd91602c2de656a4f608cf0d4795a",
+      "size": 12648
     },
     {
       "disposition": "core",
@@ -664,8 +664,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_client_auth.py",
-      "sha256": "d0395c1ce758b64627b0fe22ba7924bcb2b68a47a3727ca62d4dd8079c03c833",
-      "size": 7472
+      "sha256": "dac3985c99cc7334c61418cde45b877287e83fd1278b90d18a2dc92627e8bde2",
+      "size": 9151
     },
     {
       "disposition": "core",
@@ -688,8 +688,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_helper_auth.py",
-      "sha256": "5ad648c0aa61e6e67b27aa03c4947d0482f0c97fc98368fc155203890d790b70",
-      "size": 10011
+      "sha256": "b363afa42eef0039fa5d50e3771f5d4d0b3d0799074cfa0e5e479607048293de",
+      "size": 13055
     },
     {
       "disposition": "core",
@@ -718,8 +718,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_request_safety.py",
-      "sha256": "4b0c09727368c646b3078fff99b5b01533a9bc2a31cfdbb893d315db61de1ca1",
-      "size": 30200
+      "sha256": "81e108bf95161b283209f47cd6d77d946337619b8c94ea89471b5088b63a4cb3",
+      "size": 30931
     },
     {
       "disposition": "core",

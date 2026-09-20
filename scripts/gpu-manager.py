@@ -1225,7 +1225,29 @@ class _AiohttpTransport:
                 self(headers, method, url, body, timeout), self._owner_loop,
             )
             return await asyncio.wrap_future(pending)
-        kwargs: dict = {"headers": headers, "allow_redirects": True}
+        request_headers = dict(headers)
+        self_authenticated = False
+        if not any(str(name).lower() == "authorization" for name in request_headers):
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            try:
+                target_port = parsed.port
+            except ValueError:
+                target_port = None
+            if (
+                parsed.scheme == "http"
+                and (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+                and target_port == int(LISTEN_PORT)
+            ):
+                token = _api_token()
+                if token:
+                    request_headers["Authorization"] = f"Bearer {token}"
+                    self_authenticated = True
+        kwargs: dict = {
+            "headers": request_headers,
+            "allow_redirects": not self_authenticated,
+        }
         if body:
             kwargs["data"] = body
         timeout_obj = __import__("aiohttp", fromlist=["ClientTimeout"]).ClientTimeout(
@@ -14530,11 +14552,18 @@ def _required_native_helper_token_file() -> str:
     """Resolve the dedicated native-task helper credential before network I/O."""
     from runtime_host_client import (
         HELPER_TOKEN_FILE_ENV,
+        NATIVE_TASK_TOKEN_FILE_ENV,
         resolve_required_service_credential,
     )
 
-    token_file = os.environ.get(HELPER_TOKEN_FILE_ENV)
+    token_file = os.environ.get(NATIVE_TASK_TOKEN_FILE_ENV)
     if not token_file:
+        if os.environ.get(HELPER_TOKEN_FILE_ENV):
+            logger.warning(
+                "%s is deprecated and ignored; configure %s for native-task authentication",
+                HELPER_TOKEN_FILE_ENV,
+                NATIVE_TASK_TOKEN_FILE_ENV,
+            )
         raise RuntimeError("native task helper credential is required")
     try:
         resolve_required_service_credential(service_token_file=token_file)

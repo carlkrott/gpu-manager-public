@@ -738,17 +738,32 @@ def test_dashboard_service_display_interpolations_are_escaped():
             assert "safeServiceDisplay" in line or "serviceDisplayText" in line or "textContent" in line
 
 
-def test_native_task_controller_requires_dedicated_helper_token_file(monkeypatch, tmp_path):
+def test_native_task_controller_requires_dedicated_helper_token_file(
+    monkeypatch, tmp_path, caplog
+):
     """Controller native-task entrypoints fail closed before network I/O."""
     module = _load_controller()
+    monkeypatch.delenv("GPU_MANAGER_NATIVE_TASK_TOKEN_FILE", raising=False)
     monkeypatch.delenv("GPU_MANAGER_HELPER_TOKEN_FILE", raising=False)
     with pytest.raises(RuntimeError, match="helper credential"):
         module._required_native_helper_token_file()
 
     missing = tmp_path / "missing-helper-token"
-    monkeypatch.setenv("GPU_MANAGER_HELPER_TOKEN_FILE", str(missing))
-    with pytest.raises(RuntimeError, match="helper credential"):
+    monkeypatch.setenv("GPU_MANAGER_NATIVE_TASK_TOKEN_FILE", str(missing))
+    with pytest.raises(RuntimeError, match="unavailable"):
         module._required_native_helper_token_file()
+
+    monkeypatch.delenv("GPU_MANAGER_NATIVE_TASK_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("GPU_MANAGER_HELPER_TOKEN_FILE", str(missing))
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError, match="required"):
+            module._required_native_helper_token_file()
+    assert "GPU_MANAGER_HELPER_TOKEN_FILE is deprecated and ignored" in caplog.text
+
+    valid = tmp_path / "native-helper-token"
+    valid.write_text("native-specific-secret", encoding="utf-8")
+    monkeypatch.setenv("GPU_MANAGER_NATIVE_TASK_TOKEN_FILE", str(valid))
+    assert module._required_native_helper_token_file() == str(valid)
 
 
 def test_unload_health_passes_explicit_helper_token_file(monkeypatch, tmp_path):
@@ -758,7 +773,7 @@ def test_unload_health_passes_explicit_helper_token_file(monkeypatch, tmp_path):
     module = _load_controller()
     token_file = tmp_path / "helper-token"
     token_file.write_text("test-native-helper-token", encoding="utf-8")
-    monkeypatch.setenv("GPU_MANAGER_HELPER_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("GPU_MANAGER_NATIVE_TASK_TOKEN_FILE", str(token_file))
     module.session = object()
     module._resolve_bundles = lambda: {
         "bundle": {"gpu_id": "gpu0", "services": ["native"], "timeout": 1}
