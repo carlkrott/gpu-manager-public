@@ -11649,7 +11649,7 @@ class GPUScheduler:
                 RecoveryObservation(
                     enabled=bool(idle_svc.get("enabled")),
                     desired_state=DesiredState.IDLE,
-                    maintenance_mode=bool(scheduling.get("maintenance_mode", False)),
+                    maintenance_mode=_maintenance_mode_enabled(scheduling),
                     planned_stop=planned_stop,
                     coexistence_paused=bool(self._coexistence_paused),
                     now=now,
@@ -11712,7 +11712,7 @@ class GPUScheduler:
                 RecoveryObservation(
                     enabled=bool(idle_svc.get("enabled")),
                     desired_state=DesiredState.IDLE,
-                    maintenance_mode=bool(scheduling.get("maintenance_mode", False)),
+                    maintenance_mode=_maintenance_mode_enabled(scheduling),
                     planned_stop=planned_stop,
                     coexistence_paused=bool(self._coexistence_paused),
                     probe_ok=is_healthy,

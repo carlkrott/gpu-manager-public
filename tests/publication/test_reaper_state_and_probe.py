@@ -113,6 +113,12 @@ def test_invalid_maintenance_value_fails_safe(monkeypatch):
         assert semantics["configured_intent"]["maintenance_mode"] is True
 
 
+def test_service_recovery_observations_use_fail_closed_maintenance_normalizer():
+    source = CONTROLLER.read_text(encoding="utf-8")
+
+    assert 'maintenance_mode=bool(scheduling.get("maintenance_mode", False))' not in source
+
+
 def test_reaper_state_is_paused_during_maintenance():
     module = _load_controller()
     module.ORPHAN_REAPER_ENABLED = True
