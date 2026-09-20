@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
 import re
 
@@ -40,6 +41,20 @@ def test_default_registry_is_empty_and_durable():
     assert isinstance(assignment.value, ast.Call)
     assert isinstance(assignment.value.func, ast.Name)
     assert assignment.value.func.id == "empty_services_config"
+
+
+def test_empty_registry_is_maintenance_safe():
+    spec = importlib.util.spec_from_file_location("portable_defaults", PORTABLE_DEFAULTS)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    scheduling = module.empty_services_config()["scheduling"]
+
+    assert scheduling["maintenance_mode"] is True
+    assert scheduling["scheduler_owns_load"] is False
+    assert scheduling["scheduler_dry_run_mode"] is True
+    assert scheduling["proactive_scheduling_enabled"] is False
 
 
 def test_fixed_hardware_ceiling_is_not_in_controller():

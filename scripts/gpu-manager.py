@@ -247,6 +247,12 @@ def _phase3_scheduling_config():
     # services.json (the source of truth when env-var is unset) is loaded from
     # SERVICES_CONFIG_PATH; see top-of-file for the resolved runtime location.
     env_owns = os.environ.get('GPU_MANAGER_SCHEDULER_OWNS_LOAD', 'false').strip().lower() == 'true'
+    raw_maintenance_mode = sched.get('maintenance_mode', False)
+    maintenance_mode = (
+        raw_maintenance_mode
+        if isinstance(raw_maintenance_mode, bool)
+        else True
+    )
     return {
         'grace_period_seconds': sched.get('grace_period_seconds', 30),
         'grace_min_resume_interval_s': sched.get('grace_min_resume_interval_s', 60),
@@ -263,10 +269,18 @@ def _phase3_scheduling_config():
         # current compatibility behavior while the durable/legacy modes give
         # operators a reversible way to fence one owner during cutover.
         'queue_owner': sched.get('queue_owner', 'split'),
-        'scheduler_owns_load': env_owns or sched.get('scheduler_owns_load', False),
-        'scheduler_dry_run_mode': sched.get('scheduler_dry_run_mode', True),
-        'proactive_scheduling_enabled': sched.get('proactive_scheduling_enabled', False),
-        'maintenance_mode': sched.get('maintenance_mode', False)
+        # Maintenance is an overriding safety fence. An environment override
+        # must never grant scheduler ownership while the controller is paused.
+        'scheduler_owns_load': False if maintenance_mode else (
+            env_owns or sched.get('scheduler_owns_load', False)
+        ),
+        'scheduler_dry_run_mode': True if maintenance_mode else sched.get(
+            'scheduler_dry_run_mode', True
+        ),
+        'proactive_scheduling_enabled': False if maintenance_mode else sched.get(
+            'proactive_scheduling_enabled', False
+        ),
+        'maintenance_mode': maintenance_mode
     }
 
 

@@ -20,6 +20,48 @@ def _load_controller():
     return module
 
 
+def test_maintenance_mode_dominates_scheduler_ownership_and_dispatch(monkeypatch):
+    module = _load_controller()
+    module._services_config = {
+        "scheduling": {
+            "maintenance_mode": True,
+            "scheduler_owns_load": True,
+            "scheduler_dry_run_mode": False,
+            "proactive_scheduling_enabled": True,
+        }
+    }
+    monkeypatch.setenv("GPU_MANAGER_SCHEDULER_OWNS_LOAD", "true")
+
+    config = module._phase3_scheduling_config()
+
+    assert config["maintenance_mode"] is True
+    assert config["scheduler_owns_load"] is False
+    assert config["scheduler_dry_run_mode"] is True
+    assert config["proactive_scheduling_enabled"] is False
+
+
+def test_invalid_maintenance_value_fails_safe(monkeypatch):
+    module = _load_controller()
+    monkeypatch.setenv("GPU_MANAGER_SCHEDULER_OWNS_LOAD", "true")
+
+    for invalid in ("true", 1, None):
+        module._services_config = {
+            "scheduling": {
+                "maintenance_mode": invalid,
+                "scheduler_owns_load": True,
+                "scheduler_dry_run_mode": False,
+                "proactive_scheduling_enabled": True,
+            }
+        }
+
+        config = module._phase3_scheduling_config()
+
+        assert config["maintenance_mode"] is True
+        assert config["scheduler_owns_load"] is False
+        assert config["scheduler_dry_run_mode"] is True
+        assert config["proactive_scheduling_enabled"] is False
+
+
 def test_reaper_state_is_paused_during_maintenance():
     module = _load_controller()
     module.ORPHAN_REAPER_ENABLED = True

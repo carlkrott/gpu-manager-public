@@ -76,8 +76,8 @@
     {
       "disposition": "core",
       "path": "examples/empty/services.json",
-      "sha256": "f422f02ac3388e4c0937f0adc5a306d3c72253faba5dc6edf028f397b93c0ea7",
-      "size": 386
+      "sha256": "d76fb4df1ee7f8bef3f8969bd184a40a0e645cdd67aab8ff75e9c94c835bbcbb",
+      "size": 385
     },
     {
       "disposition": "utility",
@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "72eda076b9ebf7564f192461ed7e1c03e2fd29e99f98408a93782feae30af93d",
-      "size": 1905604
+      "sha256": "467c4f28fd46c186d3dc9cd4718ced06f8657b67121a3f6bcc93bc23b5169ce3",
+      "size": 1906092
     },
     {
       "disposition": "core",
@@ -490,8 +490,8 @@
     {
       "disposition": "core",
       "path": "scripts/portable_defaults.py",
-      "sha256": "4db291d1ca469fc34db56b18063a0c698fd120477f0a37d1e2b05067888a3743",
-      "size": 1387
+      "sha256": "fb66fbd70bc671abd9993297c9106a7872d082edd45367c1b63fe4adb49381e2",
+      "size": 1386
     },
     {
       "disposition": "core",
@@ -700,8 +700,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_portable_controller.py",
-      "sha256": "b0c04b2f61e1c0b605835eb7a39ccfdf5792c695394d038f7c12e46401c1fb27",
-      "size": 1667
+      "sha256": "05595a4c401c60c19461f11643b33cb36e39f580fcf2cc5bf84c0aaa840a48fd",
+      "size": 2234
     },
     {
       "disposition": "core",
@@ -712,8 +712,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_reaper_state_and_probe.py",
-      "sha256": "7727f83fb1458ab08870f4eefa0011144b8d144ba2ab33a6f22bc3a713fa5643",
-      "size": 3981
+      "sha256": "2df7d70481c8290b12201125c5d77f5927bf1a1c32996091a39cf4d8397a16da",
+      "size": 5424
     },
     {
       "disposition": "core",
