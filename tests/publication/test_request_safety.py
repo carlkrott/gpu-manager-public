@@ -427,6 +427,46 @@ def test_handle_api_proxy_accepts_declared_port_on_enabled_service(tmp_path):
     assert fake.call_count >= 2
 
 
+def test_handle_api_proxy_forwards_canonical_url_with_mixed_case_scheme():
+    """Validated URL components must preserve the explicit backend port."""
+    module = _load_controller()
+    _install_minimal(
+        module,
+        services_config={
+            "services": {"svc": {"enabled": True, "port": 19031}},
+        },
+    )
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status = 200
+        headers = {"content-type": "application/json"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def text(self):
+            return "{}"
+
+    def _fake_request(method, url, **kwargs):
+        captured["url"] = url
+        return _FakeResp()
+
+    module.session.request = _fake_request
+    for raw_url, expected in (
+        ("HtTp://LOCALHOST:19031/v1/models?format=json", "http://localhost:19031/v1/models?format=json"),
+        ("HtTpS://LOCALHOST:19031/v1/models?format=json", "https://localhost:19031/v1/models?format=json"),
+    ):
+        assert module._api_proxy_target_url(raw_url) == expected
+        response = asyncio.run(module.handle_api_proxy(_proxy_request(raw_url)))
+        assert response.status == 200
+        assert captured["url"] == expected
+
+
 def test_handle_api_proxy_strips_credential_headers_from_caller(tmp_path):
     """Authorization/Cookie/Proxy-Authorization/X-API-Key must be stripped."""
     module = _load_controller()
@@ -668,3 +708,76 @@ def test_dashboard_addChatMessage_renders_role_service_and_content_via_DOM():
         "addChatMessage must build the message body via textContent "
         f"(body was:\n{body})"
     )
+
+
+def test_api_tester_renders_upstream_body_as_plain_text():
+    """Upstream API tester bodies must not enter an HTML highlighter."""
+    dashboard = _CONTROLLER.read_text(encoding="utf-8")
+    match = re.search(
+        r"function renderResponse\(data\)\s*\{(?P<body>.*?)\n\}\n",
+        dashboard,
+        re.DOTALL,
+    )
+    assert match is not None, "renderResponse function not found in dashboard"
+    body = match.group("body")
+    assert ".textContent =" in body
+    assert ".innerHTML =" not in body
+    assert "prettyJson(data.body" not in body
+
+
+def test_dashboard_service_display_interpolations_are_escaped():
+    """Every inline service display interpolation must use the safe helper."""
+    dashboard = _CONTROLLER.read_text(encoding="utf-8")
+    assert "function safeServiceDisplay(" in dashboard
+    assert "${svc.display ||" not in dashboard
+    assert "${info.display ||" not in dashboard
+    # Keep this assertion scoped to the known inline dashboard template
+    # sites, rather than treating unrelated innerHTML as unsafe by itself.
+    for line in dashboard.splitlines():
+        if "svc.display" in line or "info.display" in line:
+            assert "safeServiceDisplay" in line or "serviceDisplayText" in line or "textContent" in line
+
+
+def test_native_task_controller_requires_dedicated_helper_token_file(monkeypatch, tmp_path):
+    """Controller native-task entrypoints fail closed before network I/O."""
+    module = _load_controller()
+    monkeypatch.delenv("GPU_MANAGER_HELPER_TOKEN_FILE", raising=False)
+    with pytest.raises(RuntimeError, match="helper credential"):
+        module._required_native_helper_token_file()
+
+    missing = tmp_path / "missing-helper-token"
+    monkeypatch.setenv("GPU_MANAGER_HELPER_TOKEN_FILE", str(missing))
+    with pytest.raises(RuntimeError, match="helper credential"):
+        module._required_native_helper_token_file()
+
+
+def test_unload_health_passes_explicit_helper_token_file(monkeypatch, tmp_path):
+    """Unload health probes use the required credential before host I/O."""
+    import native_task_client
+
+    module = _load_controller()
+    token_file = tmp_path / "helper-token"
+    token_file.write_text("test-native-helper-token", encoding="utf-8")
+    monkeypatch.setenv("GPU_MANAGER_HELPER_TOKEN_FILE", str(token_file))
+    module.session = object()
+    module._resolve_bundles = lambda: {
+        "bundle": {"gpu_id": "gpu0", "services": ["native"], "timeout": 1}
+    }
+    module._load_services_config = lambda: {
+        "services": {"native": {"native_task_host_url": "http://127.0.0.1:9999"}}
+    }
+
+    seen = {}
+
+    async def _health(session, host_url, **kwargs):
+        seen.update(session=session, host_url=host_url, kwargs=kwargs)
+        return True
+
+    async def _stop(*_args, **_kwargs):
+        raise AssertionError("unload must stop after unresolved native task")
+
+    monkeypatch.setattr(native_task_client, "native_host_has_unresolved", _health)
+    module._stop_bundle_members = _stop
+
+    assert asyncio.run(module._unload_bundle("bundle")) is False
+    assert seen["kwargs"] == {"service_token_file": str(token_file)}

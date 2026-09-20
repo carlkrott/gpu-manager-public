@@ -14526,6 +14526,23 @@ def _persist_generated_image(job_id: str, image: Mapping[str, Any], index: int) 
             "byte_size": len(raw), "produced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+def _required_native_helper_token_file() -> str:
+    """Resolve the dedicated native-task helper credential before network I/O."""
+    from runtime_host_client import (
+        HELPER_TOKEN_FILE_ENV,
+        resolve_required_service_credential,
+    )
+
+    token_file = os.environ.get(HELPER_TOKEN_FILE_ENV)
+    if not token_file:
+        raise RuntimeError("native task helper credential is required")
+    try:
+        resolve_required_service_credential(service_token_file=token_file)
+    except Exception as exc:
+        raise RuntimeError("native task helper credential is unavailable") from exc
+    return token_file
+
+
 class WorkerPool:
     """Pool of persistent workers for a single service.
 
@@ -15983,6 +16000,7 @@ class WorkerPool:
             if job.get("request_kind") == "audio_cpp_task" and self.service_config.get("native_task_host_url"):
                 from native_task_client import native_task_request
                 host_url = self.service_config["native_task_host_url"]
+                native_helper_token_file = _required_native_helper_token_file()
                 if job_tracker is None:
                     raise RuntimeError("native task ownership requires durable job tracking")
                 native_tracked = _coordinator_job_dict(job_tracker.get_job(job_id)) or {}
@@ -16005,6 +16023,7 @@ class WorkerPool:
                 forward_request = native_task_request(
                     self.session, host_url=host_url, task_id=job_id,
                     body=body, on_state=native_state, admission_started=native_admission_started,
+                    service_token_file=native_helper_token_file,
                 )
             else:
                 forward_request = self.session.request(
@@ -32875,12 +32894,25 @@ async def _unload_bundle(bundle_name: str) -> bool:
     member_names = bundle.get("services", [])
     config = _load_services_config()
     services_cfg = config.get("services", {})
+    native_helper_token_file = None
+    if any(
+        isinstance(services_cfg.get(member_name), Mapping)
+        and (services_cfg.get(member_name) or {}).get("native_task_host_url")
+        for member_name in member_names
+    ):
+        try:
+            native_helper_token_file = _required_native_helper_token_file()
+        except Exception as exc:
+            logger.warning("UnloadBundle: native-task helper credential unavailable: %s", exc)
+            return False
 
     for member_name in member_names:
         host_url = (services_cfg.get(member_name) or {}).get("native_task_host_url")
         if host_url:
             from native_task_client import native_host_has_unresolved
-            if session is None or await native_host_has_unresolved(session, host_url):
+            if session is None or await native_host_has_unresolved(
+                session, host_url, service_token_file=native_helper_token_file
+            ):
                 logger.warning("UnloadBundle: %s retains an unresolved native task", bundle_name)
                 return False
 
@@ -36817,13 +36849,26 @@ let editingSvc = null;
 let chatHistory = [];  // [{role, content}]
 let currentServiceName = null;
 
+function serviceDisplayText(value, fallback) {
+  const candidate = typeof value === 'string' ? value.trim() : '';
+  if (candidate && candidate.length <= 200) return candidate;
+  const fallbackText = typeof fallback === 'string' ? fallback.trim() : '';
+  return fallbackText.slice(0, 200);
+}
+
+function safeServiceDisplay(value, fallback) {
+  return serviceDisplayText(value, fallback).replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[char]);
+}
+
 function populateDirectServiceSelector() {
   const sel = document.getElementById('direct-service');
   const svcs = state.services?.services || {};
   let html = '<option value="">-- Select a service --</option>';
   for (const [name, svc] of Object.entries(svcs)) {
     if (svc.type === 'llm_backend' || svc.type === 'generation_backend') {
-      html += `<option value="${name}">${svc.display || name}</option>`;
+      html += `<option value="${name}">${safeServiceDisplay(svc.display, name)}</option>`;
     }
   }
   sel.innerHTML = html;
@@ -37238,7 +37283,7 @@ function renderBundlesTab() {
           const svc = (state.services?.services || {})[svcName];
           const health = (state.service_health || {})[svcName] || {};
           const dotColor = health.overall === 'healthy' ? '#4ade80' : health.overall === 'degraded' ? '#fbbf24' : '#666';
-          const displayName = svc?.display || svcName;
+          const displayName = safeServiceDisplay(svc?.display, svcName);
           html += `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px">`;
           html += `<span style="width:6px;height:6px;border-radius:50%;background:${dotColor};flex-shrink:0"></span>`;
           html += `<span style="color:#e0e0e0">${displayName}</span>`;
@@ -37750,7 +37795,7 @@ function renderServices() {
     return `<div class="${rowClass}" data-gpu-id="${gpuId}">
       <div class="svc-header">
         <span class="health-dot" title="${dotTitle}" style="background:${dotColor}"></span>
-        <span class="svc-name">${svc.display || svc.name}</span>
+        <span class="svc-name">${safeServiceDisplay(svc.display, svc.name)}</span>
         <label class="svc-toggle">
           <input type="checkbox" ${h.overall === 'healthy' || h.overall === 'degraded' ? 'checked' : ''}
                  onchange="toggleService('${name}')"
@@ -37966,9 +38011,9 @@ function editService(name) {
   editingSvc = name;
   const svc = state.services?.services?.[name];
   if (!svc) return;
-  document.getElementById('edit-modal-title').textContent = 'Edit Service: ' + (svc.display || name);
+  document.getElementById('edit-modal-title').textContent = 'Edit Service: ' + serviceDisplayText(svc.display, name);
   document.getElementById('edit-name').value = name;
-  document.getElementById('edit-display').value = svc.display || '';
+  document.getElementById('edit-display').value = serviceDisplayText(svc.display, '');
   document.getElementById('edit-port').value = svc.port != null ? svc.port : '';
   document.getElementById('edit-type').value = svc.type || 'other';
   document.getElementById('edit-enabled').checked = svc.enabled !== false;
@@ -38167,9 +38212,9 @@ function copyService(name) {
   copyingSvc = name;
   const svc = state.services?.services?.[name];
   if (!svc) return;
-  document.getElementById('copy-modal-title').textContent = 'COPY OF ' + (svc.display || name);
+  document.getElementById('copy-modal-title').textContent = 'COPY OF ' + serviceDisplayText(svc.display, name);
   document.getElementById('copy-name').value = name + '-copy';
-  document.getElementById('copy-display').value = (svc.display || name) + ' (copy)';
+  document.getElementById('copy-display').value = serviceDisplayText(svc.display, name) + ' (copy)';
   document.getElementById('copy-port').value = (svc.port || 0) + 1;
   document.getElementById('copy-type').value = svc.type || 'other';
   document.getElementById('copy-enabled').checked = svc.enabled !== false;
@@ -38272,7 +38317,7 @@ async function deleteServiceFromRow(name) {
   const svc = state.services?.services?.[name];
   if (!svc) return;
   if (svc.protected) { showToast(name + ' is protected', true); return; }
-  if (!confirm('Delete service ' + (svc.display || name) + '?')) return;
+  if (!confirm('Delete service ' + serviceDisplayText(svc.display, name) + '?')) return;
   const resp = await fetch('/services/' + name, { method: 'DELETE' });
   const data = await resp.json();
   if (resp.ok) {
@@ -39066,7 +39111,7 @@ function showServiceNode(nodeName) {
             svcHtml += `<div class="svc-row">
               <div class="svc-header">
                 <span class="health-dot" title="${dotTitle}" style="background:${dotColor}"></span>
-                <span class="svc-name">${svc.display || name}</span>
+                <span class="svc-name">${safeServiceDisplay(svc.display, name)}</span>
                 <label class="svc-toggle">
                   <input type="checkbox" ${active ? 'checked' : ''}
                     onchange="remoteServiceAction('${node.host}',${agentPort},'${name}','${active ? 'stop' : 'start'}')"
@@ -39164,9 +39209,9 @@ function editRemoteService(host, agentPort, svcName) {
       window._remoteEditSvcName = svcName;
 
       // Populate the existing modal with ALL fields from the service
-      document.getElementById('edit-modal-title').textContent = 'Edit Remote Service: ' + (svc.display || svcName);
+      document.getElementById('edit-modal-title').textContent = 'Edit Remote Service: ' + serviceDisplayText(svc.display, svcName);
       document.getElementById('edit-name').value = svcName;
-      document.getElementById('edit-display').value = svc.display || '';
+      document.getElementById('edit-display').value = serviceDisplayText(svc.display, '');
       document.getElementById('edit-port').value = svc.port != null ? svc.port : '';
       document.getElementById('edit-type').value = svc.type || 'llm_backend';
       document.getElementById('edit-enabled').checked = svc.enabled !== false;
@@ -39282,7 +39327,7 @@ async function remoteCopyService(host, agentPort, svcName) {
   const svc = await resp.json();
   const name = prompt('New service name:', svcName + '_copy');
   if (!name) return;
-  const display = prompt('Display name:', svc.display || svcName);
+  const display = prompt('Display name:', serviceDisplayText(svc.display, svcName));
   const port = parseInt(prompt('Port:', svc.port || '8080') || '0');
   const unit = prompt('Systemd unit:', svc.systemd_unit || name + '.service');
   const model = prompt('Model path:', svc.model_path || svc.model || '');
@@ -39475,17 +39520,11 @@ function fillEndpoint() {
   }
 }
 
-function prettyJson(str) {
+function formatResponseBody(str) {
   try {
-    const obj = JSON.parse(str);
-    return JSON.stringify(obj, null, 2)
-      .replace(/(".*?")\s*:/g, '<span class="json-key">$1</span>:')
-      .replace(/:\s*(".*?")/g, ': <span class="json-str">$1</span>')
-      .replace(/:\s*(true|false)/g, ': <span class="json-bool">$1</span>')
-      .replace(/:\s*(null)/g, ': <span class="json-null">$1</span>')
-      .replace(/:\s*(-?\d+\.?\d*)/g, ': <span class="json-num">$1</span>');
+    return JSON.stringify(JSON.parse(str), null, 2);
   } catch (_) {
-    return str;
+    return String(str);
   }
 }
 
@@ -39507,7 +39546,7 @@ function renderResponse(data) {
   headersEl.style.display = 'none';
 
   const bodyEl = document.getElementById('console-resp-body');
-  bodyEl.innerHTML = prettyJson(data.body || '');
+  bodyEl.textContent = formatResponseBody(data.body || '');
 }
 
 function renderHistory() {
@@ -39627,7 +39666,7 @@ function populateSchedulingSelectors() {
     if (name === 'gpu-manager') continue;
     const opt = document.createElement('option');
     opt.value = name;
-    opt.textContent = info.display || name;
+    opt.textContent = serviceDisplayText(info.display, name);
     pinSelect.appendChild(opt);
   }
   pinSelect.value = prevPin || state.pinnedService || '';
@@ -39664,7 +39703,7 @@ function populateIdleServices() {
     for (const [name, info] of llmBackends) {
       const h = health[name]?.overall || 'unknown';
       const selected = prevVal === name ? ' selected' : '';
-      html += `<option value="${name}"${selected}>${info.display || name} [${h}]</option>`;
+      html += `<option value="${name}"${selected}>${safeServiceDisplay(info.display, name)} [${h}]</option>`;
     }
     html += `</select>`;
     html += `</div>`;
@@ -40156,46 +40195,50 @@ def _strip_credential_headers(headers: Any) -> dict[str, str]:
     return result
 
 
-def _api_proxy_target_is_allowed(url: Any) -> bool:
-    """Return True iff *url* points at an enabled service's declared port.
+def _api_proxy_target_url(url: Any) -> str | None:
+    """Validate *url* and return its canonical loopback target URL.
 
     Only http/https loopback URLs are considered.  Userinfo, missing
     or malformed ports, the controller's own LISTEN_PORT, and ports
     that are not declared on any enabled service in
-    ``_services_config`` are rejected.
+    ``_services_config`` are rejected.  The returned URL is rebuilt from
+    these validated parsed components, never from the caller's raw string.
     """
-    from urllib.parse import urlparse
+    from urllib.parse import urlparse, urlunparse
 
     if not isinstance(url, str) or not url:
-        return False
+        return None
     if any(ord(char) < 0x20 for char in url):
-        return False
+        return None
     try:
         parsed = urlparse(url)
     except ValueError:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return False
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return None
     if parsed.username is not None or parsed.password is not None:
-        return False
+        return None
     hostname = parsed.hostname
     if hostname is None:
-        return False
-    if hostname.lower() not in {"localhost", "127.0.0.1", "::1"}:
-        return False
+        return None
+    hostname = hostname.lower()
+    if hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return None
     try:
         port = parsed.port
     except ValueError:
-        return False
+        return None
     if port is None:
-        return False
+        return None
     if port == LISTEN_PORT:
-        return False
+        return None
 
     cfg = _services_config if isinstance(_services_config, Mapping) else {}
     services = cfg.get("services") if isinstance(cfg, Mapping) else None
     if not isinstance(services, Mapping):
-        return False
+        return None
+    declared = False
     for svc in services.values():
         if not isinstance(svc, Mapping):
             continue
@@ -40209,8 +40252,20 @@ def _api_proxy_target_is_allowed(url: Any) -> bool:
             if isinstance(value, int) and 0 < value < 65536:
                 declared_ports.add(value)
         if port in declared_ports:
-            return True
-    return False
+            declared = True
+            break
+    if not declared:
+        return None
+
+    # Rebuild the authority from the validated hostname and explicit port.
+    # Brackets are required for the IPv6 loopback literal.
+    authority_host = f"[{hostname}]" if ":" in hostname else hostname
+    return urlunparse((scheme, f"{authority_host}:{port}", parsed.path, "", parsed.query, ""))
+
+
+def _api_proxy_target_is_allowed(url: Any) -> bool:
+    """Return True iff *url* points at an enabled service's declared port."""
+    return _api_proxy_target_url(url) is not None
 
 
 async def handle_api_proxy(request: web.Request) -> web.Response:
@@ -40224,8 +40279,6 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
     Proxy-Authorization and X-API-Key headers are stripped from
     caller-supplied headers before forwarding.
     """
-    from urllib.parse import urlparse
-
     try:
         body = await request.json()
     except (ValueError, json.JSONDecodeError):
@@ -40240,7 +40293,8 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
     if method not in allowed_methods:
         return web.json_response({"error": f"Unsupported method: {method}"}, status=400)
 
-    if not _api_proxy_target_is_allowed(url):
+    target_url = _api_proxy_target_url(url)
+    if target_url is None:
         return web.json_response(
             {"error": "proxy target is not an enabled service port"},
             status=403,
@@ -40259,11 +40313,6 @@ async def handle_api_proxy(request: web.Request) -> web.Response:
 
     if body_bytes and len(body_bytes) > 10 * 1024 * 1024:
         return web.json_response({"error": "Request body exceeds 10MB limit"}, status=413)
-
-    target_url = url if url.startswith("http") else f"http://localhost{urlparse(url).path}"
-    parsed_qs = urlparse(url).query
-    if parsed_qs:
-        target_url = f"{target_url}?{parsed_qs}"
 
     timeout = ClientTimeout(total=30)
     start = time.monotonic()
