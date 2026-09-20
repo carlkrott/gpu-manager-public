@@ -10,8 +10,8 @@
     {
       "disposition": "utility",
       "path": ".github/workflows/ci.yml",
-      "sha256": "67118e3f66afa2739ce2adfbed5cc12ec5dcfc188092cdc4921689df4ee9fb54",
-      "size": 4345
+      "sha256": "e67bc6de3126d76ad53b5aadd28453e1b943199813e1894474618975dfdcac58",
+      "size": 5250
     },
     {
       "disposition": "utility",
@@ -28,8 +28,8 @@
     {
       "disposition": "core",
       "path": "CONTRIBUTING.md",
-      "sha256": "4b32f8368a083b33a4f65d4aacdc5f1c553bbbc071fe0dabb2d7f5c767646a5f",
-      "size": 1860
+      "sha256": "24f516163265a0a0a056114ff60f3f19739cc5d14ad18d22d9eb73bd7738d80b",
+      "size": 2390
     },
     {
       "disposition": "core",
