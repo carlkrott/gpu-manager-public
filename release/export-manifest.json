@@ -466,8 +466,8 @@
     {
       "disposition": "core",
       "path": "scripts/native_task_host.py",
-      "sha256": "bae5b7ffe086d65f99938622fa98c035c9f6d4db142dd5eb8325681907228c4d",
-      "size": 13156
+      "sha256": "6ec53a0518c16cf43b466034671691fbc469d20caa86c9c74007d8c024dfa118",
+      "size": 13390
     },
     {
       "disposition": "core",
@@ -652,8 +652,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_api_contracts.py",
-      "sha256": "f91e0bad65a3a2f83277cad9079ac07508274a0fe29e75bd932c0faede7b03fc",
-      "size": 19399
+      "sha256": "a1948d2f718acc3ae0a659748d9d81260b06be55626290893ae9fc46da3817b9",
+      "size": 19301
     },
     {
       "disposition": "core",
@@ -688,8 +688,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_helper_auth.py",
-      "sha256": "b5dd068e275ff2bf8547598b1c189403da9c4f72eda635edd153fdbb9bf9eb18",
-      "size": 9049
+      "sha256": "5ad648c0aa61e6e67b27aa03c4947d0482f0c97fc98368fc155203890d790b70",
+      "size": 10011
     },
     {
       "disposition": "core",

@@ -165,9 +165,9 @@ def test_redact_includes_session_cookie_csrf_xsrf_jwt_as_sensitive():
 
 
 def test_error_envelope_redacts_clear_bearer_token_to_redacted():
-    # Use a distinctive, easily-spotted JWT-like token and assert the
+    # Use a distinctive, clearly synthetic value and assert the
     # redacted placeholder replaces it explicitly.
-    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature"
+    token = "public-fixture-bearer-value"
     envelope = error_envelope(
         "invalid_request",
         f"Authorization: Bearer {token}",
@@ -175,8 +175,7 @@ def test_error_envelope_redacts_clear_bearer_token_to_redacted():
     )
     rendered = json.dumps(envelope)
     assert token not in rendered
-    assert "<redacted>" in envelope["error"]["message"]
-    assert envelope["error"]["message"].startswith("Authorization: Bearer <redacted>")
+    assert envelope["error"]["message"] == "Authorization: Bearer <redacted>"
 
 
 def test_error_envelope_replaces_non_finite_details_and_is_strict_json():

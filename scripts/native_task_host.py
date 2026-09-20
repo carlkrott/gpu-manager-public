@@ -20,6 +20,7 @@ import time
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from api_contracts import ContractError, parse_json_object
 from runtime_host_client import (
     HelperTokenAuth,
     resolve_required_service_credential,
@@ -148,9 +149,14 @@ class NativeTaskHost:
     async def submit(self, request: web.Request) -> web.Response:
         task_id = request.match_info["task_id"]
         directory = self.directory(task_id)
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise web.HTTPBadRequest(text="JSON object required")
+        try:
+            payload = parse_json_object(await request.read())
+        except ContractError as exc:
+            status = 413 if exc.code == "body_too_large" else 400
+            return web.json_response(
+                {"error": exc.code, "message": exc.message},
+                status=status,
+            )
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha256(body).hexdigest()
         async with self.admission:

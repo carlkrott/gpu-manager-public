@@ -118,6 +118,34 @@ def test_native_host_health_requires_injected_token(tmp_path):
     asyncio.run(run())
 
 
+def test_native_host_submit_rejects_duplicate_json_keys_before_admission(tmp_path):
+    async def run():
+        host = NativeTaskHost(
+            tmp_path / "state",
+            "http://127.0.0.1:9999/submit",
+            1,
+            service_token=TOKEN,
+        )
+        async with TestClient(TestServer(host.app())) as client:
+            response = await client.post(
+                "/tasks/synthetic-task",
+                data='{"prompt":"first","prompt":"second"}',
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
+            assert response.status == 400
+            payload = await response.json()
+            assert payload == {
+                "error": "invalid_json",
+                "message": "valid JSON required",
+            }
+            assert not (host.root / "synthetic-task").exists()
+
+    asyncio.run(run())
+
+
 def test_native_client_sends_token_to_health_endpoint():
     seen = {}
 
