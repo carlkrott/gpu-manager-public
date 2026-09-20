@@ -173,3 +173,51 @@ def test_rejects_existing_destination_and_duplicate_manifest_paths(tmp_path):
     manifest.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ExportError, match="duplicate"):
         export_public_source(source, manifest, tmp_path / "duplicate-export")
+
+
+def test_checker_rejects_extra_unlisted_symlink_in_export_destination(tmp_path):
+    source, manifest = _fixture(tmp_path, include_public_manifest=True)
+    destination = tmp_path / "export"
+    export_public_source(source, manifest, destination)
+
+    shadow = destination / "actual.py"
+    shadow.write_text("shadowed contents", encoding="utf-8")
+    extra = destination / "extra_link.py"
+    extra.symlink_to(shadow)
+
+    report = check_public_payload(destination, manifest=destination / "release/export-manifest.json")
+
+    assert not report["ok"]
+    symlink_violations = [item for item in report["violations"] if item["rule"] == "payload_symlink_forbidden"]
+    assert any(item["path"] == "extra_link.py" for item in symlink_violations), report
+    # The receipt-listed regular file must still pass byte-for-byte.
+    assert not any(
+        item["rule"] in {"receipt_hash_mismatch", "receipt_size_mismatch", "receipt_unlisted_file"}
+        and item["path"] == "scripts/example.py"
+        for item in report["violations"]
+    ), report
+
+
+def test_checker_rejects_receipt_listed_symlink_before_hashing(tmp_path):
+    source, manifest = _fixture(tmp_path, include_public_manifest=True)
+    destination = tmp_path / "export"
+    export_public_source(source, manifest, destination)
+
+    listed = destination / "scripts" / "example.py"
+    listed.unlink()
+    shadow = destination / "shadow.py"
+    shadow.write_text("different content than the receipt\n", encoding="utf-8")
+    listed.symlink_to(shadow)
+
+    report = check_public_payload(destination, manifest=destination / "release/export-manifest.json")
+
+    assert not report["ok"]
+    symlink_violations = [item for item in report["violations"] if item["rule"] == "payload_symlink_forbidden"]
+    assert any(item["path"] == "scripts/example.py" for item in symlink_violations), report
+    # Without the symlink guard, hashing would follow the link and silently
+    # pass against the tampered target; assert the byte check was skipped.
+    assert not any(
+        item["rule"] in {"receipt_hash_mismatch", "receipt_size_mismatch"}
+        and item["path"] == "scripts/example.py"
+        for item in report["violations"]
+    ), report

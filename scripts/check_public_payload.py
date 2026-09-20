@@ -112,6 +112,21 @@ def _regular_file_paths(root: Path) -> set[str]:
     }
 
 
+def _symlink_paths(root: Path) -> set[str]:
+    """Return every payload symlink (file or directory) under ``root``.
+
+    Symlinks are rejected for the entire publication payload because receipt
+    validation would otherwise follow them and silently hash external
+    targets.  ``.git`` is excluded so checkout metadata does not trigger
+    the rule.
+    """
+    return {
+        path.relative_to(root).as_posix()
+        for path in sorted(root.rglob("*"))
+        if path.is_symlink() and ".git" not in path.parts
+    }
+
+
 def _path_disposition_map(entries: list[dict[str, Any]]) -> dict[str, str]:
     return {entry["path"]: entry["disposition"] for entry in entries}
 
@@ -136,6 +151,16 @@ def _check_structured(path: Path, relative: str, violations: list[dict[str, str]
 def check_public_payload(root: Path, *, manifest: Path | None = None) -> dict[str, Any]:
     root = Path(root).resolve(strict=True)
     violations: list[dict[str, str]] = []
+    # Symlinks must be rejected for the entire payload before any hashing.
+    # Receipt validation would otherwise follow a symlink and silently hash
+    # the external target, defeating the bound-byte receipt.
+    for relative in sorted(_symlink_paths(root)):
+        _record(
+            violations,
+            relative,
+            "payload_symlink_forbidden",
+            "payload symlinks are not publishable; remove before re-exporting",
+        )
     try:
         entries, is_receipt = _manifest_entries(root, manifest)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -169,6 +194,11 @@ def check_public_payload(root: Path, *, manifest: Path | None = None) -> dict[st
                     _record(violations, "release/public-files.json", "receipt_manifest_mismatch", "receipt does not bind the path/disposition manifest")
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 _record(violations, "release/public-files.json", "receipt_manifest_mismatch", str(exc))
+    symlinked_paths = {
+        relative
+        for relative in {entry["path"] for entry in entries}
+        if (root / relative).is_symlink()
+    }
     for entry in entries:
         path = entry["file"]
         relative = entry["path"]
@@ -178,6 +208,10 @@ def check_public_payload(root: Path, *, manifest: Path | None = None) -> dict[st
             _record(violations, str(path), "path_outside_root", "manifest path escapes payload root")
             continue
         checked += 1
+        if relative in symlinked_paths:
+            # Already recorded as payload_symlink_forbidden; do not hash the
+            # symlink target, which would silently pass receipt validation.
+            continue
         if not path.is_file():
             _record(violations, relative, "missing_file", "manifested payload file is missing")
             continue

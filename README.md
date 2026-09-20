@@ -208,10 +208,16 @@ Run the source-only test suite:
 PYTHONPATH=scripts .venv/bin/python -m pytest -q tests/publication
 ```
 
-Run the public payload gate:
+After the test suite, re-export to a fresh destination so the public payload gate operates on a clean copy rather than a source tree that now contains pytest and `__pycache__` artifacts:
 
 ```bash
-PYTHONPATH=scripts .venv/bin/python scripts/check_public_payload.py . --manifest release/export-manifest.json
+.venv/bin/python scripts/export_public_source.py /tmp/gpumanager-export
+```
+
+Run the public payload gate against the exact export and its fresh receipt:
+
+```bash
+PYTHONPATH=scripts .venv/bin/python scripts/check_public_payload.py /tmp/gpumanager-export --manifest /tmp/gpumanager-export/release/export-manifest.json
 ```
 
 Inspect CLI surfaces without starting a service:
