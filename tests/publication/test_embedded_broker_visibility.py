@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from dataclasses import replace
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
+from gemma_broker.compatibility import RequestRequirements
+from gemma_broker.contracts import JobRecord, MemberState
+from gemma_broker.member_cache import StrictMemberSnapshotCache
+from gemma_broker.redis_store import InMemoryJobRepository
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,6 +81,269 @@ def test_embedded_api_proxy_exposes_live_repository_for_attempt_status():
     proxy = module._CombinedGemmaAPIProxy()
 
     assert proxy.repository is repository
+
+
+def test_embedded_start_rejoins_member_with_generation_fenced_cas():
+    module = _load_controller()
+    service_name = "Gemma-MI50"
+    calls: list[tuple] = []
+    member = SimpleNamespace(
+        name=service_name,
+        state=SimpleNamespace(value="offline"),
+        state_version=17,
+        generation_fence=1_000,
+        accepting=False,
+    )
+
+    class _Repository:
+        @staticmethod
+        def get_member(name):
+            assert name == service_name
+            return member
+
+        @staticmethod
+        def begin_member_rejoin(
+            name, *, expected_state_version, generation_fence
+        ):
+            assert name == service_name
+            assert expected_state_version == 17
+            assert generation_fence > 1_000
+            calls.append((name, expected_state_version, generation_fence))
+            member.state = SimpleNamespace(value="joining")
+            member.state_version = 18
+            member.generation_fence = generation_fence
+            return member
+
+    async def _refresh():
+        assert member.state.value == "joining"
+        member.state = SimpleNamespace(value="ready_accepting")
+        member.state_version = 19
+        member.accepting = True
+
+    module._services_config = {
+        "services": {
+            service_name: {
+                "enabled": True,
+                "type": "llm_backend",
+                "routing_group": "Gemma",
+            }
+        },
+        "combined_gemma_broker": {"enabled": True},
+        "combined_gemma_deployment": {"mode": "embedded"},
+    }
+    module._combined_gemma_broker = SimpleNamespace(
+        _repository=_Repository()
+    )
+    module._refresh_combined_gemma_member_snapshots = _refresh
+
+    rejoined = asyncio.run(
+        module._rejoin_combined_gemma_member_after_start(
+            service_name, timeout=0.1
+        )
+    )
+
+    assert rejoined is True
+    assert len(calls) == 1
+    assert member.state.value == "ready_accepting"
+    assert member.accepting is True
+
+
+def test_embedded_start_completes_real_repository_rejoin_and_reserves(
+    monkeypatch,
+):
+    module = _load_controller()
+    service_name = "member-secondary"
+    service_config = {
+        "enabled": True,
+        "type": "llm_backend",
+        "routing_group": "Gemma",
+        "port": 18100,
+        "gpu_id": "synthetic-secondary",
+        "parallel": 1,
+        "context_per_slot": 4096,
+        "model_path": "/models/synthetic-secondary.gguf",
+        "capabilities": ["chat"],
+    }
+    cache_config = {
+        **service_config,
+        "idle_service_configured": service_name,
+    }
+
+    class _Repository(InMemoryJobRepository):
+        def __init__(self):
+            super().__init__()
+            self.complete_rejoin_calls = 0
+
+        def complete_member_rejoin(self, *args, **kwargs):
+            self.complete_rejoin_calls += 1
+            return super().complete_member_rejoin(*args, **kwargs)
+
+    class _Response:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self, **_kwargs):
+            return self.payload
+
+    class _ProbeSession:
+        closed = False
+
+        def get(self, url, **_kwargs):
+            if url.endswith("/health"):
+                return _Response({"status": "ok"})
+            if url.endswith("/slots"):
+                return _Response(
+                    [{"id": 0, "n_ctx": 4096, "is_processing": False}]
+                )
+            if url.endswith("/v1/models"):
+                return _Response(
+                    {
+                        "data": [
+                            {
+                                "id": "synthetic-secondary.gguf",
+                                "meta": {"n_ctx": 4096},
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError(url)
+
+    async def _systemd_facts(_config):
+        return {"systemd_active": True, "main_pid": 12345}
+
+    repository = _Repository()
+    cache = StrictMemberSnapshotCache({service_name: cache_config})
+    offline = replace(
+        cache.snapshots()[0],
+        state=MemberState.OFFLINE,
+        accepting=False,
+        state_version=17,
+        generation_fence=1_000,
+        compatible_free_slots=0,
+        blockers=("member rejoin required",),
+    )
+    repository.put_member(offline)
+    module._services_config = {
+        "services": {service_name: service_config},
+        "combined_gemma_broker": {
+            "enabled": True,
+            "ordered_members": [service_name],
+        },
+        "combined_gemma_deployment": {"mode": "embedded"},
+    }
+    module._combined_gemma_member_cache = cache
+    module._combined_gemma_broker = SimpleNamespace(
+        _repository=repository,
+        dispatch_loop=SimpleNamespace(is_running=True),
+    )
+    module.session = _ProbeSession()
+    monkeypatch.setattr(
+        module, "_combined_gemma_systemd_facts", _systemd_facts
+    )
+
+    rejoined = asyncio.run(
+        module._rejoin_combined_gemma_member_after_start(
+            service_name, timeout=1.0
+        )
+    )
+
+    ready = repository.get_member(service_name)
+    assert rejoined is True
+    assert repository.complete_rejoin_calls == 1
+    assert ready is not None
+    assert ready.state is MemberState.READY_ACCEPTING
+    assert ready.accepting is True
+    assert ready.compatible_free_slots == 1
+
+    job = JobRecord.new(
+        job_id="job-after-rejoin",
+        idempotency_key="idem-after-rejoin",
+        request_sha256="0" * 64,
+        request_body={"messages": [{"role": "user", "content": "synthetic"}]},
+        submitted_at=10.0,
+        enqueue_sequence=1,
+        required_capabilities=("chat",),
+    )
+    repository.submit(job, caller_scope="test")
+    reservation = repository.reserve_next(
+        now=11.0,
+        ordered_members=[ready],
+        requirements=RequestRequirements(
+            input_tokens_estimate=8,
+            max_output_tokens=16,
+            required_capabilities=("chat",),
+            estimate_source="synthetic",
+        ),
+        member_lookup=repository.get_member,
+    )
+    assert reservation is not None
+    assert reservation.member.name == service_name
+
+
+def test_bundle_start_rejoins_only_broker_owned_members(monkeypatch):
+    module = _load_controller()
+    calls: list[tuple[str, float]] = []
+    services = {
+        "member-secondary": {
+            "enabled": True,
+            "type": "llm_backend",
+            "routing_group": "Gemma",
+        },
+        "unrelated-service": {
+            "enabled": True,
+            "type": "audio",
+        },
+    }
+    module._services_config = {
+        "services": services,
+        "combined_gemma_broker": {"enabled": True},
+        "combined_gemma_deployment": {"mode": "embedded"},
+    }
+
+    async def _rejoin(name, *, timeout):
+        calls.append((name, timeout))
+        return True
+
+    monkeypatch.setattr(
+        module, "_rejoin_combined_gemma_member_after_start", _rejoin
+    )
+
+    result = asyncio.run(
+        module._rejoin_combined_gemma_bundle_members_after_start(
+            ["member-secondary", "unrelated-service"],
+            services,
+            timeout=12.0,
+        )
+    )
+
+    assert result is True
+    assert calls == [("member-secondary", 12.0)]
+
+
+def test_load_bundle_invokes_broker_member_rejoin_gate():
+    tree = ast.parse(CONTROLLER.read_text(encoding="utf-8"))
+    load_bundle = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_load_bundle"
+    )
+    called_names = {
+        call.func.id
+        for call in ast.walk(load_bundle)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+    }
+
+    assert "_rejoin_combined_gemma_bundle_members_after_start" in called_names
 
 
 def test_embedded_visibility_uses_in_process_proxy_without_http_session(monkeypatch):
