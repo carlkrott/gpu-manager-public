@@ -60,7 +60,12 @@ def reduce_member_readiness(
 
     systemd_active = bool(probes.get("systemd_active"))
     main_pid = probes.get("main_pid")
-    if not systemd_active or not main_pid:
+    # Remote OpenAI-compatible members have no local process identity. Their
+    # availability is proved by the member-specific health/model probes below;
+    # requiring a local systemd MainPID would permanently quarantine them.
+    if config.get("member_type") != "openai_compatible" and (
+        not systemd_active or not main_pid
+    ):
         block(ReasonCode.MEMBER_SYSTEMD_INACTIVE, "systemd unit or MainPID is inactive")
     semantic_health = bool(probes.get("semantic_health"))
     probe_error = probes.get("probe_error")
