@@ -4,6 +4,7 @@ import ast
 import asyncio
 from dataclasses import replace
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -13,6 +14,7 @@ import pytest
 from gemma_broker.compatibility import RequestRequirements
 from gemma_broker.contracts import JobRecord, MemberState
 from gemma_broker.member_cache import StrictMemberSnapshotCache
+from gemma_broker.member_observer import MemberObserver
 from gemma_broker.redis_store import InMemoryJobRepository
 
 
@@ -67,6 +69,161 @@ def test_embedded_broker_uses_process_independent_epoch_leadership_clock():
     assert isinstance(leadership_clock.value, ast.Name)
     assert leadership_clock.value.id == "time"
     assert leadership_clock.attr == "time"
+
+
+def test_embedded_initializer_uses_cloud_aware_member_builder_and_model_rewrite():
+    tree = ast.parse(CONTROLLER.read_text(encoding="utf-8"))
+    initializer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_initialize_combined_gemma_broker"
+    )
+    called_names = {
+        call.func.id
+        for call in ast.walk(initializer)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+    builder_call = next(
+        call
+        for call in ast.walk(initializer)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "build_member_configs"
+    )
+    builder_assignment = next(
+        node
+        for node in ast.walk(initializer)
+        if isinstance(node, ast.Assign) and node.value is builder_call
+    )
+    transport_call = next(
+        call
+        for call in ast.walk(initializer)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "BufferedAiohttpTransport"
+    )
+    request_rewriter = next(
+        (
+            keyword.value
+            for keyword in transport_call.keywords
+            if keyword.arg == "request_for_member"
+        ),
+        None,
+    )
+
+    assert "build_member_configs" in called_names
+    assert len(builder_call.args) == 2
+    assert isinstance(builder_call.args[1], ast.Name)
+    assert builder_call.args[1].id == "broker_config"
+    assert isinstance(builder_assignment.targets[0], ast.Tuple)
+    assert [item.id for item in builder_assignment.targets[0].elts] == [
+        "member_configs",
+        "endpoints",
+    ]
+    assert isinstance(request_rewriter, ast.Name)
+    assert request_rewriter.id == "_request_for_member"
+
+
+def test_embedded_initializer_builds_cloud_transport_and_rewrites_model(monkeypatch):
+    module = _load_controller()
+    data = json.loads(
+        (ROOT / "examples/combined-gemma/services.json").read_text(encoding="utf-8")
+    )
+    member_name = "member-cloud"
+    endpoint = "http://provider.test/v1/chat/completions"
+    model = "synthetic-cloud-model"
+    data["combined_gemma_broker"]["ordered_members"] = [member_name]
+    data["services"] = {
+        member_name: {
+            "enabled": True,
+            "member_type": "openai_compatible",
+            "endpoint": endpoint,
+            "health_url": "http://provider.test/health/cloud",
+            "models_url": "http://provider.test/v1/models",
+            "model": model,
+            "parallel": 1,
+            "context_per_slot": 4096,
+            "forward_timeout": 60,
+        }
+    }
+    data["combined_gemma_deployment"] = {"mode": "embedded"}
+    captured = {}
+
+    class _Repository:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def recover_stale_pre_acceptance_claims(**_kwargs):
+            return []
+
+    class _DispatchLoop:
+        is_running = True
+
+        async def start(self):
+            return None
+
+    class _Runtime:
+        dispatch_loop = _DispatchLoop()
+        api_service = SimpleNamespace(members=lambda: [])
+
+        @staticmethod
+        def schedule_background(coro):
+            coro.close()
+
+    def _build_runtime(
+        *,
+        config,
+        repository,
+        members_provider,
+        transport,
+        clock,
+        repair_fence=None,
+        request_timeout=30.0,
+        compat_timeout=30.0,
+        dispatch_owner=None,
+    ):
+        captured.update(
+            config=config,
+            repository=repository,
+            members_provider=members_provider,
+            transport=transport,
+            clock=clock,
+            repair_fence=repair_fence,
+            request_timeout=request_timeout,
+            compat_timeout=compat_timeout,
+            dispatch_owner=dispatch_owner,
+        )
+        return _Runtime()
+
+    async def _no_refresh():
+        return None
+
+    import gemma_broker.redis_store as redis_store
+    import gemma_broker.runtime as broker_runtime
+
+    monkeypatch.setattr(redis_store, "RedisJobRepository", _Repository)
+    monkeypatch.setattr(broker_runtime, "build_runtime", _build_runtime)
+    monkeypatch.setattr(
+        module, "_refresh_combined_gemma_member_snapshots", _no_refresh
+    )
+    module._services_config = data
+    module._queue_redis = object()
+    module.session = SimpleNamespace(closed=False)
+    module._combined_gemma_broker = None
+    module._combined_gemma_member_cache = None
+
+    runtime = asyncio.run(module._initialize_combined_gemma_broker())
+
+    assert runtime is not None
+    transport = captured["transport"]
+    member = SimpleNamespace(name=member_name)
+    assert transport._endpoint_for_member(member) == endpoint
+    request = {"model": "combined-gemma", "messages": []}
+    rewritten = transport._request_for_member(member, request)
+    assert rewritten["model"] == model
+    assert request["model"] == "combined-gemma"
 
 
 def test_embedded_api_proxy_exposes_live_repository_for_attempt_status():
@@ -520,6 +677,205 @@ def test_member_refresh_uses_configured_ordered_members_only():
 
     assert calls == list(configured)
     assert not {"LLM-Primary", "LLM-Secondary", "LLM-CPU"}.intersection(calls)
+
+
+def test_member_refresh_observes_openai_compatible_member(monkeypatch):
+    module = _load_controller()
+    member_name = "cloud-primary"
+    config = {
+        "enabled": True,
+        "member_type": "openai_compatible",
+        "endpoint": "http://127.0.0.1:18646/v1/chat/completions",
+        "health_url": "http://127.0.0.1:18646/health/cloud",
+        "models_url": "http://127.0.0.1:18646/v1/models",
+        "model": "synthetic-cloud-model",
+        "parallel": 1,
+        "context_per_slot": 4096,
+        "capabilities": ["chat"],
+    }
+    observations: list[str] = []
+    updates: list[tuple[str, object]] = []
+
+    class _Observer:
+        def __init__(self, configs, **_kwargs):
+            assert configs[member_name] == config
+
+        async def observe(self, name, *, now):
+            assert now > 0
+            observations.append(name)
+            return object()
+
+    class _Cache:
+        _configs = {member_name: config}
+        _snapshots = {}
+
+        def update(self, name, probes, *, now):
+            assert now > 0
+            updates.append((name, probes))
+            raise RuntimeError("bounded test stop after cloud observation")
+
+    class _Repository:
+        @staticmethod
+        def lease_count(_name):
+            return 0
+
+    module._services_config = {
+        "services": {member_name: config},
+        "combined_gemma_broker": {
+            "enabled": True,
+            "ordered_members": [member_name],
+        },
+        "combined_gemma_deployment": {"mode": "embedded"},
+    }
+    module._combined_gemma_member_cache = _Cache()
+    module._combined_gemma_broker = SimpleNamespace(
+        dispatch_loop=SimpleNamespace(is_running=True),
+        _repository=_Repository(),
+    )
+    module.session = SimpleNamespace(closed=False)
+    monkeypatch.setattr(module, "MemberObserver", _Observer, raising=False)
+
+    asyncio.run(module._refresh_combined_gemma_member_snapshots())
+
+    assert observations == [member_name]
+    assert updates and updates[0][0] == member_name
+
+
+def test_openai_compatible_member_readiness_does_not_require_local_systemd():
+    member_name = "cloud-primary"
+    config = {
+        "enabled": True,
+        "member_type": "openai_compatible",
+        "endpoint": "http://provider.test/v1/chat/completions",
+        "health_url": "http://provider.test/health/cloud",
+        "models_url": "http://provider.test/v1/models",
+        "model": "synthetic-cloud-model",
+        "parallel": 1,
+        "context_per_slot": 4096,
+        "cpu_only": True,
+        "idle_service_configured": None,
+        "capabilities": ("chat", "completion"),
+    }
+
+    class _CloudResponse:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self, **_kwargs):
+            return self.payload
+
+    class _CloudSession:
+        def get(self, url, **_kwargs):
+            if url.endswith("/health/cloud"):
+                return _CloudResponse({"status": "ok"})
+            if url.endswith("/v1/models"):
+                return _CloudResponse(
+                    {"data": [{"id": "synthetic-cloud-model"}]}
+                )
+            raise AssertionError(url)
+
+    async def _no_local_systemd(_config):
+        return {"systemd_active": False, "main_pid": None}
+
+    observer = MemberObserver(
+        {member_name: config},
+        session=_CloudSession(),
+        systemd_probe=_no_local_systemd,
+        dispatcher_state=lambda _name: (True, 0),
+        timeout=1.0,
+    )
+    cache = StrictMemberSnapshotCache({member_name: config}, freshness_ms=5000)
+    probes = asyncio.run(observer.observe(member_name, now=100.0))
+
+    snapshot = cache.update(member_name, probes, now=100.0)
+
+    assert probes["systemd_active"] is False
+    assert snapshot.state is MemberState.READY_ACCEPTING
+    assert snapshot.accepting is True
+    assert snapshot.compatible_free_slots == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("health_503", "http_503"),
+        ("model_missing", None),
+        ("health_url_missing", "url_missing"),
+        ("session_missing", "http_session_required"),
+    ],
+)
+def test_openai_compatible_member_probe_failures_are_unhealthy(
+    case, expected_error
+):
+    member_name = "cloud-primary"
+    config = {
+        "enabled": True,
+        "member_type": "openai_compatible",
+        "endpoint": "http://provider.test/v1/chat/completions",
+        "health_url": "http://provider.test/health/cloud",
+        "models_url": "http://provider.test/v1/models",
+        "model": "synthetic-cloud-model",
+        "parallel": 1,
+        "context_per_slot": 4096,
+        "cpu_only": True,
+        "idle_service_configured": None,
+        "capabilities": ("chat", "completion"),
+    }
+    if case == "health_url_missing":
+        config.pop("health_url")
+
+    class _CloudResponse:
+        def __init__(self, status, payload):
+            self.status = status
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self, **_kwargs):
+            return self.payload
+
+    class _CloudSession:
+        def get(self, url, **_kwargs):
+            if url.endswith("/health/cloud"):
+                status = 503 if case == "health_503" else 200
+                return _CloudResponse(status, {"status": "ok"})
+            if url.endswith("/v1/models"):
+                model = "other-model" if case == "model_missing" else config["model"]
+                return _CloudResponse(200, {"data": [{"id": model}]})
+            raise AssertionError(url)
+
+    async def _no_local_systemd(_config):
+        return {"systemd_active": False, "main_pid": None}
+
+    observer = MemberObserver(
+        {member_name: config},
+        session=None if case == "session_missing" else _CloudSession(),
+        systemd_probe=_no_local_systemd,
+        dispatcher_state=lambda _name: (True, 0),
+        timeout=1.0,
+    )
+    cache = StrictMemberSnapshotCache({member_name: config}, freshness_ms=5000)
+    probes = asyncio.run(observer.observe(member_name, now=100.0))
+
+    snapshot = cache.update(member_name, probes, now=100.0)
+
+    assert probes["semantic_health"] is False
+    assert probes["probe_error"] == expected_error
+    assert snapshot.state is MemberState.UNHEALTHY
+    assert snapshot.accepting is False
+    assert snapshot.compatible_free_slots == 0
 
 
 @pytest.mark.parametrize(

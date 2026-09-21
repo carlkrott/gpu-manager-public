@@ -128,6 +128,7 @@ from gemma_broker.recovery import (
     RecoveryState,
     reduce_recovery,
 )
+from gemma_broker.member_observer import MemberObserver
 from gpu_manager_contracts import (
     PriorityConvention,
     apply_priority_contract,
@@ -23889,7 +23890,6 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
         return
     cache = _combined_gemma_member_cache
     broker = _combined_gemma_broker
-    services = (_services_config or {}).get("services", {}) if isinstance(_services_config, dict) else {}
     if cache is None or broker is None or session is None or session.closed:
         return
     broker_config = (_services_config or {}).get("combined_gemma_broker", {})
@@ -23902,114 +23902,22 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
     ):
         logger.error("Combined Gemma readiness refresh refused invalid ordered_members")
         return
-    for name in ordered_members:
-        # Use the cache-owned config (which carries ``idle_service_configured``)
-        # so the readiness reducer sees the per-member synthetic fields that
-        # were set at construction time. The live services.json does NOT carry
-        # those fields and is not the right source.
-        live_config = services.get(name, {})
-        # Use the cache-owned config (which carries ``idle_service_configured``)
-        # so the readiness reducer sees the per-member synthetic fields that
-        # were set at construction time. The live services.json does NOT carry
-        # those fields and is not the right source.
-        cached_config = getattr(cache, "_configs", {}).get(name)
-        config = cached_config if cached_config is not None else live_config
-        port = config.get("port")
-        payloads: dict[str, Any] = {}
-        if isinstance(port, int) and port > 0:
-            base = f"http://127.0.0.1:{port}"
-            try:
-                for key, path in (("health", "/health"), ("slots", "/slots"), ("models", "/v1/models")):
-                    async with session.get(base + path, timeout=ClientTimeout(total=3)) as response:
-                        if response.status != 200:
-                            raise RuntimeError(f"{path}:HTTP_{response.status}")
-                        payloads[key] = await response.json(content_type=None)
-            except Exception:
-                payloads = {}
-        facts = await _combined_gemma_systemd_facts(config)
-        # idle_service_effective is broker-owned: the broker is the dispatcher;
-        # for non-CPU members, ``idle_service_configured`` was set at
-        # construction time, so the effective flag is True.
-        facts["idle_service_effective"] = (
-            True if config.get("cpu_only") else config.get("idle_service_configured") == name
+    def _dispatcher_state(member_name: str) -> tuple[bool, int]:
+        return (
+            bool(getattr(broker.dispatch_loop, "is_running", False)),
+            int(broker._repository.lease_count(member_name)),
         )
-        # dispatcher_registered reflects the broker's own dispatch_loop state;
-        # this is the broker-side assertion, not the legacy WorkerPool pool state.
-        facts["dispatcher_registered"] = bool(getattr(broker.dispatch_loop, "is_running", False))
-        # Per-probe outcome tracking. Each probe is recorded with its
-        # own error class so the readiness reducer can map ECONNREFUSED,
-        # timeout, server_disconnect, HTTP 5xx, and bad-JSON to distinct
-        # ReasonCodes. This preserves the contract: a subordinate probe
-        # failure (e.g. /slots times out under load) does NOT destroy
-        # the successful /health and /v1/models evidence.
-        probe_status: dict[str, str] = {}
-        if isinstance(port, int) and port > 0:
-            base = f"http://127.0.0.1:{port}"
-            for probe_name, path in (
-                ("health", "/health"),
-                ("slots", "/slots"),
-                ("models", "/v1/models"),
-            ):
-                # Outer: any network-level failure or unexpected error
-                # is recorded against this probe only; the OTHER probes'
-                # successful payloads are preserved.
-                try:
-                    try:
-                        async with session.get(
-                            base + path, timeout=ClientTimeout(total=3)
-                        ) as response:
-                            if response.status != 200:
-                                probe_status[probe_name] = f"http_{response.status}"
-                            else:
-                                try:
-                                    payloads[probe_name] = await response.json(
-                                        content_type=None
-                                    )
-                                except Exception:
-                                    probe_status[probe_name] = "bad_json"
-                    except asyncio.TimeoutError:
-                        probe_status[probe_name] = "probe_timeout"
-                    except aiohttp.ClientConnectorError as e:
-                        msg = str(e)
-                        probe_status[probe_name] = (
-                            "connection_refused"
-                            if "Connection refused" in msg
-                            else "connection_error"
-                        )
-                    except aiohttp.ServerDisconnectedError:
-                        probe_status[probe_name] = "server_disconnected"
-                    except Exception:
-                        # Unexpected: missing method on a fake session,
-                        # unknown transport error, etc. Record as "unknown"
-                        # so the readiness reducer still sees a known class
-                        # for the failed probe and the other probes'
-                        # successful payloads are preserved.
-                        probe_status[probe_name] = "unknown"
-                except NameError:
-                    # ``aiohttp`` failed to import at module top-level.
-                    # This only happens in the broken-test-load path; in
-                    # production, ``aiohttp`` is always available.
-                    probe_status[probe_name] = "unknown"
-        if probe_status:
-            # Keep the detailed per-endpoint evidence for diagnostics, but pass
-            # one scalar to the readiness adapter. Dict-valued probe_error was
-            # ambiguous at the consumer boundary and leaked unknown:* classes.
-            facts["probe_errors"] = dict(probe_status)
-            from gemma_broker.probe_adapter import select_probe_error
-            facts["probe_error"] = select_probe_error(probe_status)
+
+    observer = MemberObserver(
+        getattr(cache, "_configs", {}),
+        session=session,
+        systemd_probe=_combined_gemma_systemd_facts,
+        dispatcher_state=_dispatcher_state,
+        timeout=3.0,
+    )
+    for name in ordered_members:
         try:
-            facts["dispatcher_leases"] = broker._repository.lease_count(name)
-        except Exception:
-            logger.warning(
-                "BROKER_REFRESH: lease_count_failed member=%s; refusing stale capacity",
-                name, exc_info=True,
-            )
-            raise
-        try:
-            from gemma_broker.probe_adapter import member_probes_from_payloads
-            probes = member_probes_from_payloads(
-                config=config, payloads=payloads, manager_facts=facts, observed_at=time.time(),
-            )
+            probes = await observer.observe(name, now=time.time())
             readiness = cache.update(name, probes, now=time.time())
             stale_lifecycle = False
             # A persisted JOINING state can survive a manager crash/restart
@@ -24126,6 +24034,7 @@ async def _initialize_combined_gemma_broker() -> Any | None:
         logger.error("Combined Gemma broker unavailable: Redis or shared HTTP session missing")
         return None
     try:
+        from combined_gemma_broker_service import build_member_configs
         from gemma_broker.config import BrokerConfig
         from gemma_broker.member_cache import StrictMemberSnapshotCache
         from gemma_broker.redis_store import RedisJobRepository
@@ -24146,27 +24055,25 @@ async def _initialize_combined_gemma_broker() -> Any | None:
             _services_config["combined_gemma_broker"], candidate=candidate,
         )
         services = _services_config.get("services", {})
-        member_configs: dict[str, dict] = {}
-        endpoints: dict[str, str] = {}
+        member_configs, endpoints = build_member_configs(services, broker_config)
         member_forward_timeouts: list[float] = []
         for name in broker_config.ordered_members:
             service_config = services.get(name)
             if not isinstance(service_config, dict) or service_config.get("enabled") is not True:
                 raise ValueError(f"COMBINED_GEMMA_MEMBER_CONFIG_INVALID:{name}")
-            candidate_config = dict(service_config)
-            candidate_config["idle_service_configured"] = None if candidate_config.get("cpu_only") else name
-            # The readiness reducer and the compat evaluator read
-            # ``capabilities`` off the per-member config. The live
-            # services.json does not carry this field; the OpenAI-shaped
-            # compat path requires chat/completion. Stamp the explicit
-            # capability tuple here so evaluate()'s subset check matches.
-            candidate_config["capabilities"] = ("chat", "completion")
-            member_configs[name] = candidate_config
-            endpoints[name] = f"http://127.0.0.1:{int(service_config['port'])}/v1/chat/completions"
-            forward_timeout = float(service_config.get("forward_timeout", 600))
+            member_config = member_configs[name]
+            forward_timeout = float(member_config.get("forward_timeout", 600))
             if forward_timeout <= 0:
                 raise ValueError(f"COMBINED_GEMMA_FORWARD_TIMEOUT_INVALID:{name}")
             member_forward_timeouts.append(forward_timeout)
+
+        def _request_for_member(member, request_body):
+            payload = dict(request_body)
+            model = member_configs.get(member.name, {}).get("model")
+            if isinstance(model, str) and model:
+                payload["model"] = model
+            return payload
+
         cache = StrictMemberSnapshotCache(member_configs, freshness_ms=int(broker_config.freshness_seconds * 1000))
         repository = RedisJobRepository(
             _queue_redis,
@@ -24193,6 +24100,7 @@ async def _initialize_combined_gemma_broker() -> Any | None:
         transport = BufferedAiohttpTransport(
             session=session,
             endpoint_for_member=lambda member: endpoints.get(member.name, ""),
+            request_for_member=_request_for_member,
             timeout=broker_request_timeout,
         )
         runtime = build_runtime(

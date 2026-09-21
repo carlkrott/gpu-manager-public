@@ -64,6 +64,9 @@ def build_member_configs(
         if type(raw.get("enabled")) is not bool:
             raise ValueError(f"MEMBER_ENABLED_INVALID:{name}")
         member = dict(raw)
+        timeout = member.get("forward_timeout", 600)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError(f"MEMBER_FORWARD_TIMEOUT_INVALID:{name}")
         if member.get("member_type") == "openai_compatible":
             endpoint = member.get("endpoint")
             model = member.get("model")
@@ -80,9 +83,6 @@ def build_member_configs(
         port = member.get("port")
         if isinstance(port, bool) or not isinstance(port, int) or port <= 0 or port > 65535:
             raise ValueError(f"MEMBER_PORT_INVALID:{name}")
-        timeout = member.get("forward_timeout", 600)
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ValueError(f"MEMBER_FORWARD_TIMEOUT_INVALID:{name}")
         member["idle_service_configured"] = None if member.get("cpu_only") else name
         member["capabilities"] = ("chat", "completion")
         members[name] = member

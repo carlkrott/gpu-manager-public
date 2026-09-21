@@ -62,6 +62,24 @@ def test_combined_example_loads_through_real_broker_boundaries() -> None:
     assert all(endpoint.startswith("http://127.0.0.1:") for endpoint in endpoints.values())
 
 
+@pytest.mark.parametrize("timeout", [True, 0, -1, "600"])
+def test_cloud_member_rejects_invalid_forward_timeout(timeout) -> None:
+    data = _combined_data()
+    block = data["combined_gemma_broker"]
+    config = BrokerConfig.from_dict(block, candidate=block["candidate_mode"])
+    member_name = config.ordered_members[0]
+    data["services"][member_name] = {
+        "enabled": False,
+        "member_type": "openai_compatible",
+        "endpoint": "http://provider.test/v1/chat/completions",
+        "model": "synthetic-cloud-model",
+        "forward_timeout": timeout,
+    }
+
+    with pytest.raises(ValueError, match="MEMBER_FORWARD_TIMEOUT_INVALID"):
+        build_member_configs(data["services"], config)
+
+
 @pytest.mark.parametrize(
     ("change", "error"),
     [
