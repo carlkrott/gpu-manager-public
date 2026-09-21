@@ -24404,7 +24404,9 @@ def _combined_gemma_broker_embedded() -> bool:
 
 
 def _next_combined_gemma_generation_fence(service_name: str) -> int:
-    """Allocate a monotonic fence that remains exact through Redis/Lua numbers."""
+    """Allocate a process-local high-water fence exact through Redis/Lua."""
+    # Allocation consumes the value even if the later repository CAS fails.
+    # Redis remains authoritative for the committed member generation.
     candidate = time.time_ns() // 1_000_000
     previous = _combined_gemma_generation_fences.get(service_name, 0)
     fence = max(candidate, previous + 1)
@@ -24536,12 +24538,100 @@ async def _rejoin_combined_gemma_member_after_start(
     service_name: str, *, timeout: float = DRAIN_TIMEOUT,
     expected_state_version: int | None = None,
 ) -> bool:
-    """Rejoin an externally-owned member only after startup health is verified."""
+    """Rejoin a broker-owned member only after startup health is verified."""
     service_config = _services_config.get("services", {}).get(service_name, {})
     if not _combined_gemma_broker_owns_service(service_name, service_config):
         return True
     if _combined_gemma_broker_embedded():
-        return True
+        broker = _combined_gemma_broker
+        repository = getattr(broker, "_repository", None)
+        if repository is None:
+            logger.error(
+                "Embedded Combined Gemma member rejoin unavailable for %s",
+                service_name,
+            )
+            return False
+        try:
+            current = repository.get_member(service_name)
+            if current is None:
+                raise RuntimeError(
+                    f"Combined Gemma member not found: {service_name}"
+                )
+            state = getattr(getattr(current, "state", None), "value", None)
+            if state == "ready_accepting" and current.accepting is True:
+                return True
+            if state == "offline":
+                expected = (
+                    int(current.state_version)
+                    if expected_state_version is None
+                    else int(expected_state_version)
+                )
+                generation_fence = max(
+                    _next_combined_gemma_generation_fence(service_name),
+                    int(getattr(current, "generation_fence", 0) or 0) + 1,
+                )
+                _combined_gemma_generation_fences[service_name] = generation_fence
+                joining = repository.begin_member_rejoin(
+                    service_name,
+                    expected_state_version=expected,
+                    generation_fence=generation_fence,
+                )
+                state = getattr(getattr(joining, "state", None), "value", None)
+            elif state == "joining":
+                # The persisted generation is authoritative. A controller can
+                # restart with an empty process-local high-water map while a
+                # valid JOINING record survives in Redis.
+                if (
+                    expected_state_version is not None
+                    and int(current.state_version) != int(expected_state_version)
+                ):
+                    raise RuntimeError(
+                        "Combined Gemma member state changed before rejoin"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Combined Gemma member {service_name} cannot rejoin from {state!r}"
+                )
+            if state != "joining":
+                raise RuntimeError(
+                    f"Combined Gemma member {service_name} did not enter joining"
+                )
+
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while True:
+                # Refresh completes JOINING only after fresh probes are ready
+                # and dispatcher leases are zero. Poll until that fenced CAS
+                # wins or the caller's bounded timeout expires.
+                await _refresh_combined_gemma_member_snapshots()
+                current = repository.get_member(service_name)
+                if current is None:
+                    raise RuntimeError(
+                        f"Combined Gemma member disappeared: {service_name}"
+                    )
+                state = getattr(getattr(current, "state", None), "value", None)
+                if state == "ready_accepting" and current.accepting is True:
+                    logger.info(
+                        "Embedded Combined Gemma member rejoined after start: %s",
+                        service_name,
+                    )
+                    return True
+                if state != "joining":
+                    raise RuntimeError(
+                        f"Combined Gemma member {service_name} left joining as {state!r}"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Combined Gemma member rejoin timed out: {service_name}"
+                    )
+                await asyncio.sleep(min(0.25, remaining))
+        except Exception as exc:
+            logger.error(
+                "Embedded Combined Gemma member rejoin failed for %s: %s",
+                service_name,
+                exc,
+            )
+            return False
     try:
         result = await _external_combined_gemma_control(
             service_name,
@@ -24554,6 +24644,37 @@ async def _rejoin_combined_gemma_member_after_start(
         logger.error("External Combined Gemma member rejoin failed for %s: %s", service_name, exc)
         return False
     return bool(result and result.get("rejoined") is True)
+
+
+async def _rejoin_combined_gemma_bundle_members_after_start(
+    member_names: list[str],
+    services_cfg: Mapping[str, Any],
+    *,
+    timeout: float,
+) -> bool:
+    """Rejoin every broker-owned member in a newly healthy bundle."""
+    for service_name in member_names:
+        service_config = services_cfg.get(service_name, {})
+        if not isinstance(service_config, Mapping):
+            logger.error(
+                "Combined Gemma bundle member config invalid for %s",
+                service_name,
+            )
+            return False
+        if not _combined_gemma_broker_owns_service(
+            service_name, dict(service_config)
+        ):
+            continue
+        if not await _rejoin_combined_gemma_member_after_start(
+            service_name,
+            timeout=timeout,
+        ):
+            logger.error(
+                "Combined Gemma bundle member failed to rejoin after start: %s",
+                service_name,
+            )
+            return False
+    return True
 
 
 async def _fetch_external_combined_gemma_health() -> tuple[dict[str, dict], str | None]:
@@ -32731,6 +32852,17 @@ async def _load_bundle(
                         )
                         all_ok = False
                         break
+
+            # A healthy port is not enough for a broker-owned LLM member. Its
+            # durable lifecycle record must also complete the generation-fenced
+            # OFFLINE -> JOINING -> READY_ACCEPTING transition before this
+            # bundle can commit ownership or accept work.
+            if all_ok:
+                all_ok = await _rejoin_combined_gemma_bundle_members_after_start(
+                    list(member_names),
+                    services_cfg,
+                    timeout=float(bundle_timeout),
+                )
 
             # TX_VERIFY: checked profiles already carry host-supplied process,
             # model and accepting evidence. Legacy bundles retain the existing
