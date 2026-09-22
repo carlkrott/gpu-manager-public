@@ -16,6 +16,7 @@ from gemma_broker.contracts import JobRecord, MemberState
 from gemma_broker.member_cache import StrictMemberSnapshotCache
 from gemma_broker.member_observer import MemberObserver
 from gemma_broker.redis_store import InMemoryJobRepository
+from gemma_broker.runtime import BufferedAiohttpTransport
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -224,6 +225,85 @@ def test_embedded_initializer_builds_cloud_transport_and_rewrites_model(monkeypa
     rewritten = transport._request_for_member(member, request)
     assert rewritten["model"] == model
     assert request["model"] == "combined-gemma"
+
+
+def test_streamed_minimax_model_moves_leading_think_to_reasoning_content():
+    events = [
+        {
+            "id": "chatcmpl-synthetic",
+            "created": 1,
+            "model": "MiniMax-Synthetic",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "<think>private reasoning</think>\n\nFINAL",
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-synthetic",
+            "created": 1,
+            "model": "MiniMax-Synthetic",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    ]
+    body = b"".join(
+        b"data: " + json.dumps(event).encode("utf-8") + b"\n\n"
+        for event in events
+    ) + b"data: [DONE]\n\n"
+    accepted: list[bool] = []
+
+    class _Content:
+        def __aiter__(self):
+            async def _chunks():
+                yield body
+
+            return _chunks()
+
+    class _Response:
+        status = 200
+        content = _Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Session:
+        def post(self, *_args, **_kwargs):
+            return _Response()
+
+    transport = BufferedAiohttpTransport(
+        session=_Session(),
+        endpoint_for_member=lambda _member: "http://provider.test/chat",
+        request_for_member=lambda _member, request: {
+            **request,
+            "model": "MiniMax-Synthetic",
+        },
+    )
+    result = asyncio.run(
+        transport.send(
+            SimpleNamespace(name="cloud-primary"),
+            {"model": "combined-gemma", "messages": []},
+            lambda: accepted.append(True),
+        )
+    )
+
+    assert accepted == [True]
+    message = result["choices"][0]["message"]
+    assert message["content"] == "FINAL"
+    assert message["reasoning_content"] == "private reasoning"
 
 
 def test_embedded_api_proxy_exposes_live_repository_for_attempt_status():

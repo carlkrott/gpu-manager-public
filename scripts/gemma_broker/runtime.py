@@ -367,9 +367,13 @@ class BufferedAiohttpTransport:
                 # emitting the response headers. Entering the response is
                 # therefore a proven acceptance boundary for this request.
                 on_accepted()
+                model = payload.get("model")
                 return await self._read_streamed_chat_response(
                     response,
-                    split_leading_think=getattr(member, "name", None) == "MiniMax-2.5",
+                    split_leading_think=(
+                        isinstance(model, str)
+                        and model.casefold().startswith("minimax-")
+                    ),
                 )
         finally:
             pass
