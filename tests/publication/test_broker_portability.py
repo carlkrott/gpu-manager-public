@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from gemma_broker.compatibility import RequestRequirements
 from gemma_broker.config import BrokerConfig, ConfigError
 from gemma_broker.contracts import JobRecord, MemberSnapshot, MemberState
-from gemma_broker.redis_store import RESERVE_JOB_LUA, RedisJobRepository
+from gemma_broker.redis_store import (
+    RESERVE_JOB_LUA,
+    RedisJobRepository,
+    _derive_compatible_free_slots,
+)
 from gemma_broker.runtime import validate_candidate_config
 from combined_gemma_broker_service import load_broker_settings
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _config(**overrides):
@@ -164,3 +173,20 @@ def test_redis_reservation_uses_separate_durable_leadership_clock():
     assert "leader_expiry <= tonumber(ARGV[12])" in RESERVE_JOB_LUA
     assert "'queue_claimed_at', ARGV[4]" in RESERVE_JOB_LUA
     assert "'reserved_at', ARGV[4]" in RESERVE_JOB_LUA
+
+
+def test_member_release_capacity_does_not_double_count_inflight_work():
+    assert _derive_compatible_free_slots(
+        configured_slots=4,
+        backend_slots_total=4,
+        backend_slots_busy=1,
+        live_leases=1,
+    ) == 3
+
+    script = (ROOT / "scripts/gemma_broker/lua/member_drain.lua").read_text(
+        encoding="utf-8"
+    )
+    assert "configured - backend_busy - live_leases" not in script
+    assert "local backend_free = math.max(0, configured - backend_busy)" in script
+    assert "local dispatcher_free = math.max(0, configured - live_leases)" in script
+    assert "free = math.min(configured, backend_free, dispatcher_free)" in script
