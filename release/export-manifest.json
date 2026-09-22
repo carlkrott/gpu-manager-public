@@ -382,8 +382,8 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/runtime.py",
-      "sha256": "a57ad3ec9edb8ff21b1a9b11ec1740abc2787f2b7d0d29e9af96ba5c44e1833d",
-      "size": 86862
+      "sha256": "857b4fa4d9ab1a5e3bfe5a837287f596a6c4507c942c9fb0c21d76a344d94fba",
+      "size": 86999
     },
     {
       "disposition": "core",
@@ -676,8 +676,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_embedded_broker_visibility.py",
-      "sha256": "4d4989533653f5bc2d34f50b0445a12dab2bfddb3d62d50a787d42563cbb6d77",
-      "size": 32996
+      "sha256": "eb04c2ab6fb6e3910c5e4e05f3300f222a6b2a3ba1888a449b90b93c8cbec839",
+      "size": 35212
     },
     {
       "disposition": "core",
