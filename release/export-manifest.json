@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "6abd0b15dd705a57e8063fe3df70ec710601fd443cbb4f40d477c3cff6c5b233",
-      "size": 1906672
+      "sha256": "71646350d2b8ed624228f80e12b343d8719cb4a2d1690a8305850090aae73277",
+      "size": 1908171
     },
     {
       "disposition": "core",
@@ -676,8 +676,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_embedded_broker_visibility.py",
-      "sha256": "eb04c2ab6fb6e3910c5e4e05f3300f222a6b2a3ba1888a449b90b93c8cbec839",
-      "size": 35212
+      "sha256": "5757d9c6c46f756857921483546f82d5430fd87552e1cd99cf0eca7d8245d6b2",
+      "size": 37854
     },
     {
       "disposition": "core",

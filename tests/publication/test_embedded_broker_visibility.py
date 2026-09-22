@@ -385,6 +385,88 @@ def test_embedded_start_rejoins_member_with_generation_fenced_cas():
     assert member.accepting is True
 
 
+def test_embedded_start_drains_unhealthy_member_before_generation_fenced_rejoin():
+    module = _load_controller()
+    service_name = "Gemma-MI50"
+    calls: list[tuple] = []
+    member = SimpleNamespace(
+        name=service_name,
+        state=SimpleNamespace(value="unhealthy"),
+        state_version=23,
+        generation_fence=2_000,
+        accepting=False,
+    )
+
+    class _Repository:
+        @staticmethod
+        def get_member(name):
+            assert name == service_name
+            return member
+
+        @staticmethod
+        def begin_member_rejoin(
+            name, *, expected_state_version, generation_fence
+        ):
+            assert name == service_name
+            assert expected_state_version == 24
+            assert generation_fence > 2_000
+            calls.append(("begin_rejoin", expected_state_version, generation_fence))
+            member.state = SimpleNamespace(value="joining")
+            member.state_version = 25
+            member.generation_fence = generation_fence
+            return member
+
+    async def _drain_member(
+        name, *, expected_state_version, timeout, retry_stale
+    ):
+        assert name == service_name
+        assert expected_state_version == 23
+        assert timeout == 0.1
+        assert retry_stale is True
+        calls.append(("drain", expected_state_version))
+        member.state = SimpleNamespace(value="offline")
+        member.state_version = 24
+        return SimpleNamespace(drained=True, member=member, lease_count=0)
+
+    async def _refresh():
+        assert member.state.value == "joining"
+        member.state = SimpleNamespace(value="ready_accepting")
+        member.state_version = 26
+        member.accepting = True
+
+    setattr(module, "_services_config", {
+        "services": {
+            service_name: {
+                "enabled": True,
+                "type": "llm_backend",
+                "routing_group": "Gemma",
+            }
+        },
+        "combined_gemma_broker": {"enabled": True},
+        "combined_gemma_deployment": {"mode": "embedded"},
+    })
+    setattr(
+        module,
+        "_combined_gemma_broker",
+        SimpleNamespace(
+            _repository=_Repository(),
+            drain_member=_drain_member,
+        ),
+    )
+    setattr(module, "_refresh_combined_gemma_member_snapshots", _refresh)
+
+    rejoined = asyncio.run(
+        module._rejoin_combined_gemma_member_after_start(
+            service_name, timeout=0.1
+        )
+    )
+
+    assert rejoined is True
+    assert [call[0] for call in calls] == ["drain", "begin_rejoin"]
+    assert member.state.value == "ready_accepting"
+    assert member.accepting is True
+
+
 def test_embedded_start_completes_real_repository_rejoin_and_reserves(
     monkeypatch,
 ):
