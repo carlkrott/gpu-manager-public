@@ -32492,6 +32492,32 @@ async def _evict_then_load_bundle_unlocked(
         return await _transaction()
 
 
+def _reconcile_loaded_configured_idle_bundle(
+    bundle: Mapping[str, Any], config: Mapping[str, Any]
+) -> bool:
+    """Clear eviction latches after a configured per-GPU idle bundle loads."""
+    scheduling = config.get("scheduling") or {}
+    idle_services = scheduling.get("idle_services") or {}
+    if not isinstance(idle_services, Mapping):
+        return False
+    gpu_id = str(bundle.get("gpu_id") or "").strip()
+    configured_idle = str(idle_services.get(gpu_id) or "").strip()
+    member_names = {
+        str(name).strip()
+        for name in (bundle.get("services") or [])
+        if str(name).strip()
+    }
+    if not gpu_id or not configured_idle or configured_idle not in member_names:
+        return False
+    if vram is None:
+        return False
+    vram.mark_llm_evicted(False, source="_load_bundle:configured_idle")
+    gpu_evicted = getattr(vram, "_gpu_evicted", None)
+    if isinstance(gpu_evicted, dict):
+        gpu_evicted.pop(gpu_id, None)
+    return True
+
+
 async def _load_bundle(
     bundle_name: str,
     priority: int | None = None,
@@ -32946,6 +32972,8 @@ async def _load_bundle(
             # ── Step 5: Resolve pending requests ────────────────────────────
             q = _get_bundle_request_queue(bundle_name)
             await q.resolve_all(success=True)
+
+            _reconcile_loaded_configured_idle_bundle(bundle, config)
 
             logger.info(
                 f"LoadBundle: '{bundle_name}' loaded successfully on GPU {gpu_id} "
