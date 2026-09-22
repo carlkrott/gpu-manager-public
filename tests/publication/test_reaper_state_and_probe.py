@@ -372,3 +372,65 @@ def test_per_gpu_idle_recovery_bypasses_legacy_global_restore(monkeypatch):
         ("unload", "synthetic-idle-bundle"),
         ("load", "synthetic-idle-bundle"),
     ]
+
+
+def test_configured_idle_bundle_load_clears_global_and_per_gpu_eviction_latches(
+    monkeypatch,
+):
+    module = _load_controller()
+
+    class FakeVram:
+        _llm_evicted = True
+        _gpu_evicted = {"mi50": True, "rx6950xt": True}
+
+        def mark_llm_evicted(self, value, *, source):
+            assert source == "_load_bundle:configured_idle"
+            self._llm_evicted = value
+
+    fake_vram = FakeVram()
+    monkeypatch.setattr(module, "vram", fake_vram, raising=False)
+    config = {
+        "scheduling": {
+            "idle_services": {
+                "mi50": "Gemma-MI50",
+                "rx6950xt": "Gemma-RX6950XT",
+            }
+        }
+    }
+    bundle = {
+        "bundle_name": "Gemma-MI50-idle",
+        "gpu_id": "mi50",
+        "services": ["Gemma-MI50"],
+    }
+
+    reconciled = module._reconcile_loaded_configured_idle_bundle(bundle, config)
+
+    assert reconciled is True
+    assert fake_vram._llm_evicted is False
+    assert fake_vram._gpu_evicted == {"rx6950xt": True}
+
+
+def test_non_idle_bundle_load_preserves_eviction_latches(monkeypatch):
+    module = _load_controller()
+
+    class FakeVram:
+        _llm_evicted = True
+        _gpu_evicted = {"mi50": True}
+
+        def mark_llm_evicted(self, *_args, **_kwargs):
+            raise AssertionError("non-idle bundle must not clear eviction state")
+
+    fake_vram = FakeVram()
+    monkeypatch.setattr(module, "vram", fake_vram, raising=False)
+    config = {"scheduling": {"idle_services": {"mi50": "Gemma-MI50"}}}
+    bundle = {
+        "bundle_name": "qwen-edit",
+        "gpu_id": "mi50",
+        "services": ["qwen-edit-service"],
+    }
+
+    reconciled = module._reconcile_loaded_configured_idle_bundle(bundle, config)
+
+    assert reconciled is False
+    assert fake_vram._llm_evicted is True
+    assert fake_vram._gpu_evicted == {"mi50": True}

@@ -394,8 +394,8 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "71646350d2b8ed624228f80e12b343d8719cb4a2d1690a8305850090aae73277",
-      "size": 1908171
+      "sha256": "4cd001b9559c1f2b7b45c6bad5e79627dfa7bb40a755fdeb578546e7fe5519b5",
+      "size": 1909225
     },
     {
       "disposition": "core",
@@ -712,8 +712,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_reaper_state_and_probe.py",
-      "sha256": "da4b4ff022e26223b41c4fbe6edb1f0efc261f31c2b5ce23ec5e41672893d8a1",
-      "size": 11679
+      "sha256": "0910f04ca771e0999df68f1b1909cd45f5659528800b870a8bba2fc3d71b6ff6",
+      "size": 13516
     },
     {
       "disposition": "core",
