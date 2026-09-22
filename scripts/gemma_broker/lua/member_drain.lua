@@ -72,7 +72,9 @@ if mode == 'release' or mode == 'release_v2' then
     local configured = tonumber(ARGV[11]) or 0
     local backend_busy = tonumber(ARGV[12]) or 0
     if configured > 0 then
-      free = math.max(0, math.min(configured, configured - backend_busy - live_leases))
+      local backend_free = math.max(0, configured - backend_busy)
+      local dispatcher_free = math.max(0, configured - live_leases)
+      free = math.min(configured, backend_free, dispatcher_free)
     end
   end
   local record = cjson.decode(ARGV[6])

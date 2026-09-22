@@ -286,8 +286,8 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/lua/member_drain.lua",
-      "sha256": "9b0e8b557f778e720284c65534b7542fc3f402339808e5e869b8c1773890f306",
-      "size": 3836
+      "sha256": "44e28e97251704dedbb502ea854cd05095ca86f32f4b52a7270123cfd33f788a",
+      "size": 3947
     },
     {
       "disposition": "core",
@@ -658,8 +658,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_broker_portability.py",
-      "sha256": "bbf69e16474b9382a5344df09fd8766137e74fcf87dbc47c713a38a2dbe942ef",
-      "size": 5928
+      "sha256": "ba0a20695e2bb4e1f3e6adb059b8d2971129ea111716ac97acd1aa56a9293776",
+      "size": 6712
     },
     {
       "disposition": "core",
