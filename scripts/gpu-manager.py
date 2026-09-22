@@ -24470,6 +24470,37 @@ async def _rejoin_combined_gemma_member_after_start(
                     f"Combined Gemma member not found: {service_name}"
                 )
             state = getattr(getattr(current, "state", None), "value", None)
+            if state == "unhealthy":
+                if broker is None or not hasattr(broker, "drain_member"):
+                    raise RuntimeError(
+                        "Embedded Combined Gemma member drain unavailable for "
+                        f"{service_name}"
+                    )
+                drained = await broker.drain_member(
+                    service_name,
+                    expected_state_version=int(current.state_version),
+                    timeout=timeout,
+                    retry_stale=True,
+                )
+                if (
+                    getattr(drained, "drained", False) is not True
+                    or int(getattr(drained, "lease_count", -1)) != 0
+                ):
+                    raise RuntimeError(
+                        f"Combined Gemma member {service_name} did not drain cleanly"
+                    )
+                current = repository.get_member(service_name)
+                state = getattr(getattr(current, "state", None), "value", None)
+                if current is None or state != "offline":
+                    raise RuntimeError(
+                        f"Combined Gemma member {service_name} did not enter offline"
+                    )
+                expected_state_version = int(current.state_version)
+                logger.info(
+                    "Embedded Combined Gemma member normalized from unhealthy "
+                    "to offline before rejoin: %s",
+                    service_name,
+                )
             if state == "ready_accepting" and current.accepting is True:
                 return True
             if state == "offline":
