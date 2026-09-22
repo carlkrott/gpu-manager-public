@@ -11893,7 +11893,11 @@ class GPUScheduler:
                 # No other LLM on this GPU (or same LLM crashed) — just start it
                 if self._restoring:
                     return
-                if vram and vram._llm_evicted:
+                # The legacy global restore resolves scheduling.idle_service and
+                # cannot restore a per-GPU idle_services entry when the global
+                # idle service is empty.  Per-GPU recovery already has the exact
+                # idle bundle and must use the fenced bundle transition below.
+                if vram and vram._llm_evicted and not gpu_id:
                     self.logger.info(
                         f"Idle service: restoring {idle_svc_name}{tag} "
                         f"(no GPU work, service not running)"

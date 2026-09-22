@@ -242,3 +242,133 @@ def test_llm_health_uses_registry_idle_service_when_configured():
 
     assert asyncio.run(proxy.check_health()) is True
     assert session.urls == ["http://127.0.0.1:9123/ready"]
+
+
+def test_per_gpu_idle_recovery_bypasses_legacy_global_restore(monkeypatch):
+    module = _load_controller()
+    config = {
+        "services": {
+            "synthetic-idle": {
+                "enabled": True,
+                "gpu_id": "gpu-a",
+                "port": 9123,
+                "systemd_unit": "synthetic-idle.service",
+                "type": "llm_backend",
+            }
+        },
+        "scheduling": {
+            "maintenance_mode": False,
+            "idle_service": "",
+            "idle_services": {"gpu-a": "synthetic-idle"},
+        },
+        "gpu_devices": {"gpu-a": {}},
+    }
+
+    class DownSession:
+        def get(self, *_args, **_kwargs):
+            raise ConnectionError("synthetic idle service is stopped")
+
+    class FakeVram:
+        _llm_evicted = True
+        gpu_state = module.GpuState.GPU_WORK
+
+        async def _wait_for_llm_healthy(self, *, timeout):
+            return True
+
+        def mark_llm_evicted(self, value, *, source):
+            self._llm_evicted = value
+
+    calls: list[tuple[str, str]] = []
+    decisions = iter(
+        (
+            SimpleNamespace(
+                action=module.RecoveryAction.PROBE,
+                next=module.RecoveryState(),
+                reason="probe_required",
+                emit_transition_log=False,
+            ),
+            SimpleNamespace(
+                action=module.RecoveryAction.RESTART,
+                next=module.RecoveryState(),
+                reason="probe_failed",
+                emit_transition_log=False,
+            ),
+        )
+    )
+
+    async def fake_generation_tenant(_gpu_id):
+        return False, ""
+
+    async def fake_transition(_members, operation, *, reason):
+        return await operation()
+
+    async def fake_unload(bundle_name):
+        calls.append(("unload", bundle_name))
+        return True
+
+    async def fake_load(bundle_name, *, timeout):
+        calls.append(("load", bundle_name))
+        return True
+
+    monkeypatch.setattr(module, "_load_services_config", lambda: config)
+    monkeypatch.setattr(
+        module,
+        "_get_all_idle_services",
+        lambda: [
+            {
+                "gpu_id": "gpu-a",
+                "service_name": "synthetic-idle",
+                "port": 9123,
+                "systemd_unit": "synthetic-idle.service",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        module,
+        "_get_idle_bundle",
+        lambda _gpu_id: {
+            "bundle_name": "synthetic-idle-bundle",
+            "idle": True,
+            "services": ["synthetic-idle"],
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_resolve_bundles",
+        lambda: {
+            "synthetic-idle-bundle": {
+                "idle": True,
+                "services": ["synthetic-idle"],
+            }
+        },
+    )
+    monkeypatch.setattr(module, "_restore_after_gpu_work_blockers", lambda: [])
+    monkeypatch.setattr(module, "_gpu_has_active_generation_tenant", fake_generation_tenant)
+    monkeypatch.setattr(module, "_expand_bundle_transition_members", lambda roots, **_kwargs: roots)
+    monkeypatch.setattr(module, "_run_bundle_group_transition", fake_transition)
+    monkeypatch.setattr(module, "_unload_bundle", fake_unload)
+    monkeypatch.setattr(module, "_load_bundle", fake_load)
+    monkeypatch.setattr(module, "reduce_recovery", lambda *_args, **_kwargs: next(decisions))
+    monkeypatch.setattr(module, "bundle_lifecycle_controller", None)
+    monkeypatch.setattr(module, "_gpu_states", {"gpu-a": SimpleNamespace(state="idle")})
+    monkeypatch.setattr(module, "llm", SimpleNamespace(active_requests=0))
+    monkeypatch.setattr(module, "vram", FakeVram())
+
+    scheduler = module.GPUScheduler(DownSession(), module.logger)
+    scheduler._lifecycle_begin = lambda *_args, **_kwargs: None
+    scheduler._lifecycle_step_begin = lambda *_args, **_kwargs: None
+    scheduler._lifecycle_step_done = lambda *_args, **_kwargs: None
+    scheduler._lifecycle_complete = lambda: None
+
+    async def legacy_restore():
+        calls.append(("legacy_restore", ""))
+
+    scheduler._restore_after_gpu_work = legacy_restore
+
+    asyncio.run(scheduler._ensure_idle_service())
+
+    assert ("legacy_restore", "") not in calls
+    assert calls == [
+        ("unload", "synthetic-idle-bundle"),
+        ("load", "synthetic-idle-bundle"),
+    ]
