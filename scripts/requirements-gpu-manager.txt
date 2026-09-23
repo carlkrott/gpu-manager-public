@@ -1,6 +1,6 @@
 # GPUManager runtime additions not provided by the base project environment.
 # HTTP server/client used by the controller and standalone broker.
-aiohttp==3.13.5
+aiohttp==3.14.3
 # Valkey-compatible queue, lease and durable job client.
 redis==8.1.0
 # Required for image-byte validation and bounded local-vision payload resizing.
