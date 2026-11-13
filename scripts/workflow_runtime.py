@@ -2,7 +2,7 @@
 
 This module is deliberately an execution boundary, not an execution engine.
 It pins a workflow/service revision, tracks stage attempts and provider handles,
-and applies only checked state transitions.  Adapters (n8n, OpenDesign,
+and applies only checked state transitions.  Adapters (n8n,
 ComfyUI, audio.cpp, cloud providers, or local QC) remain outside this module.
 The in-memory store is a deterministic fixture for the same records a durable
 store can persist.  ``FileWorkflowStore`` is an explicit single-writer local

@@ -112,7 +112,9 @@ def test_check_public_payload_rejects_absolute_paths_and_private_filenames(tmp_p
 
 
 def test_exact_candidate_payload_is_clean():
-    report = check_public_payload(ROOT)
+    # The candidate payload is the published allowlist, not the private
+    # worktree (rollback/, systemd/, provenance/ snapshots stay private).
+    report = check_public_payload(ROOT, manifest=ROOT / "release/public-files.json")
     assert report["ok"], report["violations"]
     assert report["file_count"] > 0
 

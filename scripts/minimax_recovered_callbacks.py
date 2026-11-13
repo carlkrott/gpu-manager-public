@@ -10,11 +10,17 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlparse
+
+import api_auth
 
 from pipeline_coordinator import PipelineRunState, QCVerdict, _now_iso
 
@@ -33,6 +39,9 @@ _LOCKS = {
     "hermes/music-generate/local_audio_qc.py": "b8d10cdb5838520f0ead0698136edf22e17808b33bd8c5218ba07c3a12f0f6bd",
     "qualification/run_minimax_input.py": "acef78c96df2f4686a5772e0ba0b8201abe9b888d63cec8a9e166d4f3ba89ce1",
 }
+
+_AUTH_SHIM_LOCK = threading.RLock()
+_HTTP_FAILURE_STATE = threading.local()
 
 
 def _sha(path: Path) -> str:
@@ -117,6 +126,150 @@ def build_recovered_minimax_callbacks(config: Mapping[str, Any], **_kwargs):
     # unchanged while enforcing enough response budget for both channels.
     if not getattr(minimax.workflow, "_gpu_manager_token_budget_installed", False):
         original_combined_json = minimax.workflow._combined_json
+        workflow_error_type = minimax.workflow.WorkflowError
+
+        @contextmanager
+        def _one_attempt_http_errors():
+            workflow = minimax.workflow
+            with _AUTH_SHIM_LOCK:
+                original_error_type = workflow.WorkflowError
+
+                # The pinned workflow retries every WorkflowError as a schema repair.
+                # Shim errors retain the original type and bypass that narrower catcher.
+                class _RetryableWorkflowError(original_error_type):
+                    def __new__(cls, *args, **kwargs):
+                        if getattr(_HTTP_FAILURE_STATE, "no_retry", False):
+                            return original_error_type(*args, **kwargs)
+                        return super().__new__(cls, *args, **kwargs)
+
+                workflow.WorkflowError = _RetryableWorkflowError
+                try:
+                    yield
+                finally:
+                    workflow.WorkflowError = original_error_type
+                    _HTTP_FAILURE_STATE.no_retry = False
+
+        @contextmanager
+        def _auth_shim(stage):
+            del stage  # Stable errors intentionally do not expose request data.
+            workflow = minimax.workflow
+            base_url_env = "HERMES_MUSIC_BROKER_BASE_URL"
+            with _AUTH_SHIM_LOCK:
+                env_was_set = base_url_env in os.environ
+                if not env_was_set:
+                    os.environ[base_url_env] = "http://127.0.0.1:8091/v1"
+                try:
+                    token = api_auth.configured_token()
+                    if token is None:
+                        raise workflow_error_type(
+                            "GPU manager API token not configured (set "
+                            "GPU_MANAGER_API_TOKEN_FILE or CREDENTIALS_DIRECTORY "
+                            "with basename gpu-manager-api-token)"
+                        )
+
+                    requests_module = workflow.requests
+                    original_post = requests_module.post
+
+                    def redact_text(value):
+                        text = str(value or "")
+                        if token:
+                            text = text.replace(token, "[redacted]")
+                        text = re.sub(
+                            r"Bearer\s+[A-Za-z0-9._-]+",
+                            "Bearer [redacted]",
+                            text,
+                            flags=re.IGNORECASE,
+                        )
+                        text = re.sub(r"SENTINEL_[A-Za-z0-9_.-]+", "[redacted]", text)
+                        return text
+
+                    def sanitize(value):
+                        text = redact_text(value)
+                        return text[:200] + ("..." if len(text) > 200 else "")
+
+                    def redact_json(value):
+                        if isinstance(value, str):
+                            return redact_text(value)
+                        if isinstance(value, list):
+                            return [redact_json(item) for item in value]
+                        if isinstance(value, dict):
+                            return {
+                                redact_text(key) if isinstance(key, str) else key: redact_json(item)
+                                for key, item in value.items()
+                            }
+                        return value
+
+                    class _SanitizedResponse:
+                        def __init__(self, response):
+                            self._response = response
+
+                        @property
+                        def text(self):
+                            return redact_text(self._response.text)
+
+                        def json(self, *args, **kwargs):
+                            return redact_json(self._response.json(*args, **kwargs))
+
+                        def __getattr__(self, name):
+                            return getattr(self._response, name)
+
+                    def _shimmed_post(*args, **kwargs):
+                        url = args[0] if args else kwargs.get("url", "")
+                        try:
+                            parsed = urlparse(str(url))
+                            is_broker = parsed.hostname == "127.0.0.1" and parsed.port == 8091
+                            safe_origin = parsed.netloc.rsplit("@", 1)[-1]
+                        except (TypeError, ValueError):
+                            is_broker = False
+                            safe_origin = "unknown"
+                        if not is_broker:
+                            # Non-broker destinations are untouched: same args, same
+                            # response object, same exceptions.
+                            return original_post(*args, **kwargs)
+                        safe_origin = sanitize(safe_origin)
+
+                        call_kwargs = dict(kwargs)
+                        headers = dict(call_kwargs.get("headers") or {})
+                        headers = {
+                            key: value for key, value in headers.items()
+                            if str(key).lower() != "authorization"
+                        }
+                        headers["Authorization"] = f"Bearer {token}"
+                        call_kwargs["headers"] = headers
+
+                        try:
+                            response = original_post(*args, **call_kwargs)
+                        except requests_module.RequestException:
+                            raise workflow_error_type(
+                                "http transport failed: host=127.0.0.1:8091 "
+                                f"origin={safe_origin}"
+                            ) from None
+
+                        status = getattr(response, "status_code", 0)
+                        response_headers = getattr(response, "headers", {}) or {}
+                        content_type = response_headers.get(
+                            "Content-Type", response_headers.get("content-type", "")
+                        )
+                        if status >= 400:
+                            _HTTP_FAILURE_STATE.no_retry = True
+                        safe_content_type = sanitize(content_type)
+                        if status >= 500 or "json" not in str(content_type).lower():
+                            body = sanitize(getattr(response, "text", ""))
+                            raise workflow_error_type(
+                                f"http status={status} content-type={safe_content_type} "
+                                f"host=127.0.0.1:8091 body={body}"
+                            )
+                        return _SanitizedResponse(response)
+
+                    requests_module.post = _shimmed_post
+                    try:
+                        yield
+                    finally:
+                        requests_module.post = original_post
+                finally:
+                    _HTTP_FAILURE_STATE.no_retry = False
+                    if not env_was_set:
+                        os.environ.pop(base_url_env, None)
 
         def combined_json_with_output_room(stage, system, payload, max_tokens=3072):
             identity = hashlib.sha256(json.dumps(
@@ -132,9 +285,10 @@ def build_recovered_minimax_callbacks(config: Mapping[str, Any], **_kwargs):
                 validator = validate_expanded_brief if stage == "brief_expand" else validate_query_plan
                 if validator(prior):
                     return prior
-            result = original_combined_json(
-                stage, system, payload, max_tokens=max(int(max_tokens), 8192)
-            )
+            with _auth_shim(stage=stage):
+                result = original_combined_json(
+                    stage, system, payload, max_tokens=max(int(max_tokens), 8192)
+                )
             # Preserve the actual structured response so a rejected schema can
             # be repaired from evidence without another blind generation run.
             minimax.workflow._atomic_json(
@@ -150,12 +304,18 @@ def build_recovered_minimax_callbacks(config: Mapping[str, Any], **_kwargs):
         values = _inputs(stage)
         brief = str(values.get("brief") or state.request_params.get("brief") or "")
         duration = values.get("duration_seconds") or state.request_params.get("duration_seconds") or 60
-        return _completed({"expanded_brief": minimax.workflow._expand_brief(brief, duration, target="minimax")})
+        with _one_attempt_http_errors():
+            expanded = minimax.workflow._expand_brief(brief, duration, target="minimax")
+        return _completed({"expanded_brief": expanded})
 
     def plan(stage, state, _key):
         values = _inputs(stage)
         brief = str(values.get("brief") or state.request_params.get("brief") or "")
-        return _completed({"query_plan": minimax.workflow._plan_references(brief, dict(values["expanded_brief"]), target="minimax")})
+        with _one_attempt_http_errors():
+            query_plan = minimax.workflow._plan_references(
+                brief, dict(values["expanded_brief"]), target="minimax"
+            )
+        return _completed({"query_plan": query_plan})
 
     def resolve(stage, state, _key):
         values = _inputs(stage)
@@ -192,11 +352,12 @@ def build_recovered_minimax_callbacks(config: Mapping[str, Any], **_kwargs):
         # resolver emits it; otherwise use the completed planning output.
         attempts = state.stage_attempts.get("plan-research") or []
         plan_value = (attempts[-1].output or {}).get("query_plan", {}) if attempts else {}
-        result = minimax._finalize_minimax_brief(
-            brief, dict(values["expanded_brief"]), dict(plan_value),
-            dict(values["validated_research"]), duration,
-            values.get("lyrics") if values.get("lyrics") is not None else state.request_params.get("lyrics"),
-        )
+        with _one_attempt_http_errors():
+            result = minimax._finalize_minimax_brief(
+                brief, dict(values["expanded_brief"]), dict(plan_value),
+                dict(values["validated_research"]), duration,
+                values.get("lyrics") if values.get("lyrics") is not None else state.request_params.get("lyrics"),
+            )
         native = {"original_prompt": brief, "caption": result["caption"], "lyrics": result["lyrics"]}
         return _completed({"native_brief": native, "caption": result["caption"], "lyrics": result["lyrics"]})
 

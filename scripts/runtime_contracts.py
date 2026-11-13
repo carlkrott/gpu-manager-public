@@ -115,6 +115,14 @@ def validate_model_set(name: str, model_set: Mapping[str, Any]) -> list[str]:
                 errors.append(
                     f"{prefix}.{field} may not be unresolved in a qualified model set"
                 )
+        if "compute_api" in component:
+            api_val = component.get("compute_api")
+            if not isinstance(api_val, str) or not api_val.strip():
+                errors.append(f"{prefix}.compute_api must be a non-empty string")
+        if "precision_constraints" in component:
+            pc = component.get("precision_constraints")
+            if not isinstance(pc, list) or not all(isinstance(x, str) and x.strip() for x in pc):
+                errors.append(f"{prefix}.precision_constraints must be a list of non-empty strings")
         if isinstance(component.get("role"), str) and component["role"].strip():
             component_roles.add(component["role"])
         if isinstance(component.get("device"), str) and component["device"].strip():
@@ -129,7 +137,39 @@ def validate_model_set(name: str, model_set: Mapping[str, Any]) -> list[str]:
         if status == "qualified" and digest is None:
             errors.append(f"{prefix}.sha256 is required for a qualified model set")
 
+    # Optional model-set level precision constraints and compute_apis
+    if "precision_constraints" in model_set:
+        pc_set = model_set.get("precision_constraints")
+        if not isinstance(pc_set, list) or not all(isinstance(x, str) and x.strip() for x in pc_set):
+            errors.append("precision_constraints must be a list of non-empty strings")
+    if "compute_apis" in model_set:
+        ca_set = model_set.get("compute_apis")
+        if not isinstance(ca_set, list) or not all(isinstance(x, str) and x.strip() for x in ca_set):
+            errors.append("compute_apis must be a list of non-empty strings")
+
     budgets = model_set.get("memory_budget_mib")
+    # Also support minimum/reserved VRAM specifications
+    if "memory_minimum_mib" in model_set:
+        min_budgets = model_set.get("memory_minimum_mib")
+        if not isinstance(min_budgets, Mapping):
+            errors.append("memory_minimum_mib must be an object")
+        else:
+            for device, amount in min_budgets.items():
+                if not isinstance(device, str) or not device.strip():
+                    errors.append("memory_minimum_mib keys must be non-empty strings")
+                elif amount is not None and (isinstance(amount, bool) or not isinstance(amount, int) or amount < 0):
+                    errors.append(f"memory_minimum_mib.{device} must be a non-negative integer or null")
+    if "memory_reserved_mib" in model_set:
+        res_budgets = model_set.get("memory_reserved_mib")
+        if not isinstance(res_budgets, Mapping):
+            errors.append("memory_reserved_mib must be an object")
+        else:
+            for device, amount in res_budgets.items():
+                if not isinstance(device, str) or not device.strip():
+                    errors.append("memory_reserved_mib keys must be non-empty strings")
+                elif amount is not None and (isinstance(amount, bool) or not isinstance(amount, int) or amount < 0):
+                    errors.append(f"memory_reserved_mib.{device} must be a non-negative integer or null")
+
     if not isinstance(budgets, Mapping):
         errors.append("memory_budget_mib must be an object")
     else:
@@ -158,7 +198,7 @@ def validate_model_set(name: str, model_set: Mapping[str, Any]) -> list[str]:
     if not isinstance(compatibility, Mapping):
         errors.append("compatibility must be an object")
     else:
-        for field in ("engines", "requires_roles", "accepts", "produces"):
+        for field in ("engines", "requires_roles", "accepts", "produces", "compute_apis", "precision_constraints"):
             if field in compatibility and not _string_list(compatibility[field]):
                 errors.append(f"compatibility.{field} must be a list of non-empty strings")
         required_roles = compatibility.get("requires_roles")
@@ -199,6 +239,12 @@ def model_set_summary(name: str, model_set: Mapping[str, Any]) -> dict[str, Any]
         ),
         "memory_budget_mib": dict(model_set.get("memory_budget_mib", {}))
         if isinstance(model_set, Mapping) and isinstance(model_set.get("memory_budget_mib"), Mapping)
+        else {},
+        "memory_minimum_mib": dict(model_set.get("memory_minimum_mib", {}))
+        if isinstance(model_set, Mapping) and isinstance(model_set.get("memory_minimum_mib"), Mapping)
+        else {},
+        "memory_reserved_mib": dict(model_set.get("memory_reserved_mib", {}))
+        if isinstance(model_set, Mapping) and isinstance(model_set.get("memory_reserved_mib"), Mapping)
         else {},
         "fingerprint": model_set_fingerprint(model_set),
         "validation_errors": validate_model_set(name, model_set),
@@ -252,6 +298,22 @@ def validate_runtime_profile(name: str, profile: Mapping[str, Any]) -> list[str]
         profile["resource_requirements"], Mapping
     ):
         errors.append("resource_requirements must be an object")
+    elif isinstance(profile.get("resource_requirements"), Mapping):
+        rr = profile["resource_requirements"]
+        if "compute_api" in rr and not (isinstance(rr["compute_api"], str) and rr["compute_api"].strip()):
+            errors.append("resource_requirements.compute_api must be a non-empty string")
+        if "compute_apis" in rr and not _string_list(rr["compute_apis"]):
+            errors.append("resource_requirements.compute_apis must be a list of non-empty strings")
+        if "precision_constraints" in rr and not _string_list(rr["precision_constraints"]):
+            errors.append("resource_requirements.precision_constraints must be a list of non-empty strings")
+        if "memory_minimum_mib" in rr and not (
+            isinstance(rr["memory_minimum_mib"], int) and not isinstance(rr["memory_minimum_mib"], bool) and rr["memory_minimum_mib"] >= 0
+        ):
+            errors.append("resource_requirements.memory_minimum_mib must be a non-negative integer")
+        if "memory_reserved_mib" in rr and not (
+            isinstance(rr["memory_reserved_mib"], int) and not isinstance(rr["memory_reserved_mib"], bool) and rr["memory_reserved_mib"] >= 0
+        ):
+            errors.append("resource_requirements.memory_reserved_mib must be a non-negative integer")
     if "identity_fields" in profile and not _string_list(profile["identity_fields"]):
         errors.append("identity_fields must be a list of non-empty strings")
     for field in _DISALLOWED_FIELDS:

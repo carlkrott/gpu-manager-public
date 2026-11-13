@@ -12,6 +12,9 @@ from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
 from api_auth import (
+    HONCHO_GEMMA_TOKEN_FILE_ENV,
+    KDA_GEMMA_SCOPED_GATE_APP_KEY,
+    honcho_gemma_request_is_authorized,
     api_auth_middleware,
     bearer_matches,
     is_loopback_peer,
@@ -68,6 +71,180 @@ async def _request(app, method: str, path: str, headers: dict[str, str] | None =
     async with TestClient(TestServer(app)) as client:
         response = await client.request(method, path, headers=headers or {})
         return response.status, await response.text(), dict(response.headers)
+
+
+async def _request_json(app, method: str, path: str, payload: dict,
+                        headers: dict[str, str] | None = None):
+    async with TestClient(TestServer(app)) as client:
+        response = await client.request(method, path, headers=headers or {},
+                                        data=json.dumps(payload))
+        return response.status, await response.text(), dict(response.headers)
+
+
+def _scoped_request(method, path, token, *, query="", raw_path=None, backend=None, body=None,
+                    remote="127.0.0.1"):
+    headers = {"Authorization": f"Bearer {token}"}
+    if backend is not None:
+        headers["X-Backend"] = backend
+    return SimpleNamespace(
+        app={KDA_GEMMA_SCOPED_GATE_APP_KEY: lambda: True},
+        method=method, path=path, query_string=query,
+        raw_path=raw_path if raw_path is not None else path + ("?" + query if query else ""),
+        headers=headers, remote=remote, _read_bytes=body,
+    )
+
+
+def _secure_scoped_token(path: Path, value: str) -> Path:
+    path.write_text(value, encoding="ascii")
+    path.chmod(0o600)
+    return path
+
+
+def test_honcho_scope_has_distinct_safe_credential_and_requires_loopback(monkeypatch, tmp_path):
+    admin = _secure_scoped_token(tmp_path / "admin", "admin-synthetic")
+    kda = _secure_scoped_token(tmp_path / "kda", "kda-synthetic")
+    honcho = _secure_scoped_token(tmp_path / "honcho", "honcho-synthetic")
+    monkeypatch.setenv("GPU_MANAGER_API_TOKEN_FILE", str(admin))
+    monkeypatch.setenv("GPU_MANAGER_KDA_GEMMA_TOKEN_FILE", str(kda))
+    monkeypatch.setenv(HONCHO_GEMMA_TOKEN_FILE_ENV, str(honcho))
+    req = _scoped_request("GET", "/v1/metrics/broker", "honcho-synthetic")
+    assert honcho_gemma_request_is_authorized(req)
+    assert not honcho_gemma_request_is_authorized(
+        _scoped_request("GET", "/v1/metrics/broker", "kda-synthetic")
+    )
+    assert not honcho_gemma_request_is_authorized(
+        _scoped_request("GET", "/v1/metrics/broker", "honcho-synthetic", remote="192.0.2.2")
+    )
+    honcho.write_text("admin-synthetic", encoding="ascii")
+    assert not honcho_gemma_request_is_authorized(req)
+    honcho.write_text("honcho-synthetic", encoding="ascii")
+    kda.write_text("honcho-synthetic", encoding="ascii")
+    assert not honcho_gemma_request_is_authorized(req)
+
+
+@pytest.mark.parametrize("method,path,query,backend,body,allowed", [
+    ("GET", "/health", "", None, None, True),
+    ("GET", "/v1/models", "", None, None, True),
+    ("GET", "/v1/metrics/broker", "durable=0", None, None, True),
+    ("GET", "/v1/metrics/broker", "durable=1", None, None, False),
+    ("GET", "/v1/metrics/broker", "durable=0&durable=0", None, None, False),
+    ("POST", "/v1/chat/completions", "", None, b'{"model":"GeMmA"}', True),
+    ("POST", "/v1/chat/completions", "", "Gemma-CPU", b'{"model":"gemma"}', False),
+    ("POST", "/v1/chat/completions", "", None, b'{"model":"gemma-4-e4b"}', False),
+    ("POST", "/v1/chat/completions", "", None, b'{', False),
+    ("DELETE", "/v1/metrics/broker", "", None, None, False),
+    ("GET", "/v1/private", "", None, None, False),
+])
+def test_honcho_scope_method_path_query_pin_and_model_matrix(
+    monkeypatch, tmp_path, method, path, query, backend, body, allowed
+):
+    token_path = _secure_scoped_token(tmp_path / "honcho", "honcho-synthetic")
+    monkeypatch.setenv(HONCHO_GEMMA_TOKEN_FILE_ENV, str(token_path))
+    monkeypatch.delenv("GPU_MANAGER_API_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("GPU_MANAGER_KDA_GEMMA_TOKEN_FILE", raising=False)
+    request = _scoped_request(method, path, "honcho-synthetic", query=query,
+                              backend=backend, body=body)
+    assert honcho_gemma_request_is_authorized(request, body) is allowed
+
+
+def test_honcho_metrics_pass_and_kda_metrics_are_forbidden(monkeypatch, tmp_path):
+    admin = _secure_scoped_token(tmp_path / "admin", "admin-synthetic")
+    kda = _secure_scoped_token(tmp_path / "kda", "kda-synthetic")
+    honcho = _secure_scoped_token(tmp_path / "honcho", "honcho-synthetic")
+    monkeypatch.setenv("GPU_MANAGER_API_TOKEN_FILE", str(admin))
+    monkeypatch.setenv("GPU_MANAGER_KDA_GEMMA_TOKEN_FILE", str(kda))
+    monkeypatch.setenv(HONCHO_GEMMA_TOKEN_FILE_ENV, str(honcho))
+    monkeypatch.delenv("GPU_MANAGER_ALLOW_UNAUTHENTICATED_LOOPBACK", raising=False)
+    app = web.Application(middlewares=[api_auth_middleware])
+    app[KDA_GEMMA_SCOPED_GATE_APP_KEY] = lambda: True
+    async def metrics(_request):
+        return web.json_response({"ok": True})
+
+    app.router.add_get("/v1/metrics/broker", metrics)
+
+    async def chat(_request):
+        return web.json_response({"served": True})
+
+    app.router.add_post("/v1/chat/completions", chat)
+
+    async def run():
+        status, body, _ = await _request(
+            app, "GET", "/v1/metrics/broker?durable=0",
+            {"Authorization": "Bearer honcho-synthetic"},
+        )
+        assert status == 200 and json.loads(body) == {"ok": True}
+        status, body, _ = await _request(
+            app, "GET", "/v1/metrics/broker?durable=0",
+            {"Authorization": "Bearer kda-synthetic"},
+        )
+        assert status == 403 and json.loads(body)["code"] == "scope_forbidden"
+        status, _, _ = await _request(app, "GET", "/v1/metrics/broker?durable=0")
+        assert status == 401
+        status, _, _ = await _request(
+            app, "GET", "/v1/metrics/broker?durable=0",
+            {"Authorization": "Bearer admin-synthetic"},
+        )
+        assert status == 200
+        status, body, _ = await _request_json(
+            app, "POST", "/v1/chat/completions", {"model": "gemma"},
+            {"Authorization": "Bearer honcho-synthetic"},
+        )
+        assert status == 200 and json.loads(body) == {"served": True}
+        status, _, _ = await _request_json(
+            app, "POST", "/v1/chat/completions", {"model": "gemma-4-e4b"},
+            {"Authorization": "Bearer honcho-synthetic"},
+        )
+        assert status == 401
+        status, _, _ = await _request_json(
+            app, "POST", "/v1/chat/completions", {"model": "gemma"},
+            {"Authorization": "Bearer honcho-synthetic", "X-Backend": "Gemma-CPU"},
+        )
+        assert status == 401
+
+    asyncio.run(run())
+
+
+def test_chat_body_reaches_the_handler_for_every_principal(monkeypatch, tmp_path):
+    """Admission may read the body, but it must never consume it from the handler.
+
+    Honcho chat admission reads the request body to check ``model``. aiohttp's
+    ``read()`` drains the payload and leaves ``can_read_body`` False, so a
+    middleware that read it for every Bearer caller silently stripped the body
+    from the admin and KDA handlers too (every proxied chat arrived with
+    body=None). Each principal must receive exactly what it sent.
+    """
+    admin = _secure_scoped_token(tmp_path / "admin", "admin-synthetic")
+    kda = _secure_scoped_token(tmp_path / "kda", "kda-synthetic")
+    honcho = _secure_scoped_token(tmp_path / "honcho", "honcho-synthetic")
+    monkeypatch.setenv("GPU_MANAGER_API_TOKEN_FILE", str(admin))
+    monkeypatch.setenv("GPU_MANAGER_KDA_GEMMA_TOKEN_FILE", str(kda))
+    monkeypatch.setenv(HONCHO_GEMMA_TOKEN_FILE_ENV, str(honcho))
+    monkeypatch.delenv("GPU_MANAGER_ALLOW_UNAUTHENTICATED_LOOPBACK", raising=False)
+    seen: dict[str, bytes | None] = {}
+
+    app = web.Application(middlewares=[api_auth_middleware])
+    app[KDA_GEMMA_SCOPED_GATE_APP_KEY] = lambda: True
+
+    async def chat(request):
+        body = await request.read() if request.can_read_body else None
+        seen["body"] = body
+        seen["content_length"] = request.headers.get("Content-Length")
+        return web.json_response({"served": True})
+
+    app.router.add_post("/v1/chat/completions", chat)
+
+    async def run():
+        for token in ("admin-synthetic", "honcho-synthetic"):
+            status, _, _ = await _request_json(
+                app, "POST", "/v1/chat/completions",
+                {"model": "gemma", "messages": [{"role": "user", "content": "hi"}]},
+                {"Authorization": f"Bearer {token}"},
+            )
+            assert status == 200, (token, status)
+            assert seen["body"] is not None, f"{token}: body was consumed by auth"
+            assert json.loads(seen["body"])["model"] == "gemma", token
+
+    asyncio.run(run())
 
 
 def test_missing_token_rejects_loopback_and_sensitive_reads(monkeypatch, tmp_path):

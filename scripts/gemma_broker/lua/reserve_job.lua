@@ -36,9 +36,10 @@ end
 if redis.call('HGET', KEYS[1], 'state_version') ~= ARGV[10] then
   return {err='JOB_STATE_VERSION_STALE'}
 end
-local head = redis.call('ZRANGE', KEYS[2], 0, 0)
-if #head ~= 1 or head[1] ~= ARGV[1] then
-  return {err='QUEUE_HEAD_STALE'}
+-- Membership, not head-ness: a windowed job behind a full pinned head is
+-- still reservable. ZREM below remains the claim's atomic exclusion.
+if redis.call('ZSCORE', KEYS[2], ARGV[1]) == false then
+  return {err='QUEUE_MEMBERSHIP_STALE'}
 end
 if redis.call('EXISTS', KEYS[6]) == 1 then
   return {err='ATTEMPT_EXISTS'}

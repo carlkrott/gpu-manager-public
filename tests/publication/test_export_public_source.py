@@ -221,3 +221,35 @@ def test_checker_rejects_receipt_listed_symlink_before_hashing(tmp_path):
         and item["path"] == "scripts/example.py"
         for item in report["violations"]
     ), report
+
+
+def test_every_tracked_config_referenced_workflow_is_allowlisted():
+    # Workflows referenced by config that are tracked in this repo must ship in
+    # the release. Untracked references (ernie, qwen3-tts, minimax-music3, ...)
+    # resolve from external trees and are deliberately not asserted here.
+    import re
+    import subprocess
+
+    if not (ROOT / "config").is_dir():
+        pytest.skip("installation config/ is not part of the public export")
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files", "workflows/"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+    )
+    referenced = set()
+    for config_file in (ROOT / "config").rglob("*.json"):
+        referenced.update(
+            re.findall(r'"(workflows/[^"]+)"', config_file.read_text(encoding="utf-8"))
+        )
+    expected = sorted(tracked & referenced)
+    assert expected, "no tracked workflow is referenced by config; check the derivation"
+
+    manifest = json.loads((ROOT / "release/public-files.json").read_text(encoding="utf-8"))
+    allowlisted = {item["path"] for item in manifest["files"]}
+    missing = [path for path in expected if path not in allowlisted]
+    assert not missing, f"tracked config-referenced workflows missing from release allowlist: {missing}"

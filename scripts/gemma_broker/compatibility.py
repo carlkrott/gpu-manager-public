@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from typing import Any, Callable
 
 from .contracts import MemberSnapshot, ReasonCode
@@ -16,6 +17,9 @@ class RequestRequirements:
     max_output_tokens: int
     required_capabilities: tuple[str, ...]
     estimate_source: str
+    # Restricts eligibility to one member; the job still shares the queue,
+    # priority order and slot accounting with unpinned work.
+    pinned_member: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,10 +48,59 @@ def normalize_chat_request(body: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _utf8_upper_bound(body: dict[str, Any]) -> int:
+# Context allowance for one image part. Image bytes are not text tokens: a
+# base64 data URL would otherwise count as hundreds of thousands of "tokens"
+# and make every image job incompatible with the GPU members.
+IMAGE_TOKEN_ALLOWANCE = 1536
+# shortcut: conservative lower bound on tokens-per-byte for mixed text (real
+# ASCII is ~4 bytes/token); upgrade to the per-member tokenizer (estimate_source
+# "tokenizer") once every routing member advertises one.
+BYTES_PER_TOKEN_ESTIMATE = 3
+VISION_CAPABILITY = "vision"
+_IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
+
+
+def _is_image_part(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    if part.get("type") in _IMAGE_PART_TYPES:
+        return True
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    return isinstance(url, str) and url.startswith("data:image/")
+
+
+def _content_parts(body: dict[str, Any]):
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            yield from content
+
+
+def request_has_image(body: dict[str, Any]) -> bool:
+    """True when any chat message carries an image part (URL or data URL)."""
+    return any(_is_image_part(part) for part in _content_parts(body))
+
+
+def _text_token_estimate(body: dict[str, Any]) -> int:
     messages = body.get("messages", [])
+    images = 0
+    if isinstance(messages, list):
+        stripped = []
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                kept = [part for part in content if not _is_image_part(part)]
+                images += len(content) - len(kept)
+                message = {**message, "content": kept}
+            stripped.append(message)
+        messages = stripped
     encoded = json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return len(encoded)
+    return math.ceil(len(encoded) / BYTES_PER_TOKEN_ESTIMATE) + images * IMAGE_TOKEN_ALLOWANCE
 
 
 def build_requirements(
@@ -68,13 +121,18 @@ def build_requirements(
             estimate = max(0, int(counted))
             source = "tokenizer"
     if estimate is None:
-        estimate = _utf8_upper_bound(body)
-        source = "utf8_upper_bound"
+        estimate = _text_token_estimate(body)
+        source = "text_bytes_token_estimate"
     max_output = body.get("max_completion_tokens", body.get("max_tokens", 0))
+    capabilities = tuple(required_capabilities)
+    # Detected here, not at the callers, so submit-time admission and the
+    # dispatch-time requirements factory always agree (plan 5.1).
+    if VISION_CAPABILITY not in capabilities and request_has_image(body):
+        capabilities += (VISION_CAPABILITY,)
     return RequestRequirements(
         input_tokens_estimate=estimate,
         max_output_tokens=max(0, int(max_output or 0)),
-        required_capabilities=tuple(required_capabilities),
+        required_capabilities=capabilities,
         estimate_source=source,
     )
 
@@ -95,6 +153,8 @@ def evaluate(
         reasons.append(ReasonCode.REQUEST_CONTEXT_INCOMPATIBLE)
     if not set(requirements.required_capabilities).issubset(member.capabilities):
         reasons.append(ReasonCode.REQUEST_CAPABILITY_INCOMPATIBLE)
+    if requirements.pinned_member and member.name != requirements.pinned_member:
+        reasons.append(ReasonCode.REQUEST_PINNED_MEMBER_MISMATCH)
     return CompatibilityResult(
         compatible=not reasons,
         required_context=required_context,

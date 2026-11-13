@@ -69,10 +69,18 @@ def reduce_member_readiness(
         block(ReasonCode.MEMBER_SYSTEMD_INACTIVE, "systemd unit or MainPID is inactive")
     semantic_health = bool(probes.get("semantic_health"))
     probe_error = probes.get("probe_error")
+    dispatcher_leases = max(0, int(probes.get("dispatcher_leases", 0) or 0))
+    busy_timeout = (
+        cpu_only
+        and probe_error == "probe_timeout"
+        and dispatcher_leases > 0
+        and not stale
+    )
     if probe_error in {"connection_refused", "connection_error"}:
         block(ReasonCode.MEMBER_PORT_DARK, "port unreachable (connection refused)")
     elif probe_error == "probe_timeout":
-        block(ReasonCode.MEMBER_PROBE_TIMEOUT, "probe timed out")
+        if not busy_timeout:
+            block(ReasonCode.MEMBER_PROBE_TIMEOUT, "probe timed out")
     elif probe_error == "server_disconnected":
         block(ReasonCode.MEMBER_PROBE_DISCONNECTED, "server disconnected")
     elif isinstance(probe_error, str) and probe_error.startswith("http_"):
@@ -94,9 +102,13 @@ def reduce_member_readiness(
 
     backend_total = probes.get("backend_slots_total")
     backend_busy = probes.get("backend_slots_busy")
-    dispatcher_leases = max(0, int(probes.get("dispatcher_leases", 0) or 0))
     free: int | None
-    if stale or backend_total is None or backend_busy is None:
+    if busy_timeout:
+        # A live lease proves work is in flight, but a timed-out probe cannot
+        # prove spare backend capacity. Keep counters unknown and queue safely.
+        free = 0
+        block(ReasonCode.MEMBER_NO_CAPACITY, "no proved immediate slot")
+    elif stale or backend_total is None or backend_busy is None:
         free = None
     else:
         backend_free = max(0, int(backend_total) - int(backend_busy))
@@ -137,7 +149,8 @@ def reduce_member_readiness(
         state=state,
         accepting=accepting,
         configured_slots=configured_slots,
-        context_per_slot=int(config.get("context_per_slot", 0) or 0),
+        # broker_context_limit: admission ceiling below the real n_ctx (slow member).
+        context_per_slot=int(config.get("broker_context_limit") or config.get("context_per_slot", 0) or 0),
         state_version=1,
         observed_at=observed_at,
         generation_fence=(previous.generation_fence if previous is not None else 0),

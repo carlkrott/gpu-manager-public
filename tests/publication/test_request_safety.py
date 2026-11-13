@@ -47,7 +47,7 @@ class _FakeProto:
     def pause_reading(self) -> None:  # pragma: no cover - trivial
         pass
 
-    def resume_reading(self) -> None:  # pragma: no cover - trivial
+    def resume_reading(self, resume_parser: bool = True) -> None:  # pragma: no cover - aiohttp>=3.14 passes resume_parser
         pass
 
 

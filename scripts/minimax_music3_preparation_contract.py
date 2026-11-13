@@ -233,7 +233,9 @@ Research is text-only. Do not request, download, or claim analysis of reference 
 _FINAL_SYSTEM = """Synthesize the original request, strict expanded brief, query plan, and resolved
 source snippets into exactly {caption, lyrics}. Caption must be 150-360 words with these labeled
 sections in this order: Global Metadata, Instrument Direction, Level Plan, Mix, Mastering, Vocal
-Details, Arrangement. Include explicit BPM, key, per-element relative dB values, pre-master
+Details, Arrangement. State the tempo as a labeled "BPM: <number>" and the key as a labeled
+"Key: <tonic and mode>" (for example "Key: G major"); an unlabeled "G major" fails validation.
+Include explicit BPM, key, per-element relative dB values, pre-master
 headroom, LUFS, dBTP, dynamic-range, limiting, tonal-balance, and transient-preservation targets.
 These are conditioning targets, not claims about measured output. Preserve supplied lyrics exactly;
 otherwise emit concise section-tagged lyrics that fit the requested duration, or [Instrumental]."""
@@ -281,6 +283,23 @@ def install_contract(minimax_module: Any) -> dict[str, Any]:
             result.setdefault("errors", []).append(
                 "required research lanes have no accepted evidence: " + ", ".join(missing)
             )
+        elif enable_web and result.get("research_status") == "incomplete":
+            # The pinned resolver demands live evidence for every planned lane. Only the four
+            # required lanes gate the run; an adaptive lane (vocals, arrangement, ...) that found
+            # no live page is recorded, not fatal (canary 3abbef86/d7772b6d, vocal_arrangement).
+            live = {
+                classify_research_lane(item)
+                for item in (result.get("records") or [])
+                if isinstance(item, Mapping) and item.get("evidence_kind") == "live_page_excerpt"
+            }
+            lacking = [str(lane) for lane in (result.get("missing_live_lanes") or [])]
+            adaptive_only = all(
+                classify_research_lane({"component": lane}) not in REQUIRED_RESEARCH_LANES
+                for lane in lacking
+            )
+            if REQUIRED_RESEARCH_LANES <= live and lacking and adaptive_only:
+                result["research_status"] = "success"
+                result["adaptive_lanes_without_live_evidence"] = lacking
         return result
 
     def finalize(

@@ -19,6 +19,7 @@ import socket
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import TypeGuard
 
 import redis
 try:
@@ -31,6 +32,7 @@ from gpu_manager_contracts import (
     demand_counts,
     service_is_publicly_eligible,
 )
+from queue_recovery import RESTART_REQUEUE_MAX
 
 logger = logging.getLogger("queue-engine")
 
@@ -44,6 +46,53 @@ REDIS_CONNECT_TIMEOUT_S = float(os.environ.get("GPU_MANAGER_REDIS_CONNECT_TIMEOU
 REDIS_SOCKET_TIMEOUT_S = float(os.environ.get("GPU_MANAGER_REDIS_SOCKET_TIMEOUT_S", "5"))
 REDIS_HOST = os.environ.get("GPU_MANAGER_REDIS_HOST", "localhost").strip() or "localhost"
 REDIS_PORT = int(os.environ.get("GPU_MANAGER_REDIS_PORT", "6379"))
+
+# HTTP caller credentials must never become durable queue payload data. Keep
+# this boundary limited to credential-bearing headers; backend credential
+# references and other job fields are intentionally left untouched.
+PERSISTED_CREDENTIAL_HEADERS = frozenset({
+    "authorization", "proxy-authorization", "cookie", "x-api-key",
+})
+
+
+def is_header_mapping(value: object) -> TypeGuard[dict]:
+    """Return whether value can safely represent an HTTP header mapping."""
+    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
+
+
+def strip_persisted_credential_headers(headers: dict) -> dict:
+    """Copy headers without inbound credentials that must not be persisted."""
+    if not is_header_mapping(headers):
+        return headers
+    return {
+        key: value for key, value in headers.items()
+        if key.casefold() not in PERSISTED_CREDENTIAL_HEADERS
+    }
+
+
+def _scrub_headers_field(value: object) -> object:
+    """Scrub a mapping or JSON-encoded mapping stored in a headers field."""
+    encoded = isinstance(value, str)
+    parsed = value
+    if encoded:
+        try:
+            parsed = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+    if not is_header_mapping(parsed):
+        return value
+    scrubbed = strip_persisted_credential_headers(parsed)
+    return json.dumps(scrubbed) if encoded else scrubbed
+
+
+def scrub_persisted_credentials(job_data: dict) -> dict:
+    """Return a shallow job copy with only HTTP credentials removed."""
+    if not isinstance(job_data, dict):
+        return job_data
+    scrubbed = dict(job_data)
+    if "headers" in scrubbed:
+        scrubbed["headers"] = _scrub_headers_field(scrubbed["headers"])
+    return scrubbed
 
 
 def _redis_password() -> str | None:
@@ -135,6 +184,63 @@ local dropped_total = tonumber(redis.call('HGET', metrics, service) or '0')
 redis.pcall('XACK', source, group, entry_id)
 redis.call('XDEL', source, entry_id)
 return {dlq_id, tostring(removed), tostring(dropped_total)}
+"""
+
+# Stale-orphan recovery fences the PEL lease and tracker identity/status in
+# the same Redis script that moves the payload and terminalizes the tracker.
+_STALE_ORPHAN_TERMINALIZE_LUA = r"""
+-- stale_orphan_terminalize_v1
+local source, dlq, metrics, tracker, slots = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+local entry_id, group = ARGV[1], ARGV[2]
+local cap, service, min_idle = tonumber(ARGV[3]), ARGV[4], tonumber(ARGV[5])
+local expected_job, now, reason, err = ARGV[6], ARGV[7], ARGV[8], ARGV[9]
+local pending = redis.call('XPENDING', source, group, entry_id, entry_id, 1)
+if #pending ~= 1 or tonumber(pending[1][3]) < min_idle then return {0, 'lease_changed'} end
+if redis.call('TYPE', tracker).ok ~= 'hash' then return {0, 'tracker_missing'} end
+if redis.call('HGET', tracker, 'job_id') ~= expected_job
+   or redis.call('HGET', tracker, 'status') ~= 'in_flight' then
+  return {0, 'tracker_changed'}
+end
+local slot_rows = redis.call('HGETALL', slots)
+for i = 1, #slot_rows, 2 do
+  local ok, data = pcall(cjson.decode, slot_rows[i + 1])
+  if not ok or type(data) ~= 'table' then return {0, 'slot_unreadable'} end
+  if data.status == 'busy' and data.job_id == expected_job then return {0, 'slot_active'} end
+end
+local rows = redis.call('XRANGE', source, entry_id, entry_id, 'COUNT', 1)
+if #rows ~= 1 then return {0, 'entry_missing'} end
+local original, job_id, nack_count = rows[1][2], nil, 1
+local payload = {}
+for i = 1, #original, 2 do
+local key, value = original[i], original[i + 1]
+if key == 'job_id' then job_id = value end
+if key == '_nack_count' then nack_count = (tonumber(value) or 0) + 1 end
+if key ~= '_dead_letter_reason' and key ~= '_dead_letter_ts' and key ~= '_dead_letter_cap' then
+  table.insert(payload, key); table.insert(payload, value)
+end
+end
+if job_id ~= expected_job then return {0, 'entry_identity_changed'} end
+local function set_field(name, value)
+for i = 1, #payload, 2 do
+  if payload[i] == name then payload[i + 1] = value; return end
+end
+table.insert(payload, name); table.insert(payload, value)
+end
+set_field('_nack_count', tostring(nack_count))
+set_field('_dead_letter_cap', tostring(cap))
+set_field('_dead_letter_ts', now)
+set_field('_dead_letter_reason', reason)
+local dlq_type, metrics_type = redis.call('TYPE', dlq).ok, redis.call('TYPE', metrics).ok
+if dlq_type ~= 'none' and dlq_type ~= 'stream' then return redis.error_reply('dlq_not_stream') end
+if metrics_type ~= 'none' and metrics_type ~= 'hash' then return redis.error_reply('metrics_not_hash') end
+redis.call('XADD', dlq, '*', unpack(payload))
+local removed = redis.call('XTRIM', dlq, 'MAXLEN', '=', cap)
+if removed > 0 then redis.call('HINCRBY', metrics, service, removed) end
+redis.call('XACK', source, group, entry_id)
+redis.call('XDEL', source, entry_id)
+redis.call('HSET', tracker, 'status', 'failed', 'error_code', reason, 'error', err, 'completed_at', now)
+redis.call('EXPIRE', tracker, 2592000)
+return {1, tostring(removed), tostring(redis.call('HGET', metrics, service) or '0')}
 """
 
 # Audit-before-delete in one Redis script. Redis executes scripts atomically;
@@ -277,6 +383,14 @@ def _legacy_stream_name(service_name: str, routing_group: str | None) -> str:
 
 def _entry_handle(lane: str, entry_id: str) -> str:
     return f"{_ENTRY_HANDLE_PREFIX}{lane}:{entry_id}"
+
+
+def _stream_id_tuple(entry_id: str) -> tuple[int, int]:
+    """Order Redis stream IDs (``ms-seq``); raises ValueError on a bad ID."""
+    if isinstance(entry_id, bytes):
+        entry_id = entry_id.decode("utf-8", errors="replace")
+    ms, _, seq = str(entry_id).partition("-")
+    return int(ms), int(seq or 0)
 
 
 def _parse_entry_handle(
@@ -496,6 +610,7 @@ class RedisQueue:
         Add a job to the stream.  Returns the stream entry-id (used as
         the handle for ack / nack), or None on error.
         """
+        job_data = scrub_persisted_credentials(job_data)
         try:
             self._ensure_group(service_name, routing_group=routing_group)
             convention = job_data.get("priority_convention")
@@ -1296,6 +1411,67 @@ class RedisQueue:
                 raise RuntimeError(f"queue depth unavailable: {reason}{suffix}")
         return int(observation.get("depth", 0) or 0)
 
+    # Bound on the XRANGE scan used to rank one entry; a deeper backlog reports
+    # the cap instead of an unbounded Redis read on the status path.
+    POSITION_SCAN_CAP = 1000
+
+    def get_entry_position(
+        self,
+        service_name: str,
+        entry_id: str,
+        routing_group: str | None = None,
+    ) -> dict[str, object]:
+        """Return how many undelivered entries are ahead of one queued entry.
+
+        ``ahead`` counts entries in the same stream that are strictly older than
+        this one and not yet delivered to the consumer group (stream order is
+        delivery order). ``known`` is False when it cannot be proven (Redis
+        error, externally owned queue, stream/group missing); ``exact`` is False
+        when priority lanes can reorder delivery across streams, or when the
+        scan hit ``POSITION_SCAN_CAP``.
+        """
+        authority = routing_group or service_name
+        if authority in self.externally_owned_routing_groups:
+            return {"ahead": None, "known": False, "exact": False,
+                    "reason": "external_queue_authority"}
+        try:
+            stream, raw_entry_id, lane = self.resolve_entry_stream(
+                service_name, entry_id, routing_group=routing_group
+            )
+        except ValueError:
+            return {"ahead": None, "known": False, "exact": False,
+                    "reason": "invalid_entry_id"}
+        try:
+            last_delivered = "0-0"
+            for item in self.r.xinfo_groups(stream):
+                if item.get("name") == self.GROUP:
+                    last_delivered = str(item.get("last-delivered-id") or "0-0")
+                    break
+            if _stream_id_tuple(raw_entry_id) <= _stream_id_tuple(last_delivered):
+                return {"ahead": 0, "known": True, "exact": True, "reason": "delivered",
+                        "lane": lane}
+            rows = self.r.xrange(
+                stream, min=last_delivered, max=raw_entry_id,
+                count=self.POSITION_SCAN_CAP + 2,
+            )
+            ahead = sum(
+                1 for row_id, _ in rows
+                if _stream_id_tuple(str(row_id)) > _stream_id_tuple(last_delivered)
+                and str(row_id) != str(raw_entry_id)
+            )
+            capped = ahead > self.POSITION_SCAN_CAP
+            return {
+                "ahead": min(ahead, self.POSITION_SCAN_CAP),
+                "known": True,
+                "exact": not capped and not getattr(self, "priority_lanes_enabled", False),
+                "reason": "priority_lanes" if getattr(self, "priority_lanes_enabled", False)
+                          else ("scan_capped" if capped else "stream_order"),
+                "lane": lane,
+            }
+        except (redis.RedisError, TypeError, ValueError):
+            logger.exception("get_entry_position failed %s", service_name)
+            return {"ahead": None, "known": False, "exact": False, "reason": "redis_error"}
+
     def get_oldest_wait_seconds(
         self, service_name: str, routing_group: str | None = None
     ) -> float | None:
@@ -1341,8 +1517,16 @@ class RedisQueue:
                 )
                 for p in pending:
                     raw_id = p.get("message_id")
+                    try:
+                        entry_id_text = (
+                            raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+                        )
+                        entry_created_ms = int(entry_id_text.split("-", 1)[0])
+                    except (TypeError, ValueError):
+                        entry_created_ms = None
                     result.append({
                         "entry_id": _entry_handle(lane, raw_id) if lane else raw_id,
+                        "entry_created_ms": entry_created_ms,
                         "stream": stream,
                         "consumer": p.get("consumer_name"),
                         "idle_ms": p.get("time_since_delivered", 0),
@@ -3059,6 +3243,7 @@ class AsyncRedisQueue:
     async def enqueue(self, service_name: str, job_data: dict,
                         routing_group: str | None = None) -> str | None:
         """Add a job to the stream (async)."""
+        job_data = scrub_persisted_credentials(job_data)
         try:
             await self._ensure_group(service_name, routing_group=routing_group)
             r = await self._get_conn()
@@ -3080,6 +3265,9 @@ class AsyncRedisQueue:
                 contracted.setdefault("enqueued_at", _now_iso())
                 contracted["priority_lane"] = lane
                 handle_lane = lane
+            # This identity survives nack/yield/restart requeues, whose Redis
+            # stream IDs are new delivery IDs rather than submission time.
+            contracted.setdefault("_original_submitted_at_ms", str(int(time.time() * 1000)))
             payload = {
                 k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
                 for k, v in contracted.items()
@@ -3262,7 +3450,11 @@ class AsyncRedisQueue:
             return False
 
     async def nack(self, service_name: str, entry_id: str, max_retries: int = 3,
-                    routing_group: str | None = None) -> bool:
+                    routing_group: str | None = None,
+                    dead_letter_reason: str | None = None,
+                    orphan_tracker_key: str | None = None,
+                    orphan_slot_key: str | None = None,
+                    minimum_idle_ms: int | None = None) -> bool:
         """Re-queue a failed / stuck job (async)."""
         try:
             r = await self._get_conn()
@@ -3285,12 +3477,30 @@ class AsyncRedisQueue:
 
             if nack_count >= max_retries:
                 dlq_stream = _dead_letter_stream(service_name)
+                if dead_letter_reason == "stale_orphan_ttl":
+                    if not orphan_tracker_key or not orphan_slot_key or minimum_idle_ms is None:
+                        return False
+                    result = await r.eval(
+                        _STALE_ORPHAN_TERMINALIZE_LUA,
+                        5, stream, dlq_stream, DEAD_LETTER_METRICS_HASH,
+                        orphan_tracker_key, orphan_slot_key, raw_entry_id, self.GROUP,
+                        EXACT_DEAD_LETTER_CAP, service_name, int(minimum_idle_ms),
+                        str(original_data.get("job_id", original_data.get(b"job_id", ""))),
+                        _now_iso(), dead_letter_reason,
+                        "expired pending submission dead-lettered without replay",
+                    )
+                    if int(result[0]) != 1:
+                        logger.info("stale orphan recovery deferred for %s: %s", entry_id, result[1])
+                        return False
+                    return True
                 payload = {
                     **original_data,
                     "_nack_count": str(nack_count),
                     "_dead_letter_cap": str(EXACT_DEAD_LETTER_CAP),
                     "_dead_letter_ts": _now_iso(),
                 }
+                if dead_letter_reason:
+                    payload["_dead_letter_reason"] = str(dead_letter_reason)
                 result = await r.eval(
                     _DEAD_LETTER_TRANSFER_LUA,
                     3,
@@ -3371,6 +3581,89 @@ class AsyncRedisQueue:
         except Exception:
             logger.exception("async yield_pending failed %s %s", service_name, entry_id)
             return False
+
+    async def requeue_after_restart(
+        self,
+        service_name: str,
+        entry_id: str,
+        routing_group: str | None = None,
+        *,
+        max_requeues: int = RESTART_REQUEUE_MAX,
+    ) -> dict:
+        """Requeue an orphaned pending entry, bounded by ``max_requeues``.
+
+        Same atomic shape as ``yield_pending`` (XACK + XDEL + XADD + trim in
+        one MULTI/EXEC, so the job is never absent from or duplicated in the
+        stream), but the restart requeues are counted in their own
+        ``_restart_requeue_count`` field so ordinary yields never spend a poison
+        job's budget. An entry that has already used ``max_requeues`` moves to
+        the dead-letter stream through the same exact-cap Lua transfer as
+        ``nack`` instead of looping across restarts. Outcomes: ``requeued``,
+        ``dead_lettered``, ``trimmed`` (entry already gone, PEL cleaned) and
+        ``error``.
+        """
+        try:
+            r = await self._get_conn()
+            stream, raw_entry_id, _lane = self.resolve_entry_stream(
+                service_name, entry_id, routing_group=routing_group
+            )
+            entries = await r.xrange(stream, min=raw_entry_id, max=raw_entry_id, count=1)
+            if not entries:
+                pipe = r.pipeline(transaction=True)
+                pipe.xack(stream, self.GROUP, raw_entry_id)
+                await pipe.execute()
+                return {"outcome": "trimmed", "count": 0}
+            _, original_data = entries[0]
+
+            raw_count = original_data.get(
+                "_restart_requeue_count", original_data.get(b"_restart_requeue_count", 0)
+            )
+            if isinstance(raw_count, bytes):
+                raw_count = raw_count.decode()
+            requeue_count = int(raw_count or 0) + 1
+
+            if requeue_count > max_requeues:
+                dlq_stream = _dead_letter_stream(service_name)
+                payload = {
+                    **original_data,
+                    "_restart_requeue_count": str(requeue_count - 1),
+                    "_dead_letter_reason": "restart_requeue_exhausted",
+                    "_dead_letter_cap": str(EXACT_DEAD_LETTER_CAP),
+                    "_dead_letter_ts": _now_iso(),
+                }
+                result = await r.eval(
+                    _DEAD_LETTER_TRANSFER_LUA,
+                    3,
+                    stream,
+                    dlq_stream,
+                    DEAD_LETTER_METRICS_HASH,
+                    raw_entry_id,
+                    self.GROUP,
+                    EXACT_DEAD_LETTER_CAP,
+                    service_name,
+                    *_flatten_stream_payload(payload),
+                )
+                logger.warning(
+                    "async requeue_after_restart: moved %s to dead-letter after %d "
+                    "restart requeues on %s (dropped=%d)",
+                    entry_id, requeue_count - 1, service_name, int(result[1]),
+                )
+                return {"outcome": "dead_lettered", "count": requeue_count - 1}
+
+            pipe = r.pipeline(transaction=True)
+            pipe.xack(stream, self.GROUP, raw_entry_id)
+            pipe.xdel(stream, raw_entry_id)
+            pipe.xadd(stream, {**original_data, "_restart_requeue_count": str(requeue_count)})
+            pipe.xtrim(stream, maxlen=500, approximate=False)
+            results = await pipe.execute()
+            logger.info(
+                "async requeue_after_restart (#%d/%d) %s %s -> %s",
+                requeue_count, max_requeues, service_name, entry_id, results[2],
+            )
+            return {"outcome": "requeued", "count": requeue_count}
+        except Exception:
+            logger.exception("async requeue_after_restart failed %s %s", service_name, entry_id)
+            return {"outcome": "error", "count": 0}
 
     # --- Plan 05 dead-letter mirrors (async surface, semantically aligned) -
 
@@ -3581,8 +3874,20 @@ class AsyncRedisQueue:
                 )
                 for item in pending:
                     raw_id = item.get("message_id")
+                    entry = await r.xrange(stream, min=raw_id, max=raw_id, count=1)
+                    fields = entry[0][1] if entry else {}
+                    def field(name: str):
+                        return fields.get(name, fields.get(name.encode()))
+                    submitted_ms = field("_original_submitted_at_ms")
+                    job_id = field("job_id")
+                    if isinstance(submitted_ms, bytes):
+                        submitted_ms = submitted_ms.decode(errors="replace")
+                    if isinstance(job_id, bytes):
+                        job_id = job_id.decode(errors="replace")
                     result.append({
                         "entry_id": _entry_handle(lane, raw_id) if lane else raw_id,
+                        "entry_created_ms": _safe_int(submitted_ms, default=0) or None,
+                        "job_id": job_id,
                         "stream": stream,
                         "consumer": item.get("consumer_name"),
                         "idle_ms": item.get("time_since_delivered", 0),
@@ -3757,6 +4062,41 @@ class AsyncSlotManager:
             return True
         except Exception:
             logger.exception("async release_slot failed %s/%s", service_name, slot_id)
+            return False
+
+    # Compare-and-release: frees the slot only if it still holds the lease the
+    # caller classified as orphaned. A plain read-then-write release could free
+    # a lease a worker acquired in between.
+    _RELEASE_IF_UNCHANGED_LUA = """
+    -- release_slot_if_unchanged_v1
+    local raw = redis.call('HGET', KEYS[1], ARGV[1])
+    if not raw then return 0 end
+    local data = cjson.decode(raw)
+    if data.status ~= 'busy' or data.job_id ~= ARGV[2] or data.started_at ~= ARGV[3] then
+        return 0
+    end
+    data.status = 'free'
+    data.job_id = ''
+    data.started_at = ''
+    redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(data))
+    return 1
+    """
+
+    async def release_slot_if_unchanged(
+        self, service_name: str, slot_id: int, job_id: str, started_at: str
+    ) -> bool:
+        """Atomically free a busy slot only while it still holds ``job_id``/``started_at``."""
+        try:
+            r = await self._get_conn()
+            released = await r.eval(
+                self._RELEASE_IF_UNCHANGED_LUA, 1, self._key(service_name),
+                str(slot_id), str(job_id or ""), str(started_at or ""),
+            )
+            return int(released) == 1
+        except Exception:
+            logger.exception(
+                "async release_slot_if_unchanged failed %s/%s", service_name, slot_id
+            )
             return False
 
     async def get_slots(self, service_name: str) -> dict:

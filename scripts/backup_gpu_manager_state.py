@@ -59,7 +59,31 @@ def encoded(raw: bytes) -> str:
     return base64.b64encode(raw).decode('ascii')
 
 
+def resolve_registry(release: Path, runtime_state: Path) -> Path:
+    """Return the service registry to snapshot.
+
+    Releases up to r138 shipped ``config/services.json`` inside the release.
+    From r139 the registry lives beside the runtime-state document, outside
+    the release, so a release copy is still preferred when present and the
+    sibling copy is the documented fallback.
+    """
+    in_release = release.resolve() / 'config/services.json'
+    sibling = runtime_state.resolve().parent / 'services.json'
+    if in_release.is_file():
+        return in_release
+    if sibling.is_file():
+        return sibling
+    raise FileNotFoundError(
+        f'gpu-manager service registry not found: release copy {in_release} is missing and '
+        f'r139 sibling copy {sibling} is missing; restore the registry or point '
+        f'--runtime-state at the directory that holds services.json'
+    )
+
+
 def capture(args) -> Path:
+    # Resolved before any Redis work so a misconfigured registry fails fast
+    # instead of after a full capture.
+    registry = resolve_registry(args.release, args.runtime_state)
     root = args.destination.resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     started = time.time()
@@ -72,13 +96,16 @@ def capture(args) -> Path:
         'schema': 'gpu-manager-private-snapshot.v1', 'started_at': started,
         'redis_captured_at': redis_captured, 'patterns': PATTERNS,
         'source_release': str(args.release.resolve()),
+        # Records which registry layout answered, so a snapshot taken through
+        # the r139 fallback is auditable without re-reading the deployment.
+        'registry_source': str(registry),
         'redis': [{'key': encoded(key), 'dump': encoded(raw), 'ttl_ms': ttl}
                   for key, raw, ttl in rows],
         'files': {}, 'restore_mode': 'isolated-inspection-no-workers',
         'off_host': 'not_configured',
     }
     paths = {
-        'registry.json': args.release.resolve() / 'config/services.json',
+        'registry.json': registry,
         'runtime-state.json': args.runtime_state,
         'runtime-host-fences.json': args.host_fences,
     }

@@ -33,11 +33,16 @@ Design seams
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
 import logging
+import os
+import time
 import redis
+
+logger = logging.getLogger(__name__)
 
 # Cache Redis exception types lazily so they work even when redis is mocked
 # in test contexts (conftest replaces sys.modules["redis"]).
@@ -84,6 +89,32 @@ class TerminalCode(str, Enum):
     UNSAFE_RESUME       = "unsafe_resume"
     # No terminal artifact produced
     NO_ARTIFACT         = "no_artifact"
+    # A server-owned workflow graph the stage needs is not shipped/readable.
+    # Retrying cannot fix a missing deploy asset, so this is terminal at once.
+    WORKFLOW_ASSET_MISSING = "workflow_asset_missing"
+
+
+# Consecutive untyped tick failures tolerated for one parent run before the
+# coordinator terminalizes it instead of re-delivering the same claim forever.
+MAX_TICK_FAILURES = 5
+
+
+class TerminalLeafError(Exception):
+    """A leaf admission failure that no retry can repair.
+
+    ``code`` is a stable reason string such as ``workflow_asset_missing``.
+    """
+
+    def __init__(self, code: str, message: str = "") -> None:
+        self.code = str(code)
+        super().__init__(f"{self.code}: {message}" if message else self.code)
+
+
+# Leaf admission reasons that terminalize the parent without stage retries.
+_TERMINAL_LEAF_CODES = {
+    "workflow_asset_missing": "WORKFLOW_ASSET_MISSING",
+    "workflow_asset_invalid": "WORKFLOW_ASSET_MISSING",
+}
 
 
 # ── Stage state machine ───────────────────────────────────────────────────────
@@ -348,6 +379,8 @@ class PipelineRunState:
     last_resumed_at: str | None = None
     resume_count: int = 0
     restoration_evidence: list[RestorationEvidence] = field(default_factory=list)
+    # Consecutive untyped tick failures (reset by any tick that returns).
+    tick_failures: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -391,6 +424,7 @@ class PipelineRunState:
             "last_resumed_at": self.last_resumed_at,
             "resume_count": self.resume_count,
             "restoration_evidence": [e.to_dict() for e in self.restoration_evidence],
+            "tick_failures": self.tick_failures,
         }
 
     @classmethod
@@ -418,6 +452,7 @@ class PipelineRunState:
             updated_at=d.get("updated_at", _now_iso()),
             last_resumed_at=d.get("last_resumed_at"),
             resume_count=d.get("resume_count", 0),
+            tick_failures=int(d.get("tick_failures", 0) or 0),
         )
 
         for cjd in d.get("child_jobs", []):
@@ -572,7 +607,9 @@ class CoordinatorStore(ABC):
     def ack_parent(self, run_id: str) -> bool: ...
 
     @abstractmethod
-    def requeue_parent(self, state: PipelineRunState) -> bool:
+    def requeue_parent(
+        self, state: PipelineRunState, *, ordinary_wait: bool = False
+    ) -> bool:
         """
         Durably replace the currently-claimed message for run_id with a fresh
         entry carrying the updated state, atomically ACK-ing the old message.
@@ -610,6 +647,9 @@ class CoordinatorStore(ABC):
         ----------
         state : PipelineRunState
             The updated nonterminal state to carry in the replacement message.
+        ordinary_wait : bool
+            True when an accepted child is still pending readiness; this
+            replacement must not increment retry counters or invoke backoff.
 
         Returns
         -------
@@ -819,7 +859,9 @@ class InMemoryCoordinatorStore(CoordinatorStore):
         if run_id in self._states:
             self._states[run_id].cancellation_intent = False
 
-    def requeue_parent(self, state: PipelineRunState) -> bool:
+    def requeue_parent(
+        self, state: PipelineRunState, *, ordinary_wait: bool = False
+    ) -> bool:
         """
         Replace the currently-claimed message for run_id with a fresh entry.
 
@@ -861,6 +903,13 @@ class RedisCoordinatorStore(CoordinatorStore):
     GROUP = "coordinator"
     BLOCK_MS = 2000  # Finite block timeout to avoid indefinite blocking
     RECLAIM_MIN_IDLE_MS = 30_000
+    # Conservative retention safety net. Keep recent messages, while XDEL is
+    # the primary removal path. Override with GPU_MANAGER_COORDINATOR_STREAM_MAXLEN.
+    DEFAULT_STREAM_MAXLEN = 10_000
+    STALE_CONSUMER_IDLE_MS = 60 * 60 * 1000
+    DEFAULT_REQUEUE_LIMIT = 25
+    REQUEUE_BACKOFF_BASE_SECONDS = 0.25
+    REQUEUE_BACKOFF_MAX_SECONDS = 5.0
     # One atomic boundary for a new parent.  The state key is the uniqueness
     # fence: a concurrent admission for the same deterministic run_id returns
     # 0 and cannot append a second parent-stream entry.  Hash/event/stream
@@ -897,6 +946,11 @@ return 1
         self._r = r or self._make_conn()
         self._ensure_group()
         self._entry_ids: dict[str, str] = {}  # run_id → Redis stream entry ID
+        self._consecutive_requeues: dict[str, int] = {}
+        self._last_requeue_warning: dict[str, float] = {}
+        # Consumers are unique per controller process. Remove only records that
+        # have been idle for >1 h and own no pending messages.
+        self.cleanup_stale_consumers()
 
     def _make_conn(self):
         import os
@@ -923,6 +977,113 @@ return 1
             self._r.xgroup_create(self.STREAM_KEY, self.GROUP, id="0", mkstream=True)
         except Exception:  # BUSYGROUP
             pass
+
+    def cleanup_stale_consumers(self) -> int:
+        """Delete only >1 h idle consumers with no PEL entries."""
+        removed = 0
+        try:
+            for consumer in self._r.xinfo_consumers(self.STREAM_KEY, self.GROUP) or []:
+                name = consumer.get("name")
+                if isinstance(name, bytes):
+                    name = name.decode()
+                idle_ms = int(consumer.get("idle", 0) or 0)
+                pending = int(consumer.get("pending", 0) or 0)
+                if name and idle_ms > self.STALE_CONSUMER_IDLE_MS and pending == 0:
+                    self._r.xgroup_delconsumer(self.STREAM_KEY, self.GROUP, name)
+                    removed += 1
+        except Exception as exc:
+            # Cleanup is best-effort; it must not prevent the controller starting.
+            logger.warning("coordinator stale-consumer cleanup failed: %s", exc)
+        return removed
+
+    @staticmethod
+    def _stream_id_key(entry_id: str) -> tuple[int, int]:
+        milliseconds, sequence = str(entry_id).split("-", 1)
+        return int(milliseconds), int(sequence)
+
+    def trim_stream(self) -> int:
+        """Approximate MINID retention, bounded by the oldest pending entry.
+
+        The configurable default retains 10,000 recent entries. MINID keeps all
+        entries at/after its boundary; lowering the boundary to the oldest PEL
+        ID prevents trimming any message still pending in the coordinator group.
+        """
+        try:
+            maxlen = max(1, int(os.environ.get(
+                "GPU_MANAGER_COORDINATOR_STREAM_MAXLEN",
+                self.DEFAULT_STREAM_MAXLEN,
+            )))
+            if int(self._r.xlen(self.STREAM_KEY) or 0) <= maxlen:
+                return 0
+            retained = self._r.xrevrange(self.STREAM_KEY, count=maxlen)
+            if not retained:
+                return 0
+            boundary = str(retained[-1][0])
+            pending = self._r.xpending_range(
+                self.STREAM_KEY, self.GROUP, min="-", max="+", count=100_000,
+            ) or []
+            pending_ids = []
+            for item in pending:
+                if isinstance(item, dict):
+                    entry_id = item.get("message_id")
+                elif isinstance(item, (list, tuple)):
+                    entry_id = item[0] if item else None
+                else:
+                    entry_id = getattr(item, "message_id", None)
+                if isinstance(entry_id, bytes):
+                    entry_id = entry_id.decode()
+                if entry_id:
+                    pending_ids.append(str(entry_id))
+            if pending_ids:
+                oldest_pending = min(pending_ids, key=self._stream_id_key)
+                if self._stream_id_key(oldest_pending) < self._stream_id_key(boundary):
+                    boundary = oldest_pending
+            return int(self._r.xtrim(
+                self.STREAM_KEY, minid=boundary, approximate=True,
+            ) or 0)
+        except Exception as exc:
+            logger.warning("coordinator stream trim failed: %s", exc)
+            return 0
+
+    def _requeue_backoff(self, run_id: str) -> None:
+        count = self._consecutive_requeues.get(run_id, 0) + 1
+        self._consecutive_requeues[run_id] = count
+        try:
+            limit = max(1, int(os.environ.get(
+                "GPU_MANAGER_COORDINATOR_REQUEUE_LIMIT",
+                self.DEFAULT_REQUEUE_LIMIT,
+            )))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_REQUEUE_LIMIT
+        if count <= limit:
+            return
+        exponent = min(count - limit - 1, 8)
+        delay = min(
+            self.REQUEUE_BACKOFF_MAX_SECONDS,
+            self.REQUEUE_BACKOFF_BASE_SECONDS * (2 ** exponent),
+        )
+        now = time.monotonic()
+        last_warning = self._last_requeue_warning.get(run_id)
+        if last_warning is None or now - last_warning >= 60.0:
+            self._last_requeue_warning[run_id] = now
+            logger.warning(
+                "coordinator requeue loop run_id=%s consecutive=%d backoff=%.2fs",
+                run_id, count, delay,
+            )
+        else:
+            logger.debug(
+                "coordinator requeue loop run_id=%s consecutive=%d backoff=%.2fs "
+                "(summary suppressed; next warning in %.2fs)",
+                run_id, count, delay, 60.0 - (now - last_warning),
+            )
+        # Most retries are processed by CoordinatorConsumer in a worker thread,
+        # where the bounded blocking delay cannot stall the controller loop.
+        # Cancellation can call this synchronous path directly from an async
+        # controller callback; never block that loop for a backoff interval.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            time.sleep(delay)
 
     def _state_key(self, run_id: str) -> str:
         return f"{self.HASH_PREFIX}{run_id}"
@@ -983,7 +1144,10 @@ return 1
                 self.STREAM_KEY,
                 *args,
             )
-            return int(result or 0) == 1
+            accepted = int(result or 0) == 1
+            if accepted:
+                self.trim_stream()
+            return accepted
         except Exception:
             # Script errors leave no partial write visible; the caller receives
             # a truthful rejection and may reconcile/retry.
@@ -1031,6 +1195,7 @@ return 1
         }
         try:
             self._r.xadd(self.STREAM_KEY, payload)
+            self.trim_stream()
             return True
         except Exception:
             return False
@@ -1089,6 +1254,12 @@ return 1
             entry_id = self._entry_ids.pop(run_id, None)
             if entry_id:
                 self._r.xack(self.STREAM_KEY, self.GROUP, entry_id)
+                # Once XACK returns the message is no longer pending, so XDEL
+                # safely removes the acknowledged payload from stream history.
+                self._r.xdel(self.STREAM_KEY, entry_id)
+            self._consecutive_requeues.pop(run_id, None)
+            self._last_requeue_warning.pop(run_id, None)
+            self.trim_stream()
             return True
         except Exception:
             return False
@@ -1247,7 +1418,9 @@ return 1
             state.cancellation_intent = False
             self.save_state(state)
 
-    def requeue_parent(self, state: PipelineRunState) -> bool:
+    def requeue_parent(
+        self, state: PipelineRunState, *, ordinary_wait: bool = False
+    ) -> bool:
         """
         Durably replace the currently-claimed message for run_id with a fresh entry.
 
@@ -1275,19 +1448,22 @@ return 1
         }
 
         if claimed_entry_id is not None:
-            # Atomic: XADD new entry + XACK old claimed entry
+            if not ordinary_wait:
+                self._requeue_backoff(state.run_id)
+            # Atomic: XADD replacement + XACK + XDEL of the now-acked old entry.
             try:
                 pipe = self._r.pipeline(transaction=True)
                 new_entry_id = pipe.xadd(self.STREAM_KEY, payload)
                 pipe.xack(self.STREAM_KEY, self.GROUP, claimed_entry_id)
+                pipe.xdel(self.STREAM_KEY, claimed_entry_id)
                 results = pipe.execute()
-                # results[0] = new_entry_id, results[1] = xack_count
+                # results[0] = new_entry_id, results[1] = xack_count, results[2] = xdel_count
                 if not results or results[0] is None:
                     return False
-                # Transaction succeeded: **clear** the mapping.
-                # The new XADD entry is unread until XREADGROUP; tracking it
-                # would cause phantom-claim bugs (XACKing an unclaimed entry).
+                # Transaction succeeded: clear the old claim mapping. The fresh
+                # entry is unread until XREADGROUP establishes its next claim.
                 self._entry_ids.pop(state.run_id, None)
+                self.trim_stream()
                 return True
             except Exception:
                 # Transaction failed: preserve old entry_id for recovery
@@ -1307,6 +1483,7 @@ class PipelineCoordinator:
     and terminalization. Delegates external stages and leaf generation to injected
     protocols.
     """
+    TERMINAL_CHILD_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
     def __init__(
         self,
@@ -1623,9 +1800,16 @@ class PipelineCoordinator:
                     "error": f"external_adapter_failed: {str(exc)[:1000]}",
                 }
         elif result is None and authority == "leaf":
-            result = self._execute_leaf(
-                state, execution_stage, current_attempt_num, idem_key,
-            )
+            try:
+                result = self._execute_leaf(
+                    state, execution_stage, current_attempt_num, idem_key,
+                )
+            except TerminalLeafError as exc:
+                result = {
+                    "status": "failed",
+                    "error": str(exc)[:1000],
+                    "terminal_leaf_code": exc.code,
+                }
         elif result is None:
             result = {"status": "failed", "error": f"Unknown authority: {authority}"}
 
@@ -1856,6 +2040,8 @@ class PipelineCoordinator:
                 "status": "failed",
                 "error": poll_result.get("error", "leaf generation failed"),
             }
+        if status == "cancelled":
+            return {"status": "failed", "error": "leaf generation was cancelled"}
         if status in ("queued", "in_flight"):
             return {"status": status}
         return {
@@ -2026,6 +2212,18 @@ class PipelineCoordinator:
     ) -> PipelineRunState:
         """Handle a non-QC stage failure with a bounded retry contract."""
         error_text = str(result.get("error") or "unknown")
+
+        # A typed leaf admission failure (for example a workflow asset that is
+        # not shipped) cannot succeed on retry: end the parent now.
+        terminal_leaf = _TERMINAL_LEAF_CODES.get(
+            str(result.get("terminal_leaf_code") or "")
+        )
+        if terminal_leaf:
+            return self._terminalize(
+                state,
+                TerminalCode[terminal_leaf],
+                f"Stage {failed_stage['id']} failed: {error_text}",
+            )
 
         # A resumed external stage has no durable provider handle.  Repeating
         # it could duplicate a paid or generative request, so this outcome is
@@ -2204,11 +2402,27 @@ class PipelineCoordinator:
         # receipts are historical evidence and must never be rewritten as
         # cancelled during a later parent cancellation request.
         for child_ref in state.child_jobs:
-            if child_ref.cancelled or child_ref.status in {
-                "completed", "failed", "cancelled"
-            }:
+            if child_ref.cancelled or child_ref.status in self.TERMINAL_CHILD_STATUSES:
                 continue
             try:
+                try:
+                    observed = self._leaf.poll(child_ref.child_job_id)
+                except Exception as exc:
+                    observed = {}
+                    self._store.append_event(state.run_id, "cancellation_error", {
+                        "child_job_id": child_ref.child_job_id,
+                        "error": f"child status reconciliation failed: {str(exc)[:10_000]}",
+                    })
+                observed_status = str(observed.get("status") or "")
+                if observed_status == "cancelled":
+                    child_ref.cancelled = True
+                    child_ref.status = "cancelled"
+                    if child_ref.child_job_id not in state.cancelled_children:
+                        state.cancelled_children.append(child_ref.child_job_id)
+                    continue
+                if observed_status in {"completed", "failed"}:
+                    child_ref.status = observed_status
+                    continue
                 stopped = bool(self._leaf.cancel(child_ref.child_job_id))
                 if stopped:
                     child_ref.cancelled = True
@@ -2282,6 +2496,41 @@ class PipelineCoordinator:
         })
         return state
 
+    def record_tick_failure(self, run_id: str, exc: BaseException) -> PipelineRunState | None:
+        """Account for one raised tick; terminalize a run that keeps failing.
+
+        Cancellation wins: a run with cancellation intent is cascaded first.
+        Returns the terminal state when this call ended the run, else None
+        (the caller re-raises so the claim stays recoverable).
+        """
+        state = self._store.load_state(run_id)
+        if state is None or state.status in ("completed", "failed", "cancelled"):
+            return None
+        if state.cancellation_intent and not state.cancelled:
+            try:
+                return self._cascade_cancellation(state)
+            except Exception as cancel_exc:  # fall through to the retry cap
+                self._store.append_event(run_id, "cancellation_error", {
+                    "error": str(cancel_exc)[:1000],
+                })
+        state.tick_failures += 1
+        self._store.save_state(state)
+        self._store.append_event(run_id, "tick_failed", {
+            "stage_id": state.current_stage_id,
+            "failures": state.tick_failures,
+            "max_failures": MAX_TICK_FAILURES,
+            "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+        })
+        if state.tick_failures >= MAX_TICK_FAILURES:
+            return self._terminalize(
+                state,
+                TerminalCode.COORDINATOR_ERROR,
+                f"tick_retry_cap_exceeded: {state.tick_failures} consecutive "
+                f"failures at stage {state.current_stage_id}: "
+                f"{type(exc).__name__}: {str(exc)[:300]}",
+            )
+        return None
+
     def request_cancellation(self, run_id: str) -> bool:
         """Persist cancellation intent and wake the parent for its next advance."""
         state = self._store.load_state(run_id)
@@ -2289,6 +2538,8 @@ class PipelineCoordinator:
             return False
         if state.status in ("completed", "failed", "cancelled"):
             return False
+        if state.cancellation_intent:
+            return True
         state.cancellation_intent = True
         if not self._store.save_state(state):
             return False

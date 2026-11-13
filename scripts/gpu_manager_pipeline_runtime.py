@@ -30,6 +30,7 @@ No live Redis, no live GPUManager HTTP calls in tests.
 from __future__ import annotations
 
 import copy
+import time
 from typing import Any, Callable
 
 from pipeline_coordinator import (
@@ -41,6 +42,11 @@ from pipeline_coordinator import (
     _deep_sanitize,
     _now_iso,
 )
+
+
+# Ordinary child readiness is polled at a bounded cadence rather than retried
+# immediately. Controller callers run this synchronous API via asyncio.to_thread.
+READINESS_POLL_INTERVAL_SECONDS = 1.0
 
 # ── Exceptions ─────────────────────────────────────────────────────────────────
 
@@ -471,10 +477,37 @@ class ControllerPipelineRuntime:
         # Step 4: call advance() exactly once — this persists progress/terminal state
         try:
             state = self._coordinator.advance(state)
-        except Exception:
-            # advance() raised: leave the claimed message unACKed for crash recovery.
-            # Do not re-enqueue, do not ACK, do not swallow the error.
-            raise
+        except Exception as exc:
+            # advance() raised: leave the claimed message unACKed for crash
+            # recovery, but bound the redelivery. A run that keeps raising (or
+            # was cancelled meanwhile) is terminalized and ACKed instead of
+            # being re-ticked forever; otherwise the error is not swallowed.
+            ended = self._coordinator.record_tick_failure(claimed_run_id, exc)
+            if ended is None or ended.status not in ("completed", "failed", "cancelled"):
+                raise
+            if not self._store.ack_parent(ended.run_id):
+                raise RuntimeError(
+                    f"ack_parent failed for run_id={ended.run_id!r} after "
+                    "bounded tick failure terminalization"
+                ) from exc
+            return ended
+        ordinary_child_wait = (
+            not state.cancellation_intent
+            and state.current_stage_id is not None
+            and any(
+                child.stage_id == state.current_stage_id
+                and not child.cancelled
+                and child.status in {"queued", "in_flight", "pending"}
+                for child in state.child_jobs
+            )
+        )
+        if ordinary_child_wait:
+            # This is not retry backoff: unchanged pending work must not
+            # increment retry counters or emit retry-loop warnings.
+            time.sleep(READINESS_POLL_INTERVAL_SECONDS)
+        if state.tick_failures and state.status not in ("completed", "failed", "cancelled"):
+            state.tick_failures = 0
+            self._store.save_state(state)
 
         # Step 5: ACK terminal results; re-enqueue nonterminal via requeue_parent
         if state.status in ("completed", "failed", "cancelled"):
@@ -493,7 +526,7 @@ class ControllerPipelineRuntime:
             # message and enqueue the replacement. This prevents PEL accumulation.
             # Fail-closed: if the atomic replacement fails, raise so the
             # unACKed message can be recovered via reclaim_orphaned.
-            ok = self._store.requeue_parent(state)
+            ok = self._store.requeue_parent(state, ordinary_wait=ordinary_child_wait)
             if not ok:
                 raise RuntimeError(
                     f"requeue_parent failed for run_id={state.run_id!r}; "

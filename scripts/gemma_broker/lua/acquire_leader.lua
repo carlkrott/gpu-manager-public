@@ -14,4 +14,6 @@ local token = redis.call('INCR', KEYS[2])
 local expires_at = tonumber(ARGV[2]) + tonumber(ARGV[3])
 redis.call('HSET', KEYS[1],
   'owner', ARGV[1], 'token', tostring(token), 'expires_at', tostring(expires_at))
-return {tostring(token), tostring(expires_at)}
+-- Minted: also return the superseded owner/token so the new leader can
+-- detect a dead predecessor and reconcile its leases without the grace.
+return {tostring(token), tostring(expires_at), current_owner or '', current_token or ''}

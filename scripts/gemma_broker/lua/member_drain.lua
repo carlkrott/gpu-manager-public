@@ -78,14 +78,36 @@ if mode == 'release' or mode == 'release_v2' then
     end
   end
   local record = cjson.decode(ARGV[6])
-  record.state = ARGV[7]
-  record.accepting = ARGV[8] == '1'
+  -- Capacity-only READY_BUSY is not a lifecycle transition: releasing a lease
+  -- that freed a slot must restore readiness immediately, or a pinned submit
+  -- arriving before the next readiness refresh tick is refused with 503. Only
+  -- a member whose ONLY recorded reason was no-capacity is promoted, and only
+  -- when `free` proves a slot is actually available. Lifecycle states and any
+  -- other blocker are written through untouched.
+  local new_state = ARGV[7]
+  local new_accepting = ARGV[8]
+  if new_state == 'ready_busy' and free > 0 then
+    local capacity_only = true
+    for _i, reason in ipairs(record['reason_codes'] or {}) do
+      if reason ~= 'MEMBER_NO_CAPACITY' then
+        capacity_only = false
+      end
+    end
+    if capacity_only then
+      record['reason_codes'] = {}
+      record['blockers'] = {}
+      new_state = 'ready_accepting'
+      new_accepting = '1'
+    end
+  end
+  record.state = new_state
+  record.accepting = new_accepting == '1'
   record.state_version = tonumber(ARGV[5])
   record.generation_fence = tonumber(ARGV[10])
   record.dispatcher_leases = live_leases
   record.compatible_free_slots = free
   redis.call('HSET', KEYS[1],
-    'record', cjson.encode(record), 'state', ARGV[7], 'accepting', ARGV[8],
+    'record', cjson.encode(record), 'state', new_state, 'accepting', new_accepting,
     'compatible_free_slots', tostring(free), 'state_version', ARGV[5],
     'generation_fence', ARGV[10])
   return {mode, ARGV[5], tostring(live_leases), tostring(free)}

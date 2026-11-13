@@ -370,6 +370,16 @@ def validate_service_definition(name: str, service: Mapping[str, Any]) -> list[s
     for field in _DISALLOWED_DYNAMIC_FIELDS:
         if field in service:
             errors.append(f"{field} is not allowed in a service definition")
+    # audit C6: the fields every routing/eviction decision reads must have their types
+    if "enabled" in service and not isinstance(service["enabled"], bool):
+        errors.append("enabled must be true or false")
+    for field in ("type", "endpoint", "member_type", "gpu_id", "served_model"):
+        if service.get(field) is not None and not isinstance(service[field], str):
+            errors.append(f"{field} must be a string")
+    for field in ("priority", "parallel", "context_per_slot"):
+        value = service.get(field)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            errors.append(f"{field} must be a non-negative integer")
     return errors
 
 
@@ -528,6 +538,9 @@ def registry_fingerprint(config: Mapping[str, Any]) -> str:
             "workflows",
             "operation_catalogs",
             "source_locks",
+            # The broker's member order decides which backend serves a chat
+            # request, so a reorder is a routing change and must resync clients.
+            "combined_gemma_broker",
         )
         if key in config
     }
@@ -693,6 +706,8 @@ def registry_legacy_findings(config: Mapping[str, Any]) -> list[dict[str, Any]]:
             and service.get("systemd_unit")
             and service.get("type") in {"llm_backend", "generation_backend"}
             and not service.get("runtime_profile")
+            # no GPU = a proxy to a remote engine (router cloud members, MSI embedder)
+            and (service.get("gpu_id") or service.get("gpu_ids"))
         ):
             add(
                 "runtime_profile_missing",

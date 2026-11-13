@@ -71,6 +71,7 @@ class ReasonCode(StrEnum):
     TELEMETRY_STALE = "TELEMETRY_STALE"
     RESERVATION_STATE_STALE = "RESERVATION_STATE_STALE"
     PRE_ACCEPTANCE_REQUEUE = "PRE_ACCEPTANCE_REQUEUE"
+    PRE_ACCEPTANCE_REQUEUE_EXHAUSTED = "PRE_ACCEPTANCE_REQUEUE_EXHAUSTED"
     POST_ACCEPTANCE_OUTCOME_UNKNOWN = "POST_ACCEPTANCE_OUTCOME_UNKNOWN"
     CANCELLED_BEFORE_ACCEPTANCE = "CANCELLED_BEFORE_ACCEPTANCE"
     CANCELLED_AFTER_ACCEPTANCE = "cancelled_after_acceptance"
@@ -79,6 +80,7 @@ class ReasonCode(StrEnum):
     MIGRATION_PEL_NOT_EMPTY = "MIGRATION_PEL_NOT_EMPTY"
     BASELINE_DRIFT = "BASELINE_DRIFT"
     NO_ELIGIBLE_MEMBER = "NO_ELIGIBLE_MEMBER"
+    REQUEST_PINNED_MEMBER_MISMATCH = "REQUEST_PINNED_MEMBER_MISMATCH"
     PRIORITY_INVALID = "PRIORITY_INVALID"
     STREAMING_NOT_SUPPORTED = "STREAMING_NOT_SUPPORTED"
     CRASH_EVIDENCE_CONFLICT = "CRASH_EVIDENCE_CONFLICT"
@@ -263,6 +265,7 @@ class JobRecord:
     selected_member: str | None = None
     member_state_version: int | None = None
     attempt_count: int = 0
+    pre_acceptance_requeue_count: int = 0
     current_attempt_id: str | None = None
     accepted_boundary_crossed: bool = False
     queue_claimed_at: float | None = None
@@ -271,6 +274,7 @@ class JobRecord:
     input_tokens_estimate: int | None = None
     max_output_tokens: int | None = None
     required_capabilities: tuple[str, ...] = ()
+    pinned_member: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
     reason_code: ReasonCode | None = None

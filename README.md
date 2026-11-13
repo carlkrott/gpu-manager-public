@@ -121,6 +121,14 @@ A bundle is a service-level runtime unit whose desired state and observed readin
 
 This keeps decisions such as “should this bundle be probed, started, restarted or quarantined?” separate from the host-specific mechanism that performs the action.
 
+#### Explicit ComfyUI on-demand lifecycle
+
+ComfyUI is not restarted automatically to make a generation request succeed. `GET /comfyui/status` treats HTTP 200 from `/system_stats` as readiness and reports a cold or unhealthy backend as unavailable. The configured unit is `services.comfyui.systemd_unit` in `config/services.json` (currently `comfyui.service`); do not start it directly with systemd. An operator can explicitly request `POST /vram/start-comfyui` (or the MCP `start_comfyui` tool); both use the controller's managed `start_bundle` lifecycle for `comfyui`, and report ready only after `/system_stats` succeeds and the configured unit's running state is confirmed.
+
+Generation itself remains a managed request through `/generate/{type}` or `/v1/submit/generation`. In durable mode the WorkerPool owns job admission and bundle load/eviction for that admitted job; the HTTP handler does not start ComfyUI as a side effect of submission. Completion and resource restoration stay with the same controller/worker lifecycle rather than a second allocator or direct systemd start from the request path.
+
+A failed start or failed `/system_stats` check is visible: `POST /vram/start-comfyui` answers HTTP 503 with a typed `error` (`comfyui_start_failed`, `comfyui_system_stats_unavailable` or `comfyui_running_state_unconfirmed`) and is never retried automatically. In the compatibility `split` queue-owner mode, jobs queued for a stopped ComfyUI wait for the explicit start, and the legacy scheduler logs one warning per five minutes rather than one per retry.
+
 ### Declarative workflow registration
 
 A service draft can describe reviewed inputs, operations and outputs. The compiler validates that description into a workflow graph and bounded preview.
@@ -171,6 +179,12 @@ The standalone broker is a separately composable service for an ordered set of m
 - a candidate-mode contract that disables lifecycle mutation and SSE.
 
 The public example uses disabled synthetic members and an isolated candidate namespace. It is a schema and behavior fixture, not a live model deployment.
+
+#### Embedded refresh logging and member roles
+
+In embedded deployment the controller refreshes member readiness every two seconds and logs `BROKER_REFRESH` only when a member changes state. Ordinary transitions into a ready state (accepting or busy) are INFO; every other state (unhealthy, joining, draining, offline, faulted, or a member missing from the configuration) stays WARNING. Unchanged state, capacity flipping between accepting and busy, and live values inside blocker text such as snapshot age do not repeat the line.
+
+A member whose service is `enabled: false` stays in the topology fail-closed and is reported once as `absent/disabled` without being probed again. An enabled member that is down is still probed and stays visible as unhealthy, in the log and in the readiness response. A member backed by a GPU's idle service (`scheduling.idle_services`, bundle `idle: true`) is an on-demand filler: it is expected to be stopped while another bundle holds that device, and its `systemd_unit`, `port` and `health_path` describe the serving it provides once loaded.
 
 ### Checked runtime supervision
 

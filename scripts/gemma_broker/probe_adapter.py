@@ -178,6 +178,23 @@ def _health_payload_ok(health: Any) -> bool:
     )
 
 
+HEALTH_MODELS_PROFILE = "health_models"
+
+
+def _health_models_counts(config: dict[str, Any], models: Any, facts: Mapping[str, Any]):
+    """Servers without llama.cpp /slots (Breccia, audit B8): slots come from config, busy
+    from dispatcher leases, residency from a /v1/models id equal to config served_model."""
+    total = _positive_int(config.get("parallel", config.get("worker_parallel")))
+    context = _positive_int(config.get("context_per_slot"))
+    served = config.get("served_model")
+    data = models.get("data") if isinstance(models, dict) else None
+    match = bool(served) and isinstance(data, list) and any(
+        isinstance(m, dict) and m.get("id") == served for m in data)
+    if total is None or context is None:
+        return None, None, None, False
+    return total, min(total, _nonnegative_int(facts.get("dispatcher_leases"))), context, match
+
+
 def member_probes_from_payloads(
     *,
     config: dict[str, Any],
@@ -202,12 +219,15 @@ def member_probes_from_payloads(
     health = payloads.get("health")
     slots = payloads.get("slots")
     models = payloads.get("models")
-    total, busy, observed_context = _slot_counts(config, slots, health)
-    model_match = _model_matches(
-        config,
-        models,
-        observed_context=observed_context,
-    )
+    if config.get("probe_profile") == HEALTH_MODELS_PROFILE:
+        total, busy, observed_context, model_match = _health_models_counts(config, models, manager_facts)
+    else:
+        total, busy, observed_context = _slot_counts(config, slots, health)
+        model_match = _model_matches(
+            config,
+            models,
+            observed_context=observed_context,
+        )
     health_ok = _health_payload_ok(health)
     semantic_health = health_ok and model_match and total is not None
     raw_probe_error = manager_facts.get("probe_error")

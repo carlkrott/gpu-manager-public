@@ -1,5 +1,5 @@
 {
-  "file_count": 122,
+  "file_count": 251,
   "files": [
     {
       "disposition": "utility",
@@ -40,8 +40,8 @@
     {
       "disposition": "core",
       "path": "README.md",
-      "sha256": "cffa106d39eaf5f034bf9dc8f8937a79a804b0e7e78d4a23e502f5fc6c6b24ff",
-      "size": 16309
+      "sha256": "693d1a28376091f0f1c0117aac4423f8da0eda85996e0bbd7015c3dc75902e90",
+      "size": 18954
     },
     {
       "disposition": "core",
@@ -52,8 +52,20 @@
     {
       "disposition": "core",
       "path": "THIRD_PARTY_NOTICES.md",
-      "sha256": "2f76d7d37877be1ecf43b62fa1a63ce0963a565a50783d299cece510a1bc90cd",
-      "size": 1524
+      "sha256": "94301c81ab32f4c3b93bdded44941bc70c3e98291292f46e053d19b01aaef8b2",
+      "size": 1644
+    },
+    {
+      "disposition": "core",
+      "path": "deployment/oom_inflight_deploy.sh",
+      "sha256": "0abf1b3f52a75239a7aee11cc553aa0574eaa56209ba48744d121e761ec6e8bf",
+      "size": 21144
+    },
+    {
+      "disposition": "core",
+      "path": "deployment/oom_inflight_preflight.py",
+      "sha256": "68aa9c9a3fedd44051ec31cfdac13342e324b5204977cb003be78cc10dac948d",
+      "size": 14226
     },
     {
       "disposition": "core",
@@ -88,14 +100,14 @@
     {
       "disposition": "utility",
       "path": "release/public-files.json",
-      "sha256": "99067949fea4f202f7940be6a2111396ee313ede98ed694cc253a512406c6c4d",
-      "size": 11365
+      "sha256": "d59e93ae262d43b8fbe8fdc9aaf842df54dddf8ec9e1101bcec87e505a499f83",
+      "size": 24221
     },
     {
       "disposition": "utility",
       "path": "requirements-dev.lock",
-      "sha256": "69a6f40e85c385d28a6d01d8d691a20d6b7ad6d551e900510789ac3f0e05a771",
-      "size": 578
+      "sha256": "2797ab555f07e488748a9f93a844d7c46d48b817dea3e4b36090b0197792bbd7",
+      "size": 1116
     },
     {
       "disposition": "utility",
@@ -111,9 +123,21 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/acceptance_full_pipeline.py",
+      "sha256": "cf9b4657a8eeeeef42edeea7a9e53c16f4ac869e8229f6ae86e66653047ce1ba",
+      "size": 12392
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/admission_affirmation.py",
+      "sha256": "23c55b2fc378d07cb7be84368a88dca4df43c5742793a360796a859c7d89d2a8",
+      "size": 12005
+    },
+    {
+      "disposition": "core",
       "path": "scripts/api_auth.py",
-      "sha256": "f2b9e3905578c6c18ec986974abde6b092f510913c6e5e07d84790dbe8f49419",
-      "size": 6372
+      "sha256": "ec37fa3918c879928a3b1d1fa340cf911f55bd68914537ca3a90ca8dc23147e6",
+      "size": 27662
     },
     {
       "disposition": "core",
@@ -124,8 +148,8 @@
     {
       "disposition": "core",
       "path": "scripts/backup_gpu_manager_state.py",
-      "sha256": "39e329f30237eedb759bda9111f0e510b375c7903f571be586a20a336b3e2642",
-      "size": 7973
+      "sha256": "0e10280cb7bbc5ad9c5123ffcf64186aaaaed72a4e838235d18c767d34c8c26b",
+      "size": 9215
     },
     {
       "disposition": "core",
@@ -142,8 +166,8 @@
     {
       "disposition": "core",
       "path": "scripts/bundle_lifecycle.py",
-      "sha256": "0fc0a8ea10e44e6c8a3a8ce89514e6f1b094c93d7853a9c13f88edc5d0656b7e",
-      "size": 59624
+      "sha256": "bd447a87cab186f28f4db2b7b163d6a39718410876649a02052b5d2301b2ffd8",
+      "size": 60323
     },
     {
       "disposition": "utility",
@@ -154,8 +178,14 @@
     {
       "disposition": "core",
       "path": "scripts/combined_gemma_broker_service.py",
-      "sha256": "1d5293a6fa9c1a45bb9a745ea32e6dbc4df500e2fecd7357e143f5b8a02a5b94",
-      "size": 27419
+      "sha256": "f714896f3945eeee732cbdd5d913c687a6207a65ad6768d643ba81a89bbc8a3f",
+      "size": 35760
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/comfyui_liveness.py",
+      "sha256": "c19b444b0333bf4c3150303feac758c1904e46317846ccd0ad8cd5b12f9c384e",
+      "size": 3376
     },
     {
       "disposition": "utility",
@@ -177,6 +207,12 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/copy_gpu_manager_state_backup.py",
+      "sha256": "5fa5781f78d49b998012caa94d24d329410332d2e66aba7683b6f9d042549ef0",
+      "size": 37413
+    },
+    {
+      "disposition": "core",
       "path": "scripts/declarative_package.py",
       "sha256": "468ae55aa7a79b3d88d393aee9436105218f8981fe419603fd8b3cb3e616eee4",
       "size": 15779
@@ -190,8 +226,8 @@
     {
       "disposition": "core",
       "path": "scripts/execution_boundary.py",
-      "sha256": "5cd5be2a3e7cf37dfa26b466f57ae79870601f7d2545b5d4ffff1c63b217551a",
-      "size": 45486
+      "sha256": "21e0840a7c98747f10efc8611315f6de21469831e1687ffe6de3159b0f3f5dc4",
+      "size": 45421
     },
     {
       "disposition": "utility",
@@ -226,44 +262,44 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/api.py",
-      "sha256": "242c3e763de716598dab9eebd217caca61adb396c0412d12e4aa668c4e3d7443",
-      "size": 11497
+      "sha256": "fdef5ffb552cb75d453599d543a9436bb268c4e9094e1a06aa6820d5eaa6a4d5",
+      "size": 16431
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/compat.py",
-      "sha256": "647dd8199db2f3353d33fcd2dcefd91fec688a78fd76bd1912a5ad3b7cf355bc",
-      "size": 10565
+      "sha256": "c61b82fe93dbae256e06bbf742c4ef02c65b166c9754a0a67823704a6d03f37d",
+      "size": 16343
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/compatibility.py",
-      "sha256": "47679a5872c35c78421d36cc89dddb3b6d24cdd44ed4ffb7ae31188a8ae18a83",
-      "size": 3449
+      "sha256": "df40064b779061f5c9f07fbd6bc18e79d12416429a7aedd7cfd3fab62e270777",
+      "size": 6060
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/config.py",
-      "sha256": "c327d76dbf39e9cacdddaeb2e61815a8cc8a48d70806fa7c2a8705ce8ca0c209",
-      "size": 5060
+      "sha256": "159d5b59cfa75db2c91b9f082b79d36ab66e651eed60f4f9c9fb2a412f9db2df",
+      "size": 5535
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/contracts.py",
-      "sha256": "adf81d5ea9e4afccc5b22f804ccffe2ac5ece2f8f7b7b90271b347fecac25e22",
-      "size": 11036
+      "sha256": "6cd2c064c128451313da093493ab0b5c35f7d48f0a1c4a3928480924b64d44d6",
+      "size": 11259
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/dispatcher.py",
-      "sha256": "dbb9aac303d096152d89e8ea89dd0d16e9c8b1a123d8a3928e676e1a9e3b1d9c",
-      "size": 5295
+      "sha256": "5057dbe93bb8535cfe4f7063e00c990a87dfaadce96c821410e24a33cbce71d5",
+      "size": 12752
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/drain.py",
-      "sha256": "c8222d388b4c1c95610b5aa5f24c72298458ce4c9825c613ab630206973663e0",
-      "size": 8721
+      "sha256": "0c06f6749bd9ba00a53cb081d71e95ef06346fa8d38d050c25a8f5f8e14ec213",
+      "size": 8763
     },
     {
       "disposition": "core",
@@ -273,9 +309,21 @@
     },
     {
       "disposition": "core",
-      "path": "scripts/gemma_broker/lua/acquire_leader.lua",
-      "sha256": "ecd5f4262657577ae94c64b6ca27246aa59363150ae55e5d3e01ed999328e9bf",
+      "path": "scripts/gemma_broker/gate_limits.py",
+      "sha256": "e17cd7fae1184327cad7f35730e0dfa8a6b0d6b4a987b090046f62789c5048c8",
       "size": 770
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/kv_affinity.py",
+      "sha256": "e1930c83a21873054969cc6f3e133d7a0e96f55d06d2276b3ea3f08724c155aa",
+      "size": 24295
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/lua/acquire_leader.lua",
+      "sha256": "55388d67b217f2edf4e0ca411f92a98c5e29aaceb015f8fe24700fe4f63c5b47",
+      "size": 957
     },
     {
       "disposition": "core",
@@ -286,8 +334,8 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/lua/member_drain.lua",
-      "sha256": "44e28e97251704dedbb502ea854cd05095ca86f32f4b52a7270123cfd33f788a",
-      "size": 3947
+      "sha256": "1edeff7809316923de5ad14bd97b6ea8628bc88b69fce3b1ad87d91d1e95d30e",
+      "size": 4868
     },
     {
       "disposition": "core",
@@ -316,26 +364,26 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/lua/reserve_job.lua",
-      "sha256": "f00a03405a6548cb7f1f81b060754b63beb16480ee63895b88649c81ef75a801",
-      "size": 3511
+      "sha256": "be753d10f1986aad000d8486cac48f04d4bd1928935c58fba133eb21fb3fde93",
+      "size": 3627
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/lua/submit_job.lua",
-      "sha256": "2e47fde1c8635bb0fabfe05dc3ff4609267b442be3c7e82a74a05fdc94c581be",
-      "size": 768
+      "sha256": "4d933aa93339d3cdc3fe8777a80d2de8e428ac429a8a509645269d22960f7504",
+      "size": 2020
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/member_cache.py",
-      "sha256": "392fbcd6d15114c538b55c82d9a7c84552e87c265e439a8cb3da6ecf75461993",
-      "size": 2847
+      "sha256": "9be8b2a98dfe5bf0e57f6365b3a9b20db637c8c2b47961ef6538342cb9695009",
+      "size": 5095
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/member_observer.py",
-      "sha256": "e3ed11d781fc11788368d8fdb9c24cef5e3186aa6dc8879dece0925dea48fbfe",
-      "size": 10580
+      "sha256": "abc2d4eeb204898283fbb211e46d4c7a915da20cc6147163b57e927655f2c17f",
+      "size": 10732
     },
     {
       "disposition": "core",
@@ -352,14 +400,14 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/probe_adapter.py",
-      "sha256": "2876fbc34fba7b74bc1f7c7c1d57a80523e2b85d7827882cb09fae872543d10d",
-      "size": 9698
+      "sha256": "4bd5f8e00bdbf60ca691da9dd36b305b6bba055f0a0c3d8a5666402dca923b85",
+      "size": 10769
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/readiness.py",
-      "sha256": "54cc9f177ae95f5f654c64d326a83051ecaf178cbcfe44b7d2ff297b1efb9779",
-      "size": 7279
+      "sha256": "ca145dfc831c0fd9aa762adfe4d9e04a584cd75afbd08359584ca92f38b8266c",
+      "size": 7850
     },
     {
       "disposition": "core",
@@ -376,14 +424,14 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/redis_store.py",
-      "sha256": "f146ce40bbd56afa1faed464d583bd661d802060b4b14baa8a3c7e80a9078335",
-      "size": 94701
+      "sha256": "2b357936317a4b94a7c8c703fd27f64e62579899686f9bdc7e2dc414934abde0",
+      "size": 119338
     },
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/runtime.py",
-      "sha256": "857b4fa4d9ab1a5e3bfe5a837287f596a6c4507c942c9fb0c21d76a344d94fba",
-      "size": 86999
+      "sha256": "ea372f8a3753d2942e8420d6adece70f4fefec9ce197fe3aededb64f1d79daab",
+      "size": 121598
     },
     {
       "disposition": "core",
@@ -394,26 +442,140 @@
     {
       "disposition": "core",
       "path": "scripts/gpu-manager.py",
-      "sha256": "4cd001b9559c1f2b7b45c6bad5e79627dfa7bb40a755fdeb578546e7fe5519b5",
-      "size": 1909225
+      "sha256": "d60fae8fd1fa0f82cd3658336913c23055419fb99037ad4e36ca9f218ee6cb6a",
+      "size": 1818540
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/bundle_model.py",
+      "sha256": "54161b4a7bb5cb51370d68d1492fc9bf608df6ae9421e35643b2d5953ac8d32e",
+      "size": 35186
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/bundle_queue.py",
+      "sha256": "172816d65ec70c0f05df629349e1f1f559b6355c6d33d7c137eb19f012440309",
+      "size": 16542
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/config_policy.py",
+      "sha256": "7c03e25c09622bfe77c9ce9039d6d969e5b20281fe54f6ad2fd31adf7a5ddc91",
+      "size": 26676
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/fit_validator.py",
+      "sha256": "1f957d06c31049ff82f63203b8f7f1f5abdffa1d5937b795ae911caff3530b9f",
+      "size": 22231
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/gpu_guard.py",
+      "sha256": "6a57195fb429346cc1aacf245d2db4a4939ac253ab2e04c6cc8e54d993ea20c0",
+      "size": 39189
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/gpu_topology.py",
+      "sha256": "634dd63785daf3cd0bcb2c2172e67dfd26774905bef0bebedc8f41d738d9dbfd",
+      "size": 13502
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/job_models.py",
+      "sha256": "d096a23299052e2fe2d8df62e0e778b1e550388feef04024a824fe8624c3d830",
+      "size": 11175
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/memory_policy.py",
+      "sha256": "237a4bbd49026d1e111a43f41a94a6b4e5bc5dd5c6f308192b1979f0d7cdeb89",
+      "size": 9949
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/oom_detection.py",
+      "sha256": "8cb30b25776137f7c739d163adefd6ad7e39d3a5b9ca19e0b44f61a4bfdf08b2",
+      "size": 21901
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/oom_retry.py",
+      "sha256": "572127ab2c031c5a7064067fa5093ccfb6764f4211817d307ebf12c55f806ee8",
+      "size": 21371
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/oom_telemetry.py",
+      "sha256": "e1ffc0232e2240b8286460a1fb054af2707c575fb9e1168a2542db7bb07cb9b2",
+      "size": 15573
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/reservations.py",
+      "sha256": "6aaa54cb4324a6404252d620c9021483fbafc740822a2b2b0d68d04564492ce8",
+      "size": 13305
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/scheduler_helpers.py",
+      "sha256": "72f743c7157549c2306f0efe43fba4af8251ef55d5821c96968f4f9c9ed4e6cd",
+      "size": 34000
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/scheduler_state.py",
+      "sha256": "293d6f3e9923e0fb57555ba9f18f7d0ab2d9f8ac35993ba613c846a057857ae8",
+      "size": 12833
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/service_events.py",
+      "sha256": "c383c4a652b7139da34c8f81b3eed4eaa14a277439848f77feffa44027ae36cb",
+      "size": 16086
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/vram_lifecycle.py",
+      "sha256": "0f87a6f0ba4c75544d8037c1dbc93a6abb256c3024aa27b68f5113436a54a005",
+      "size": 66069
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/warm_pool.py",
+      "sha256": "53949838ad19e4e50c151a33f13f27f3db3eadb013fd994cd2895f960e10581a",
+      "size": 3812
     },
     {
       "disposition": "core",
       "path": "scripts/gpu_manager_contracts.py",
-      "sha256": "8da6f32bae7b28d15e2ff5badc944555835c150b81ceb732587453dcc7934fa6",
-      "size": 52700
+      "sha256": "aef7d49dd07eb4a897024cee87ebd3aeb94fb3939b09f72558e80fbffb49180d",
+      "size": 53751
     },
     {
       "disposition": "core",
       "path": "scripts/gpu_manager_pipeline_runtime.py",
-      "sha256": "c75b2bb0fb33044a0f4e2ee75b3582fd889ef68931a7b922169d2487771d213a",
-      "size": 22268
+      "sha256": "fa2048dc0a054b35d0146b963bb1056c6b0602f02c7198b240151e6e0f700dab",
+      "size": 23910
     },
     {
       "disposition": "core",
       "path": "scripts/gpu_manager_semantics.py",
-      "sha256": "b3e992f5c2cf2bad3aaf2de473777c1c0f3fb1ddb165ca2fc8d8c557df539ddd",
-      "size": 25788
+      "sha256": "43cc88c9747715903428edc61c24a795eae3fd7cf21e7a9c6fab7ce1c5aeaa86",
+      "size": 26132
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/hardware_recognition.py",
+      "sha256": "644397fd34bd936adbd85aab670dbad2531d4eda172d166cdbabf07b396c408d",
+      "size": 10006
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/idle_targets.py",
+      "sha256": "96e0b321daec84876a2473c8e533b149342a1a169e70490c7d83088df51d19d9",
+      "size": 5276
     },
     {
       "disposition": "core",
@@ -448,14 +610,14 @@
     {
       "disposition": "portable_optional_integration",
       "path": "scripts/minimax_music3_preparation_contract.py",
-      "sha256": "504726ed7c56dde1bd512944c1dc18c55e6098b4ef9534ce291d9c45a1d0a5c7",
-      "size": 14560
+      "sha256": "e3456fa697fe14357f0a8f83fe99dccc7bf08c0b95932b8807d8a0b6ba1da2b6",
+      "size": 15791
     },
     {
       "disposition": "portable_optional_integration",
       "path": "scripts/minimax_recovered_callbacks.py",
-      "sha256": "1fa80b06395cf34e3608edf6d0dc76ce0e0ae8985e74763946e76ddaf7cb2310",
-      "size": 14312
+      "sha256": "c0deba419b42ff88894b0282db0c7fb5cbbf1b4130c0cc2ee33581b2dcc799ab",
+      "size": 21752
     },
     {
       "disposition": "core",
@@ -471,9 +633,15 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/node_leases.py",
+      "sha256": "40f896a6586fbfcdc3cad25692b5866dc4d8177566b7f0c95750f41eb0d82487",
+      "size": 23772
+    },
+    {
+      "disposition": "core",
       "path": "scripts/pipeline_coordinator.py",
-      "sha256": "38c327c97955509063fe833514ff01034497076678ad1765c58d046c02847036",
-      "size": 95473
+      "sha256": "99e55b3ede9dc81978b9c294dbe67637035deb329541dcb7623d75568cf20e05",
+      "size": 106705
     },
     {
       "disposition": "core",
@@ -484,8 +652,14 @@
     {
       "disposition": "core",
       "path": "scripts/pipeline_provider_runtime.py",
-      "sha256": "630e7cea0b149bad2e36d25ec348260fe4df88a5ba96362f974cd50dcca9d96c",
-      "size": 153481
+      "sha256": "7dc1294e82816b4067d69332340c3a49071affb7337da15f00f8b6a68330612d",
+      "size": 155788
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/placement_orchestrator.py",
+      "sha256": "dc362d1b395f5ee41ef65deeab230ff20c225e3e52897b942de0104e54fa5217",
+      "size": 12982
     },
     {
       "disposition": "core",
@@ -496,8 +670,8 @@
     {
       "disposition": "core",
       "path": "scripts/queue_engine.py",
-      "sha256": "88102429ffdb7b1ab3935a3d7594dc403a590dc2fec2bed82e4e69397e4bd4f3",
-      "size": 183263
+      "sha256": "cf7399db9c67dcaa5a0f1dd93a87ee747ea5761b772f1af91b0075cf5fba5d28",
+      "size": 199401
     },
     {
       "disposition": "core",
@@ -510,6 +684,18 @@
       "path": "scripts/queue_monitor_analyze.py",
       "sha256": "9d14b328f361404309176b0ecb1a16a7d7ad3adfe61db081b35a759dcb066da8",
       "size": 4589
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/queue_recovery.py",
+      "sha256": "9728fed7dea442a8c2377b98f74cd306c522190cc71fa1b4ab48217c6e00fb96",
+      "size": 13225
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/r139_cleanup_queue_gemma.py",
+      "sha256": "6b30f5306fb3b87c3fae5f53cbf78ce75f30b8f660b84e7edc1df058f5fffa24",
+      "size": 3957
     },
     {
       "disposition": "core",
@@ -531,6 +717,12 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/retire_provider_instance.py",
+      "sha256": "a985b32c840f9d94b592ff71f97ddc459d1906d16f9a3f35eb24003b3b85ec8c",
+      "size": 21607
+    },
+    {
+      "disposition": "core",
       "path": "scripts/retry_failed_coordinator_qc.py",
       "sha256": "98f0db6694966f0eb7c23c876055da31efdb654338bb0f776399b0397c929187",
       "size": 4675
@@ -538,14 +730,14 @@
     {
       "disposition": "core",
       "path": "scripts/runtime_contracts.py",
-      "sha256": "23c6ca49d30071b40570b1cc4fdba2960c44197da7ad28e13cf5cc7d428b7f92",
-      "size": 19478
+      "sha256": "d7c259cea612b0e47127eda05d365d1739c648dd2c7d780eb00aba60d51d9eee",
+      "size": 23759
     },
     {
       "disposition": "core",
       "path": "scripts/runtime_controller.py",
-      "sha256": "eb5545f2fdcd2e717e5db44e02756f2e6c3175a1e3332fcebaa1ed20bb7527cb",
-      "size": 10045
+      "sha256": "404c2d5b3f071ed83b7da82709c71c71c648bfdd888cd6fcd97da82b19b202db",
+      "size": 10378
     },
     {
       "disposition": "core",
@@ -568,8 +760,8 @@
     {
       "disposition": "core",
       "path": "scripts/runtime_state.py",
-      "sha256": "37729f8264d0e3ddcfebfddab6a304bd66246e00de9f98caf880cd2ca625309b",
-      "size": 20826
+      "sha256": "a007a62c72a9c3abdbc7be91e155be3776bebc9db1e366114f302e5f7515a319",
+      "size": 22087
     },
     {
       "disposition": "core",
@@ -598,8 +790,14 @@
     {
       "disposition": "core",
       "path": "scripts/stage_dispatch.py",
-      "sha256": "e1868913d0a565d40aa06ae4b3534613b6eff263b85025f11116ab472f592d17",
-      "size": 38545
+      "sha256": "859409e3a4edc526a982bee71fca994b93039ea46a311b9abe8664c258b64004",
+      "size": 38544
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/trim_coordinator_stream.py",
+      "sha256": "80c2c43f3d6e15b3a32a0c54b69588a9228d313f864f9739654a94e77d026abe",
+      "size": 5300
     },
     {
       "disposition": "core",
@@ -634,32 +832,80 @@
     {
       "disposition": "core",
       "path": "scripts/workflow_runtime.py",
-      "sha256": "3687019a9aeb4d7e8fb5d1d701b687c9b26b39c1b80bc333d69e90a246d03571",
-      "size": 29386
+      "sha256": "9588a592217c45f3f2462968795d66bc41deb6525bc66e2c7da3e7ddaf74141c",
+      "size": 29374
     },
     {
       "disposition": "core",
       "path": "tests/publication/conftest.py",
-      "sha256": "1d9d9dce5e81609cea5ed0eaf3f699b8032a893df766da418dea43e04d89178b",
-      "size": 1878
+      "sha256": "37a293b036b70e358f804c0e7314e888099d42e35f348941a6cad474470f87e8",
+      "size": 2265
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_acceptance_full_pipeline.py",
+      "sha256": "97db2fbfbd91e10972bab997f2c3b7f1465f93b6bd33a0880add96498044af6e",
+      "size": 8982
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_api_auth.py",
-      "sha256": "643d7916e24068cfc78acd6f60813ece916317eebede22ee180b687c68b8522c",
-      "size": 6930
+      "sha256": "ed1fffa1d9d62d5c09735763d60b8f441be3329bf2a0b6d403d7a2b0f410c6a9",
+      "size": 15340
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_api_contracts.py",
-      "sha256": "a1948d2f718acc3ae0a659748d9d81260b06be55626290893ae9fc46da3817b9",
-      "size": 19301
+      "sha256": "2ce0e0b692aab7a6445f2f3d8c9a2a5b5d9ecc39d7a7e0ad4f71b06ced7f6425",
+      "size": 19356
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_backup_registry_layout.py",
+      "sha256": "f93a81614d187cd674b41a5ada2fc439d8c6bdaab3e89c22cfabff50154a9e1f",
+      "size": 5083
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_hot_config.py",
+      "sha256": "93a7fd780048fee2770d7ca6cd5cb5125111aabb463ee4f9a5aae06837345a99",
+      "size": 2788
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_pin_503_regressions.py",
+      "sha256": "4f5ae06f837de86c295e890ee45823e8a7b8ea512e0ffbb4431073090e12574a",
+      "size": 27655
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_pinned_full_and_orphans.py",
+      "sha256": "3d136172ab953d98ea897c53f2b19c78a7fc003e08725b2cbe394e95d1aab375",
+      "size": 8502
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_broker_portability.py",
-      "sha256": "ba0a20695e2bb4e1f3e6adb059b8d2971129ea111716ac97acd1aa56a9293776",
-      "size": 6712
+      "sha256": "6ce68a95a6493cf2f313fdd8c1a762aaff39945a8ac60851c978622f6536c17e",
+      "size": 8574
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_vision_routing.py",
+      "sha256": "38b897f0109f795633de293d28cf25b25079459c0f24f155bc4c697479e0d8bb",
+      "size": 15848
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_window_redis.py",
+      "sha256": "8ae736e790c086fbef7e518cb6c93e4fccd4e670a838882e75b26a7299885c35",
+      "size": 7375
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_catalog_subscribe.py",
+      "sha256": "25e64cea1ece8e54bc0d903c1c34d8349a19abb663bbb5559623978e12133968",
+      "size": 20164
     },
     {
       "disposition": "core",
@@ -669,21 +915,93 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_cold_llm_inline_admission.py",
+      "sha256": "9d6441b9357d7f8156f9ac965beb4004b2cef64ddbb4b05df520f1cdbae6b006",
+      "size": 5033
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_combined_broker_scoped_gate.py",
+      "sha256": "6593691293d44ad90f7b83c7c7402cecba2e21c44ac081a254870536935b46fc",
+      "size": 12833
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_combined_gemma_example.py",
-      "sha256": "0b38ec2fa790283b02e36f11e2e91561f400a19520151267a6275348db4ca6e4",
-      "size": 5858
+      "sha256": "c21a223aa0c9d7ec4d886370334564facc64e5067f48999a309aecdbf43b8830",
+      "size": 17132
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_comfyui_readiness_gate.py",
+      "sha256": "2d61ab101a05ccfe2945dedc8a37f3a7b37a3b0244a170e2de0555369f7bd5ef",
+      "size": 10192
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_compat_failed_replay.py",
+      "sha256": "77c8745a0e50d2e7864247ff56aa881b3ab7b191d5675d10e7cfda8a5159d15b",
+      "size": 4439
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_config_first_boot_fail_closed.py",
+      "sha256": "432f767985974693437bc584b6cdb359be176dccb9418a70e1dab9b90219bb51",
+      "size": 2219
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_coordinator_http_cancel.py",
+      "sha256": "814725c427303e31a9db3203fb9842a8fecb098052f947fc1106769764e31075",
+      "size": 5936
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_cross_bundle_interruption.py",
+      "sha256": "13ab272312aba11a88f0b5d5786a477abbdd73d311043151b93dff8625604c3f",
+      "size": 2639
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_dead_leader_fast_reconcile_redis.py",
+      "sha256": "715c42c5081fd474d8b1d44cbb3b494d773b5cb9f49c56c633558f8ae70883c1",
+      "size": 6808
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_embedded_broker_visibility.py",
-      "sha256": "5757d9c6c46f756857921483546f82d5430fd87552e1cd99cf0eca7d8245d6b2",
-      "size": 37854
+      "sha256": "ca5b6024cbc593a82f9759e67e75986f931720b9b03051502d53214929716d47",
+      "size": 42544
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_evict_bundle_drain_and_owner.py",
+      "sha256": "cd7453c9dadd01cc5870007141000b92277a5522c8512e9a6293989388f54c19",
+      "size": 6388
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_export_public_source.py",
-      "sha256": "dbab097690c5e80b01ea203e0ae5cd54fc83871048583757a973281cda75903a",
-      "size": 9401
+      "sha256": "6633fb7b89781e8aee6951b02d68e4c7119fd8a65b07b0c7f75d82087520cd6d",
+      "size": 10750
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_fit_validator.py",
+      "sha256": "88ad089e3eec36f87b5b6e17038783af019403b6024d87372e505d21bcafea32",
+      "size": 7214
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_gfx_arch_detection.py",
+      "sha256": "639818b59d57b6ef855ecc069d37cbcc7193da729ec21dab4b8cc48557e82d7b",
+      "size": 3289
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_health_hygiene.py",
+      "sha256": "5e45c014635ec28af3613172fc64ca12fcdbecd643b9807a579c8be50c4fd6a0",
+      "size": 4361
     },
     {
       "disposition": "core",
@@ -693,9 +1011,87 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_idempotency_cancelled_retry.py",
+      "sha256": "f2854eb24dc2b6b2a02ae9bda318138198b66fbb4c60ead290c131eda4278fb2",
+      "size": 8439
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_idle_health.py",
+      "sha256": "754c8dcf75523200279120de96a53f4ca6240eb1fef5e6e11ef32fb59bedb57e",
+      "size": 9024
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_idle_restore_http.py",
+      "sha256": "efb3e8f652f0ad3e499e20599bbf8007b6a2cbbc3820b994d2f4aeaf6098593c",
+      "size": 27849
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_idle_ttl_release.py",
+      "sha256": "b7e2b6e30f64c71e3ccf3ee2953a9370d4e75ab6fd251ca7dd2d07666492423d",
+      "size": 10092
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_image_restore_requeue.py",
+      "sha256": "846753ecde1419ecaa177eba53fec760c33462470b1430fc51061c1c22549358",
+      "size": 3891
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_isolation.py",
       "sha256": "f56a160803eb0564cde30a510e22d3f9eeb94845055e1bb60d7ee1a8f680c57f",
       "size": 837
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_kv_affinity.py",
+      "sha256": "b182289f1eaf9be8715848f114e638217a8082a9fd9aef52cb9bc8510055557d",
+      "size": 24264
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_llm_chat_alias_gate.py",
+      "sha256": "2c8982005d7d94e6b9ea8cb7187d0a6818c0e1e777569a2e487bac7fc44eb4ba",
+      "size": 12681
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_llm_proxy_portless_members.py",
+      "sha256": "ded159da200af69d85d847fcfe4c9efcabb2dd090441b05e5b580a29fea739ed",
+      "size": 7643
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_llmchat_transport_gaps.py",
+      "sha256": "00fc49c64bb776553a38a608dd4d8194d4b637d6e8b30654a398cd7043f580be",
+      "size": 7551
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_model_validator_registry.py",
+      "sha256": "bd6c9f7376df86529d7234222e81176afdd08903fdcf0d1838a30f7501aa6953",
+      "size": 2838
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_oom_inflight_deploy.py",
+      "sha256": "d5bf12ee44b395f8f6d6d1abb1153092552860d2bd20d83d9dc9077eb4aeb0aa",
+      "size": 27616
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_oom_inflight_readiness.py",
+      "sha256": "6ae5260b90cde99a57cf8f23fcd27f91a889d94d750e7b6a3ae9f5c0b844485f",
+      "size": 6209
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_pinned_slot_release_race.py",
+      "sha256": "00ec890de964f6b6ae8182959c780ee5707a581523316e72ba4872da84d98a1f",
+      "size": 9497
     },
     {
       "disposition": "core",
@@ -705,21 +1101,69 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_preacceptance_requeue_bound.py",
+      "sha256": "e303741794e68c235cff8e81b3247c9e27846abd75f032956bca85bba5ced350",
+      "size": 9417
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_probe_health_models.py",
+      "sha256": "9f3866dabd6dae385cefa13139dbf145ad98f4d0f016fcf9b876d6aa7909ec57",
+      "size": 2069
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_proxy_admission_and_redaction.py",
+      "sha256": "8e7a89faef38af922ce6725b63254c82983a412d5daacc662d1d80efdc8b4a08",
+      "size": 10873
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_public_payload.py",
-      "sha256": "a195178967beaaba9c667256bdbdcb76cffb7d79214eb7218aec2f16d5e08b10",
-      "size": 6451
+      "sha256": "1e1f17adb3057c3b84fbcadc5242c9543498f3446d68ca8b3c0d369bbd81ff62",
+      "size": 6642
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_qc_image_inspect.py",
+      "sha256": "c26a70cd505df857289ff26391b4cea60f097b2f05ab458ed86e753527c8bbc7",
+      "size": 5226
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_queue_drain_priority.py",
+      "sha256": "d180176961d372196d347f5b2a3ae29036ad46405c47ed4e3f63e10d65806e5c",
+      "size": 3739
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_quota_wall_cloud_members.py",
+      "sha256": "ae8b97a2ba392ea3176c78c039e915ab946603cb75c18e8d2ac5f70289957df5",
+      "size": 37174
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_r139_cleanup_queue_gemma.py",
+      "sha256": "d6df493a3ee0fde9037835ae326a6eca2328946a6d6c208592b58687ecb06306",
+      "size": 3867
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_reaper_no_resurrect.py",
+      "sha256": "9eb139f63df18d89313d9947574a9fd7877a59c8ecd69878b9c98ecb7b7244df",
+      "size": 8111
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_reaper_state_and_probe.py",
-      "sha256": "0910f04ca771e0999df68f1b1909cd45f5659528800b870a8bba2fc3d71b6ff6",
-      "size": 13516
+      "sha256": "df4731aed6039f6257b859c94929468f0a9ee13bfa9064c289a4d4e18ec6490b",
+      "size": 14238
     },
     {
       "disposition": "core",
       "path": "tests/publication/test_request_safety.py",
-      "sha256": "81e108bf95161b283209f47cd6d77d946337619b8c94ea89471b5088b63a4cb3",
-      "size": 30931
+      "sha256": "b4af07401d9bb2aeed634b6b6f7693d060fa6ccf9d714de5348dfe8259b7bb9f",
+      "size": 30986
     },
     {
       "disposition": "core",
@@ -729,11 +1173,341 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_restore_relief_gaps.py",
+      "sha256": "7df74cc0f0c18bd8c0069b9c9dab8fed0b56d9bab742e813e666a6c416cd7235",
+      "size": 7208
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_retire_provider_instance.py",
+      "sha256": "daf495c758e50c6fbd6f7cb85895ee8d497ee567ed44171cbd6fa3d150726863",
+      "size": 16600
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_retired_controller_removal.py",
+      "sha256": "a7d1a0bb716680b379e0b1c2447a48ad431eaf804a3d6fb52aa802d56bcb40e4",
+      "size": 11346
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_retired_image_provider.py",
+      "sha256": "be0e19edd8065b64d26992e775ce6588fb5012fdb08f296d887628dab8434af3",
+      "size": 3050
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_scoped_gate_member_pins.py",
+      "sha256": "b0cef51e1b994727f443a8246dadb0ab883b843eed0175e1bdd651a59d16d33a",
+      "size": 53993
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_scoped_token_backends.py",
+      "sha256": "d04ca2e0c08499dbe1f9d6a61ccb80c271d46b2c93663fc61fe53ce6c7d57a35",
+      "size": 1070
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_service_catalog.py",
+      "sha256": "1c639b751f2e6062e892b4bb8a2db4cbedb60c637364db4deb03543f198251c4",
+      "size": 11753
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_source_closure.py",
       "sha256": "2e45c7beef560df90986c9d67044191bc277ce18ad74d72cfa81217f5faa7847",
       "size": 7555
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_stale_orphan_redis.py",
+      "sha256": "9ae39dec2fda99cf2a29dafca3bd9078a77e6e98a377e31e59b8d56af5796b33",
+      "size": 6856
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_stream_result_tool_calls.py",
+      "sha256": "e09345baede14a65d573cfa6d924fc5db947a2f1602193a0ebb428ecd45fce17",
+      "size": 6193
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_terminal_lease.py",
+      "sha256": "e841c4626ce518d97c57829a30134450ea13cf3a8c10ebae7445a96d9e95ad57",
+      "size": 17978
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_workflow_asset_terminal.py",
+      "sha256": "d26727523c2266ad5b4596a038fb5a59345ea1d39bfd234184585410bd815aa8",
+      "size": 17095
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_broker_router_catalog.py",
+      "sha256": "dad5c87cd9ee818127421160f5447c6f0f1ac877b761d4518fc24891ab100c17",
+      "size": 5713
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_bundle_model_binding.py",
+      "sha256": "280647000b5441843ba7649b76768b4b5187f656d4bfa3a8afc772d6ad398fb0",
+      "size": 12357
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_bundle_queue_binding.py",
+      "sha256": "fbb7dbbc8afce653a019386557c102c5928bdb31c339b731b5b12ba567fdf1a2",
+      "size": 9390
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_config_policy_binding.py",
+      "sha256": "34150b4538f6382da47dd4334d0de03af79104c0f39edaa01b0155abb66f9443",
+      "size": 11325
+    },
+    {
+      "disposition": "utility",
+      "path": "tests/test_copy_gpu_manager_state_backup.py",
+      "sha256": "8d4e2d6a7c2aa9f1fa968cdd3f387ee052bd2476c5b946cf38f89799cea79dff",
+      "size": 59514
+    },
+    {
+      "disposition": "utility",
+      "path": "tests/test_cpu_probe_busy.py",
+      "sha256": "7a4a4c8db81864e96a36aa95f00ad9736c2aeb0b9d8e90ac54e56184289f75ae",
+      "size": 13816
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_dashboard_link_row.py",
+      "sha256": "9525347e7685836b7757d137129e1a1f9ca45c9a8bccf92d7462ad98cb435271",
+      "size": 3788
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_draining_member_rejoin.py",
+      "sha256": "e99a4982fbbe793e5ee6d94d960ff347d0c59eda1172b8e7918387a621855935",
+      "size": 3500
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_enum_class_binding.py",
+      "sha256": "bebb25055c189a9b5718f05ae3782eff2e538ce95213bf06f6ade9e85dadd310",
+      "size": 25534
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_evict_only_when_idle.py",
+      "sha256": "ad03cabb4f0071b32ff0f4a16763f3855d807250883730466ea88e1fa2c94b0d",
+      "size": 13443
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_capacity_excludes_igpu.py",
+      "sha256": "73cad987e7dcbe08346dad35475134f485be6c4380d77d5e5516897377731323",
+      "size": 2442
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_guard.py",
+      "sha256": "743d444fdb3ebd1f2031c3cee1d80509162d0b9ed0a6b99759ce9c9bfaa8ab2b",
+      "size": 18552
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_guard_wiring.py",
+      "sha256": "dda81eca8b835411db68c04400f8aa2e1c59e0af48fdff9834ba80c25a7928d0",
+      "size": 12700
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_identity_annotation.py",
+      "sha256": "c28677cac16eeb9a9622d28d413e952ad820f1a2a76423ef150dd7916f6ca6ac",
+      "size": 6317
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_topology_binding.py",
+      "sha256": "8d1d6879208ea9d776c9baf102f83c285d9f1a8602d54db5a67c255dd7abec55",
+      "size": 6361
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_haiku_55_member.py",
+      "sha256": "ea0007ffdf0701a92a8097b6379a5673fd8e280437c22c3ccc40c7418d2fc3d4",
+      "size": 2601
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_idle_restart_health_port.py",
+      "sha256": "5153a58c2077e67f867e60f5cd2fb1a18e0df27a9525ca3fd49dcca4889a19bb",
+      "size": 3705
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_job_models_binding.py",
+      "sha256": "910f5c5ec418ea4d97f6c868fc6af8b3bdf451ece05950f04a7a8e39b282d7a2",
+      "size": 6315
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_memory_policy_binding.py",
+      "sha256": "b5bd83fe502e7d3ad4ae35661c4d50d3f8c9aea4dc8d4c855beea6a741083003",
+      "size": 22098
+    },
+    {
+      "disposition": "utility",
+      "path": "tests/test_mesh_host_cards.py",
+      "sha256": "9bd48bdfef6750eb09526367b42ab157f79c0c65251e25bd2992d21df0039e68",
+      "size": 8844
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_no_interrupt.py",
+      "sha256": "5e7a67913502c9fba30c032858693fe8f6012d0b34ec05007fb0ff5179629fed",
+      "size": 11518
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_detection_binding.py",
+      "sha256": "da8fed9ada591357d939746843eb1c24a36c4d1ccdea622f30ffc1d101c4852c",
+      "size": 6895
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_mcp_tools.py",
+      "sha256": "54c1511e8fb914057c14e39b21de45218fbe8fad32089d015bb3dc163ad28787",
+      "size": 14597
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_retry_binding.py",
+      "sha256": "87f8d58f42eec0095f373941363e62e8cc3fc239468371c8d930e8eb0a4edb1e",
+      "size": 9566
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_telemetry_binding.py",
+      "sha256": "847a0ce3a43451e385d8f4d26d45530b0235e3272c816a46d2cd5b95af1a0239",
+      "size": 4774
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_orphan_reaper_idle_probe.py",
+      "sha256": "93f710800c1a3276f70cab4156c9803549dfe72c5083dd661612cf8f80168c12",
+      "size": 1552
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_poll_vram_background_throttle.py",
+      "sha256": "267cfdc7676688cde8fd479b315df1906c7d4fcc93f64cc57fc63f71a79b267e",
+      "size": 7729
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_queue_engine_credential_persistence.py",
+      "sha256": "998d76c259209ba98e119d8d4b23dbc682954874009436d968225fb78b4d0fbe",
+      "size": 5447
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_reservations_binding.py",
+      "sha256": "91beb139fde24b58a6296baf6eb275a10e6c264020671d92ce8779882e014eae",
+      "size": 5808
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_runtime_state_boot_generation.py",
+      "sha256": "eac96237837cb88f8f8864dc112958fc3d8d06c995a848d2869b9410c1cb657b",
+      "size": 4048
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_scheduler_helpers_binding.py",
+      "sha256": "169a60a3d978544f6099e0cef3b9b6a37d118805cffce07d10849872a98fd92c",
+      "size": 10409
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_scheduler_state_binding.py",
+      "sha256": "0ca0220792261316f78083c9170a5fff3aa129a0114392b352c0d79ff9d6930f",
+      "size": 14049
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_service_events_binding.py",
+      "sha256": "affb98939651465a41a36937b0e828fd4d12d9e47b574ffdf85540f9b0b48e45",
+      "size": 8884
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vision_policy_fail_closed.py",
+      "sha256": "a97bb35137386ddf22939277f08a627bc81b3904207545544a414461a31a2882",
+      "size": 1611
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vram_glance_accuracy.py",
+      "sha256": "00144a11c1739f074be5d574eb9b1e8cd5af1de354640d284a685810df963c67",
+      "size": 5968
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vram_idle_poll.py",
+      "sha256": "10ae8f4fdbe588415c31235c3f78a936be9d988af8122faa512a116597881ee5",
+      "size": 3798
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vram_lifecycle_binding.py",
+      "sha256": "0932023c975a94371d904b21fcb24968f87edd2829d28b6aaa97579bf25fa1db",
+      "size": 17964
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_warm_pool_preload.py",
+      "sha256": "8cb36349e5487ace30ddd824ba199d6e0ffb02fb7e90eb2d3ce8530f3315fe98",
+      "size": 9182
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/krea2_multigpu.json",
+      "sha256": "f11b511c1f530dee14654fbd5254c99c4207ad6fc46cd9d9f3443c08f3ebb56d",
+      "size": 1676
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-benchmark.json",
+      "sha256": "fbd1d04247ada8a27a04a8ed147fb9ce95a42d936d89a514913557aaf9c18161",
+      "size": 3033
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-distorch-896-bars-masked-qualification.json",
+      "sha256": "ecac22bb48a314e8757be84d6c8bb0d44d9b48e428918e4522a192fb8bb0a2ad",
+      "size": 3725
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-distorch-896-masked-qualification.json",
+      "sha256": "28a569c563bbf566bf5a90f001fe159e5fe9a87391270bcb20c1702ba5139222",
+      "size": 3859
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-distorch-896-qualification.json",
+      "sha256": "c91f9b13efd003cc5879bc172068694b401a81474408fcd927e543407c55be07",
+      "size": 3343
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-dualgpu.json",
+      "sha256": "e7404d5c9b382610799703a95120564c09abe07a504d4864098ed200125e913a",
+      "size": 3254
     }
   ],
   "schema_version": "gpumanager.exported-files.v1",
-  "source_manifest_sha256": "99067949fea4f202f7940be6a2111396ee313ede98ed694cc253a512406c6c4d"
+  "source_manifest_sha256": "d59e93ae262d43b8fbe8fdc9aaf842df54dddf8ec9e1101bcec87e505a499f83"
 }
