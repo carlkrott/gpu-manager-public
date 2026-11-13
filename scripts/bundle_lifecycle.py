@@ -1670,4 +1670,25 @@ __all__ = [
     "TransitionAttempt",
     "TransitionGroupAttempt",
     "reduce_recovery",
+    "exclude_active_child_transitions",
 ]
+
+
+def exclude_active_child_transitions(
+    root_name: str,
+    transitions: list[tuple[str, DesiredState]],
+    *,
+    active_children: set[str],
+) -> list[tuple[str, DesiredState]]:
+    """Keep another active child out of a root's teardown transition group.
+
+    The requested root remains eligible for its own cleanup. Child ownership is
+    independent: a linked graph walk must not overwrite a child's active
+    RUNNING transition with the parent's STOPPED intent.
+    """
+    protected = set(active_children) - {root_name}
+    return [
+        (name, desired_state)
+        for name, desired_state in transitions
+        if name not in protected
+    ]

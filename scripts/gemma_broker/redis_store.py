@@ -6,15 +6,18 @@ an equivalent fenced Redis transaction without changing these public rules.
 from __future__ import annotations
 
 from collections import Counter, deque
+from itertools import islice
 from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
 from threading import RLock
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 from redis.exceptions import RedisError, ResponseError
+
+from .gate_limits import BrokerGateLimits, DEFAULT_GATE_LIMITS
 
 from .compatibility import RequestRequirements, evaluate
 from .contracts import (
@@ -43,12 +46,135 @@ def _load_lua(name: str) -> str:
 
 
 RESERVE_JOB_LUA = _load_lua("reserve_job.lua")
+# Terminal job hashes expire 30 min after they finish.
+TERMINAL_JOB_RETENTION_SECONDS = 1800
+# Queued jobs considered per dispatch pass. A pinned job whose member is full
+# stays queued in place; the pass reserves the first job in this window that
+# an eligible member can serve, so it cannot head-of-line block the queue.
+DISPATCH_WINDOW = 64
+
+
+def _window_requirements(job, requirements, requirements_for):
+    """Requirements for one queued job; None means skip it (unreadable request)."""
+    if requirements_for is None:
+        return requirements
+    try:
+        return requirements_for(job)
+    except Exception:
+        return None
+
+
+def _window_order(candidates, *, limit):
+    """Sort queued candidates by the same key as peek_next and truncate."""
+    candidates.sort(key=lambda job: (job.effective_priority, job.enqueue_sequence))
+    return candidates[:limit]
 SUBMIT_JOB_LUA = _load_lua("submit_job.lua")
 REPLACE_JOB_LUA = _load_lua("replace_job.lua")
 MEMBER_DRAIN_LUA = _load_lua("member_drain.lua")
 REPAIR_DEAD_JOB_LUA = _load_lua("repair_dead_job.lua")
 CANCEL_QUEUED_LUA = _load_lua("cancel_queued.lua")
 REQUEUE_CLAIM_LUA = _load_lua("requeue_claim.lua")
+FAIL_QUEUED_LUA = """
+-- combined-gemma.fail-queued.v1
+-- KEYS: job hash, priority queue
+-- ARGV: expected_version, new_version, record_json, job_id, terminal_state
+if redis.call('EXISTS', KEYS[1]) ~= 1 then return {err='UNKNOWN_JOB_ID'} end
+if redis.call('HGET', KEYS[1], 'state') ~= 'queued' then return {'already_not_queued'} end
+if redis.call('HGET', KEYS[1], 'state_version') ~= ARGV[1] then
+  return {err='JOB_STATE_VERSION_STALE'}
+end
+if tonumber(ARGV[2]) ~= tonumber(ARGV[1]) + 1 then return {err='JOB_STATE_VERSION_INVALID'} end
+if redis.call('ZREM', KEYS[2], ARGV[4]) ~= 1 then return {err='REDIS_STATE_UNKNOWN'} end
+redis.call('HSET', KEYS[1], 'record', ARGV[3], 'state', ARGV[5], 'state_version', ARGV[2])
+return {'terminalized'}
+"""
+REAP_TERMINAL_QUEUE_ID_LUA = """
+-- combined-gemma.reap-terminal-queue-id.v1
+-- KEYS: job hash, priority queue  ARGV: job_id
+-- Removes a queue id only when its job record is already terminal; queued
+-- and claimed jobs are never touched.
+local state = redis.call('HGET', KEYS[1], 'state')
+if state == 'completed' or state == 'failed' or state == 'cancelled'
+   or state == 'outcome_unknown' then
+  return redis.call('ZREM', KEYS[2], ARGV[1])
+end
+return 0
+"""
+_TERMINAL_JOB_STATES = frozenset(
+    {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED, JobState.OUTCOME_UNKNOWN}
+)
+TERMINALIZE_REQUEUE_CLAIM_LUA = """
+-- combined-gemma.requeue-claim-exhausted.v1
+-- KEYS: job hash, member hash, member lease set, current attempt hash
+-- ARGV: expected_job_version, new_job_version, terminal_job_json, job_id,
+--       attempt_id, expected_member_version, new_member_version,
+--       member_record_json, member_state, member_accepting,
+--       compatible_free_slots, generation_fence, failed_attempt_json,
+--       attempt_terminal_at, error_category, terminal_attempt_retention_seconds,
+--       member_name
+local expected_types = {'hash', 'hash', 'set', 'hash'}
+if redis.call('EXISTS', KEYS[1]) ~= 1 then
+  return {err='UNKNOWN_JOB_ID'}
+end
+if redis.call('EXISTS', KEYS[2]) ~= 1 then
+  return {err='UNKNOWN_MEMBER'}
+end
+if redis.call('EXISTS', KEYS[4]) ~= 1 then
+  return {err='UNKNOWN_ATTEMPT_ID'}
+end
+for i = 1, #KEYS do
+  if redis.call('TYPE', KEYS[i]).ok ~= expected_types[i] then
+    return {err='REQUEUE_STATE_TYPE_INVALID'}
+  end
+end
+if not tonumber(ARGV[1]) or tonumber(ARGV[2]) ~= tonumber(ARGV[1]) + 1
+   or not tonumber(ARGV[6]) or tonumber(ARGV[7]) ~= tonumber(ARGV[6]) + 1
+   or not tonumber(ARGV[11]) or not tonumber(ARGV[12])
+   or not tonumber(ARGV[14]) or not tonumber(ARGV[16])
+   or tonumber(ARGV[16]) <= 0 then
+  return {err='REQUEUE_ARGUMENT_INVALID'}
+end
+if redis.call('HGET', KEYS[1], 'state_version') ~= ARGV[1] then
+  return {err='JOB_STATE_VERSION_STALE'}
+end
+local job_state = redis.call('HGET', KEYS[1], 'state')
+if job_state ~= 'claimed' and job_state ~= 'accepted' and job_state ~= 'in_flight' then
+  return {err='REQUEUE_INVALID_STATE'}
+end
+if redis.call('HGET', KEYS[1], 'accepted_boundary_crossed') == '1' then
+  return {err='CANCEL_UNSAFE_AFTER_ACCEPTANCE'}
+end
+if redis.call('HGET', KEYS[1], 'current_attempt_id') ~= ARGV[5]
+   or redis.call('HGET', KEYS[1], 'selected_member') ~= ARGV[17] then
+  return {err='ATTEMPT_STATE_STALE'}
+end
+if redis.call('HGET', KEYS[2], 'state_version') ~= ARGV[6] then
+  return {err='RESERVATION_STATE_STALE'}
+end
+if redis.call('HGET', KEYS[4], 'state') ~= 'reserved'
+   or redis.call('HGET', KEYS[4], 'job_id') ~= ARGV[4]
+   or redis.call('HGET', KEYS[4], 'member_name') ~= ARGV[17] then
+  return {err='ATTEMPT_STATE_STALE'}
+end
+if redis.call('SISMEMBER', KEYS[3], ARGV[5]) ~= 1 then
+  return {err='LEASE_NOT_OWNED'}
+end
+
+-- All identity, state, type, and numeric preconditions are checked before the
+-- first write: Lua runtime errors do not roll back preceding Redis mutations.
+redis.call('HSET', KEYS[1],
+  'record', ARGV[3], 'state', 'failed', 'state_version', ARGV[2])
+redis.call('HSET', KEYS[2],
+  'record', ARGV[8], 'state', ARGV[9], 'accepting', ARGV[10],
+  'compatible_free_slots', ARGV[11], 'state_version', ARGV[7],
+  'generation_fence', ARGV[12])
+redis.call('SREM', KEYS[3], ARGV[5])
+redis.call('HSET', KEYS[4],
+  'record', ARGV[13], 'state', 'failed',
+  'terminal_at', ARGV[14], 'error_category', ARGV[15])
+redis.call('EXPIRE', KEYS[4], tonumber(ARGV[16]))
+return {'terminalized', ARGV[4]}
+"""
 REFRESH_MEMBER_MIRROR_LUA = """
 -- combined-gemma.member-refresh.v1
 -- KEYS: member lease set, member hash
@@ -188,6 +314,36 @@ def _derive_compatible_free_slots(
     return min(configured, backend_free, dispatcher_free)
 
 
+def _released_capacity_state(current: MemberSnapshot, free_slots: int) -> dict[str, Any]:
+    """Restore lifecycle readiness a lease release freed.
+
+    ``ready_busy`` is the capacity-only state ``reduce_member_readiness``
+    publishes while every slot is leased; it is not a lifecycle transition.
+    Recomputing ``compatible_free_slots`` alone therefore left the member at
+    ``ready_busy``/``accepting=False`` with a free slot, and a pinned submit
+    arriving before the next readiness tick was refused.
+
+    Only a capacity-only ``ready_busy`` member is promoted, and only back to
+    ``ready_accepting`` when capacity is actually proved free. Lifecycle
+    states (``draining``, ``unhealthy``, ``offline``, ``faulted``) and any
+    member still carrying a non-capacity blocker are left exactly as they are,
+    so an unavailable member is never reopened by a release.
+    """
+    if current.state is not MemberState.READY_BUSY:
+        return {}
+    reasons = {getattr(code, "value", code) for code in (current.reason_codes or ())}
+    if reasons - {ReasonCode.MEMBER_NO_CAPACITY.value}:
+        return {}
+    if int(free_slots or 0) <= 0:
+        return {}
+    return {
+        "state": MemberState.READY_ACCEPTING,
+        "accepting": True,
+        "reason_codes": (),
+        "blockers": (),
+    }
+
+
 def effective_priority(
     base_priority: Priority | int,
     *,
@@ -203,6 +359,24 @@ def effective_priority(
     return max(int(Priority.INTERACTIVE), base - (10 * tiers))
 
 
+def _cancelled_before_acceptance(job: JobRecord) -> bool:
+    """True when ``job`` was cancelled without ever crossing the boundary.
+
+    This is the exact predicate ``submit_job.lua`` applies to the stored
+    record, so the in-memory repository and the Redis EVAL decide a same-key
+    retry identically. ``accepted_boundary_crossed`` is set by the dispatcher's
+    on-accepted path (dispatcher.py) and by ``api.accept_for_test``; the
+    post-acceptance cancel writes reason_code
+    ``CANCELLED_AFTER_ACCEPTANCE`` and always keeps the flag set, so it can
+    never be mistaken for a pre-acceptance cancel here.
+
+    shortcut: reads the job record only, so a cancel that raced the accepted
+    boundary is judged by whichever state was stored last. Upgrade to an
+    explicit accepted_at comparison when the boundary needs its own audit row.
+    """
+    return job.state is JobState.CANCELLED and not job.accepted_boundary_crossed
+
+
 class InMemoryJobRepository:
     """Thread-safe semantic reference for priority/FIFO and idempotency."""
 
@@ -212,10 +386,12 @@ class InMemoryJobRepository:
         available: bool = True,
         aging_seconds: float = 300.0,
         terminal_notifier=None,
+        gate_limits=None,
     ):
         self.available = available
         self.aging_seconds = aging_seconds
         self._terminal_notifier = terminal_notifier
+        self._gate_limits = gate_limits
         self._lock = RLock()
         self._jobs: dict[str, JobRecord] = {}
         self._queues: dict[Priority, deque[str]] = {priority: deque() for priority in Priority}
@@ -285,7 +461,21 @@ class InMemoryJobRepository:
                 prior_job_id, prior_hash = prior
                 if prior_hash != job.request_sha256:
                     raise ContractError(ReasonCode.IDEMPOTENCY_KEY_REUSED.value)
-                return self._jobs[prior_job_id]
+                prior_job = self._jobs.get(prior_job_id)
+                if prior_job is None:
+                    raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
+                # Mirror submit_job.lua: a prior job CANCELLED before it
+                # crossed the accepted boundary never ran, so the retry the
+                # 504 compatibility_timeout (retry_safe=true) promised is still
+                # available. Drop the mapping and fall through to create the
+                # new job; accepted / in-flight / completed jobs and jobs
+                # cancelled AFTER acceptance keep replaying. Held under
+                # self._lock, so this is the single compare-and-set the Redis
+                # EVAL performs: two concurrent retries make exactly one job.
+                if _cancelled_before_acceptance(prior_job):
+                    del self._idempotency[key]
+                else:
+                    return prior_job
             if job.job_id in self._jobs:
                 raise ContractError(f"DUPLICATE_JOB_ID:{job.job_id}")
             stored = replace(job, effective_priority=int(job.base_priority))
@@ -330,19 +520,51 @@ class InMemoryJobRepository:
                 ),
             )
 
+    def peek_window(self, *, now: float, limit: int = DISPATCH_WINDOW) -> list[JobRecord]:
+        """First ``limit`` queued jobs in dispatch order (priority, aging, FIFO)."""
+        self._require_available()
+        with self._lock:
+            candidates: list[JobRecord] = []
+            for queue in self._queues.values():
+                for job_id in [
+                    job_id for job_id in islice(queue, limit)
+                    if self._jobs[job_id].state in _TERMINAL_JOB_STATES
+                ]:
+                    queue.remove(job_id)
+                for job_id in islice(queue, limit):
+                    job = self._jobs[job_id]
+                    if job.state is not JobState.QUEUED:
+                        continue
+                    candidates.append(
+                        replace(
+                            job,
+                            effective_priority=effective_priority(
+                                job.base_priority,
+                                submitted_at=job.submitted_at,
+                                now=now,
+                                aging_seconds=self.aging_seconds,
+                            ),
+                        )
+                    )
+            return _window_order(candidates, limit=limit)
+
     def reserve_next(
         self,
         *,
         now: float,
         ordered_members: list[MemberSnapshot],
-        requirements: RequestRequirements,
+        requirements: RequestRequirements | None = None,
         member_lookup: Callable[[str], MemberSnapshot] | None = None,
         leader_owner: str | None = None,
         fencing_token: int | None = None,
         backend_url: str | None = None,
+        requirements_for: Callable[[JobRecord], RequestRequirements] | None = None,
     ) -> Reservation | None:
-        """Select queue head and member, then commit both under one lock.
+        """Reserve the first windowed job that an eligible member can serve.
 
+        ``requirements_for`` gives each queued job its own requirements (pin,
+        capabilities); without it only the queue head is considered, with
+        ``requirements``. A job whose member is full stays queued in place.
         The optional lookup models the Redis commit-time state-version re-read.
         Any mismatch leaves the job in its original queue.
 
@@ -353,70 +575,92 @@ class InMemoryJobRepository:
         so it accepts and ignores them. Tests that pass these kwargs
         therefore work against both implementations.
         """
+        if requirements is None and requirements_for is None:
+            raise ValueError("reserve_next needs requirements or requirements_for")
         self._require_available()
         with self._lock:
-            selected = self.peek_next(now=now)
-            if selected is None:
-                return None
-            member = next(
-                (
-                    candidate
-                    for candidate in ordered_members
-                    if candidate.state is MemberState.READY_ACCEPTING
-                    and candidate.accepting
-                    and (candidate.compatible_free_slots or 0) > 0
-                    and evaluate(requirements, candidate).compatible
-                ),
-                None,
+            stale_seen = False
+            window = self.peek_window(
+                now=now, limit=DISPATCH_WINDOW if requirements_for else 1
             )
-            if member is None:
-                return None
-            current = member_lookup(member.name) if member_lookup else member
-            live_leases = len(self._leases.get(current.name, set()))
-            configured_slots = int(current.configured_slots or 0)
-            if configured_slots <= 0 or live_leases >= configured_slots:
-                raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value)
-            if (
-                current.state_version != member.state_version
-                or current.state is not MemberState.READY_ACCEPTING
-                or not current.accepting
-                or (current.compatible_free_slots or 0) <= 0
-            ):
-                raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value)
-
-            queue = self._queues[selected.base_priority]
-            if not queue or queue[0] != selected.job_id:
-                raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value)
-            queue.popleft()
-            claimed = replace(
-                self._jobs[selected.job_id],
-                state=JobState.CLAIMED,
-                selected_member=member.name,
-                member_state_version=member.state_version,
-                attempt_count=self._jobs[selected.job_id].attempt_count + 1,
-                current_attempt_id=str(uuid4()),
-                queue_claimed_at=now,
-                effective_priority=selected.effective_priority,
-                state_version=self._jobs[selected.job_id].state_version + 1,
-            )
-            self._jobs[claimed.job_id] = claimed
-            # Mirror the Lua reserve_job.lua's SADD to the lease set so the
-            # terminal-release path can find and remove the attempt.
-            attempt_id: str = claimed.current_attempt_id or ""
-            self._leases.setdefault(member.name, set()).add(attempt_id)
-            reserved_member = replace(
-                current,
-                dispatcher_leases=live_leases + 1,
-                compatible_free_slots=max(
-                    0,
-                    min(
-                        configured_slots - live_leases - 1,
-                        (current.compatible_free_slots or 0) - 1,
+            for selected in window:
+                job_requirements = _window_requirements(
+                    selected, requirements, requirements_for
+                )
+                if job_requirements is None:
+                    continue
+                member = next(
+                    (
+                        candidate
+                        for candidate in ordered_members
+                        if candidate.state is MemberState.READY_ACCEPTING
+                        and candidate.accepting
+                        and (candidate.compatible_free_slots or 0) > 0
+                        and evaluate(job_requirements, candidate).compatible
                     ),
+                    None,
+                )
+                if member is None:
+                    continue
+                current = member_lookup(member.name) if member_lookup else member
+                live_leases = len(self._leases.get(current.name, set()))
+                configured_slots = int(current.configured_slots or 0)
+                if configured_slots <= 0 or live_leases >= configured_slots:
+                    stale_seen = True
+                    continue
+                if (
+                    current.state_version != member.state_version
+                    or current.state is not MemberState.READY_ACCEPTING
+                    or not current.accepting
+                    or (current.compatible_free_slots or 0) <= 0
+                ):
+                    stale_seen = True
+                    continue
+                queue = self._queues[selected.base_priority]
+                if selected.job_id not in queue:
+                    stale_seen = True
+                    continue
+                return self._commit_reservation(
+                    selected, member, current, live_leases, configured_slots, queue, now
+                )
+            if stale_seen:
+                raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value)
+            return None
+
+    def _commit_reservation(
+        self, selected, member, current, live_leases, configured_slots, queue, now
+    ) -> Reservation:
+        """Claim ``selected`` onto ``member``; caller holds the lock and has checked state."""
+        queue.remove(selected.job_id)
+        claimed = replace(
+            self._jobs[selected.job_id],
+            state=JobState.CLAIMED,
+            selected_member=member.name,
+            member_state_version=member.state_version,
+            attempt_count=self._jobs[selected.job_id].attempt_count + 1,
+            current_attempt_id=str(uuid4()),
+            queue_claimed_at=now,
+            effective_priority=selected.effective_priority,
+            state_version=self._jobs[selected.job_id].state_version + 1,
+        )
+        self._jobs[claimed.job_id] = claimed
+        # Mirror the Lua reserve_job.lua's SADD to the lease set so the
+        # terminal-release path can find and remove the attempt.
+        attempt_id: str = claimed.current_attempt_id or ""
+        self._leases.setdefault(member.name, set()).add(attempt_id)
+        reserved_member = replace(
+            current,
+            dispatcher_leases=live_leases + 1,
+            compatible_free_slots=max(
+                0,
+                min(
+                    configured_slots - live_leases - 1,
+                    (current.compatible_free_slots or 0) - 1,
                 ),
-            )
-            self._members[member.name] = reserved_member
-            return Reservation(job=claimed, member=reserved_member)
+            ),
+        )
+        self._members[member.name] = reserved_member
+        return Reservation(job=claimed, member=reserved_member)
 
     def put_member(self, member: MemberSnapshot) -> MemberSnapshot:
         self._require_available()
@@ -640,6 +884,7 @@ class InMemoryJobRepository:
                     current,
                     dispatcher_leases=live_count,
                     compatible_free_slots=free_slots,
+                    **_released_capacity_state(current, free_slots),
                 )
             self._members[member_name] = updated
             return updated
@@ -748,6 +993,25 @@ class InMemoryJobRepository:
             self._notify_terminal(cancelled.job_id)
             return cancelled
 
+    def fail_queued(self, job: JobRecord) -> JobRecord:
+        """Store a terminal record for a QUEUED job and drop it from its queue."""
+        self._require_available()
+        with self._lock:
+            current = self._jobs.get(job.job_id)
+            if current is None:
+                raise ContractError(f"UNKNOWN_JOB_ID:{job.job_id}")
+            if current.state is not JobState.QUEUED:
+                return current
+            if job.state_version != current.state_version + 1:
+                raise ReservationStale("JOB_STATE_VERSION_STALE")
+            try:
+                self._queues[current.base_priority].remove(job.job_id)
+            except ValueError:
+                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
+            self._jobs[job.job_id] = job
+            self._notify_terminal(job.job_id)
+            return job
+
     def replace_job(self, job: JobRecord) -> JobRecord:
         self._require_available()
         with self._lock:
@@ -769,8 +1033,9 @@ class InMemoryJobRepository:
         *,
         reason: ReasonCode,
         terminal_at: float | None = None,
+        error: str | None = None,
     ) -> JobRecord:
-        del terminal_at  # Redis persists attempt timing; this oracle tracks job semantics.
+        del terminal_at  # The in-memory oracle has no durable attempt ledger.
         self._require_available()
         with self._lock:
             current = self._jobs.get(job.job_id)
@@ -780,6 +1045,53 @@ class InMemoryJobRepository:
                 raise ContractError(f"REQUEUE_INVALID_STATE:{current.state.value}")
             if current.accepted_boundary_crossed:
                 raise ContractError(ReasonCode.CANCEL_UNSAFE_AFTER_ACCEPTANCE.value)
+            exhausted = False
+            # Enforce the explicit pre-acceptance requeue budget before another
+            # dispatch cycle can be queued.
+            if reason is ReasonCode.PRE_ACCEPTANCE_REQUEUE:
+                limits = (
+                    self._gate_limits
+                    if self._gate_limits is not None
+                    else DEFAULT_GATE_LIMITS
+                )
+                if not isinstance(limits, BrokerGateLimits):
+                    limits = DEFAULT_GATE_LIMITS
+                exhausted = (
+                    current.pre_acceptance_requeue_count
+                    >= limits.pre_acceptance_requeue_limit
+                )
+            attempt_id = current.current_attempt_id
+            if exhausted:
+                member_name = current.selected_member or ""
+                leases = self._leases.get(member_name, set())
+                member = self._members.get(member_name)
+                if (
+                    not attempt_id
+                    or not member_name
+                    or member is None
+                    or attempt_id not in leases
+                ):
+                    raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
+                terminal = replace(
+                    current,
+                    state=JobState.FAILED,
+                    reason_code=ReasonCode.PRE_ACCEPTANCE_REQUEUE_EXHAUSTED,
+                    error=error,
+                    state_version=current.state_version + 1,
+                )
+                self._jobs[terminal.job_id] = terminal
+                leases.discard(attempt_id)
+                self._members[member_name] = replace(
+                    member,
+                    dispatcher_leases=max(0, member.dispatcher_leases - 1),
+                    compatible_free_slots=min(
+                        member.configured_slots,
+                        (member.compatible_free_slots or 0) + 1,
+                    ),
+                    state_version=member.state_version + 1,
+                )
+                self._notify_terminal(terminal.job_id)
+                return terminal
             queued = replace(
                 current,
                 state=JobState.QUEUED,
@@ -789,7 +1101,11 @@ class InMemoryJobRepository:
                 queue_claimed_at=None,
                 forward_started_at=None,
                 reason_code=reason,
-                error=None,
+                error=error,
+                # Track PRE_ACCEPTANCE_REQUEUE cycles explicitly so the budget
+                # is decoupled from attempt_count (which is also incremented by
+                # reserve_next on each new dispatch cycle).
+                pre_acceptance_requeue_count=current.pre_acceptance_requeue_count + 1,
                 state_version=current.state_version + 1,
             )
             self._jobs[queued.job_id] = queued
@@ -830,6 +1146,7 @@ class RedisJobRepository:
         terminal_attempt_retention_seconds: int = 604800,
         terminal_notifier=None,
         leadership_clock: Callable[[], float] | None = None,
+        gate_limits=None,
     ):
         if not prefix or not prefix.endswith(":"):
             raise ValueError("Redis repository prefix must be non-empty and end with ':'")
@@ -845,11 +1162,19 @@ class RedisJobRepository:
         )
         self._terminal_notifier = terminal_notifier
         self._leadership_clock = leadership_clock
+        self._gate_limits = gate_limits
+        self.last_minted_leadership: tuple[int, str, int] | None = None
 
     def set_terminal_notifier(self, notifier) -> None:
         self._terminal_notifier = notifier
 
     def _notify_terminal(self, job_id: str) -> None:
+        # Finished jobs carry the full request body (~130 KB); keep them only
+        # long enough for callers to read the result, then let Valkey drop them.
+        try:
+            self.client.expire(self._job_key(job_id), TERMINAL_JOB_RETENTION_SECONDS)
+        except RedisError:
+            pass
         notifier = self._terminal_notifier
         notify = getattr(notifier, "notify_terminal", None)
         if callable(notify):
@@ -917,7 +1242,16 @@ class RedisJobRepository:
             raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
         except RedisError as exc:
             raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
-        return int(self._text(result[0]))
+        token = int(self._text(result[0]))
+        if len(result) >= 4:
+            # (new token, superseded owner, superseded token) of a fresh mint.
+            prev_token = self._text(result[3])
+            self.last_minted_leadership = (
+                token,
+                self._text(result[2]),
+                int(prev_token) if prev_token.isdigit() else 0,
+            )
+        return token
 
     def renew_leadership(
         self,
@@ -1084,6 +1418,7 @@ class RedisJobRepository:
                 stored.request_sha256, stored.job_id,
                 self._json(stored.to_dict()), stored.enqueue_sequence,
                 stored.state_version,
+                f"{self.prefix}job:",
             )
         except ResponseError as exc:
             message = str(exc)
@@ -1151,6 +1486,31 @@ class RedisJobRepository:
                 now=now, aging_seconds=self.aging_seconds,
             ),
         )
+
+    def peek_window(self, *, now: float, limit: int = DISPATCH_WINDOW) -> list[JobRecord]:
+        """First ``limit`` queued jobs in dispatch order, read from each priority zset."""
+        candidates: list[JobRecord] = []
+        for priority in Priority:
+            rows = self._redis(
+                lambda key=self._queue_key(priority): self.client.zrange(key, 0, limit - 1)
+            )
+            for row in rows:
+                job = self.get(self._text(row))
+                if job is not None and job.state in _TERMINAL_JOB_STATES:
+                    self._reap_terminal_queue_id(job.job_id, self._queue_key(priority))
+                    continue
+                if job is None or job.state is not JobState.QUEUED:
+                    continue
+                candidates.append(
+                    replace(
+                        job,
+                        effective_priority=effective_priority(
+                            job.base_priority, submitted_at=job.submitted_at,
+                            now=now, aging_seconds=self.aging_seconds,
+                        ),
+                    )
+                )
+        return _window_order(candidates, limit=limit)
 
     def put_member(self, member: MemberSnapshot) -> MemberSnapshot:
         # Only the runtime's view of readiness is mirrored here. Lua reservation
@@ -1572,6 +1932,11 @@ class RedisJobRepository:
                 state_version=current.state_version + 1,
             )
         else:
+            # ``compatible_free_slots`` is a placeholder here: Lua recomputes
+            # ``free`` from the live lease set after the SREM, and is the only
+            # place that knows the post-release value. The capacity-only
+            # ``ready_busy`` -> ``ready_accepting`` promotion therefore happens
+            # inside member_drain.lua against that recomputed value.
             updated = replace(
                 current,
                 dispatcher_leases=0,
@@ -1679,119 +2044,158 @@ class RedisJobRepository:
         *,
         now: float,
         ordered_members: list[MemberSnapshot],
-        requirements: RequestRequirements,
+        requirements: RequestRequirements | None = None,
         leader_owner: str,
         fencing_token: int,
         backend_url: str | None = None,
         member_lookup: Callable[[str], MemberSnapshot] | None = None,
+        requirements_for: Callable[[JobRecord], RequestRequirements] | None = None,
     ) -> Reservation | None:
-        selected = self.peek_next(now=now)
-        if selected is None:
-            return None
-        # The readiness snapshot is advisory at reservation time. Redis is
-        # authoritative for each member's state/capacity inside the Lua
-        # transaction. In particular, a burst can consume a member's real
-        # free slots before the next readiness refresh updates this Python
-        # snapshot. Do not let that stale first member strand the queue head:
-        # try every ordered compatible member and let the atomic claim decide
-        # which one is currently reservable.
-        candidates = [
-            candidate
-            for candidate in ordered_members
-            if candidate.accepting and evaluate(requirements, candidate).compatible
-        ]
-        if not candidates:
-            return None
+        """Reserve the first windowed job that an eligible member can serve.
+
+        The readiness snapshot is advisory at reservation time. Redis is
+        authoritative for each member's state/capacity inside the Lua
+        transaction, so every compatible member is tried in order for each
+        windowed job and the atomic claim decides which one is reservable.
+        A pinned job whose member is full is skipped and stays queued in
+        place; it cannot strand the jobs behind it. ``requirements_for``
+        gives each job its own requirements; without it only the queue head
+        is considered, with ``requirements``.
+        """
+        if requirements is None and requirements_for is None:
+            raise ValueError("reserve_next needs requirements or requirements_for")
+        if requirements_for is None:
+            # Legacy single-requirements callers keep head-only semantics.
+            head = self.peek_next(now=now)
+            window = [] if head is None else [head]
+        else:
+            window = self.peek_window(now=now, limit=DISPATCH_WINDOW)
         reservation_stale_seen = False
-        for member in candidates:
-            attempt_id = str(uuid4())
-            claimed = replace(
-                selected,
-                state=JobState.CLAIMED,
-                selected_member=member.name,
-                member_state_version=member.state_version,
-                attempt_count=selected.attempt_count + 1,
-                current_attempt_id=attempt_id,
-                queue_claimed_at=now,
-                state_version=selected.state_version + 1,
-            )
-            reserved_member = replace(
-                member,
-                dispatcher_leases=member.dispatcher_leases + 1,
-                compatible_free_slots=max(0, (member.compatible_free_slots or 0) - 1),
-            )
-            attempt = AttemptRecord(
-                attempt_id=attempt_id,
-                job_id=selected.job_id,
-                member_name=member.name,
-                reservation_fence=fencing_token,
-                backend_url=backend_url or f"member://{member.name}",
-                state=AttemptState.RESERVED,
-                reserved_at=now,
-            )
-            keys = (
-                self._job_key(selected.job_id),
-                self._queue_key(selected.base_priority),
-                self._member_key(member.name),
-                self._lease_key(member.name),
-                self._leader_key(),
-                self._attempt_key(attempt_id),
-            )
-            leadership_now = (
-                float(self._leadership_clock())
-                if self._leadership_clock
-                else now
-            )
-            try:
-                self.client.eval(
-                    RESERVE_JOB_LUA, len(keys), *keys,
-                    selected.job_id, member.name, member.state_version, now, attempt_id,
-                    self._json(claimed.to_dict()), self._json(reserved_member.to_dict()),
-                    leader_owner, fencing_token, selected.state_version,
-                    self._json(attempt.to_dict()), leadership_now,
+        for selected in window:
+            job_requirements = _window_requirements(selected, requirements, requirements_for)
+            if job_requirements is None:
+                continue
+            candidates = [
+                candidate
+                for candidate in ordered_members
+                if candidate.accepting and evaluate(job_requirements, candidate).compatible
+            ]
+            for member in candidates:
+                outcome = self._claim_on_member(
+                    selected, member, now=now, fencing_token=fencing_token,
+                    leader_owner=leader_owner, backend_url=backend_url,
                 )
-            except ResponseError as exc:
-                message = str(exc)
-                # Candidate staleness is expected under contention. The
-                # dispatch loop owns the rate-limited operator warning and
-                # cumulative counter; retain candidate detail at debug level.
-                import logging
-                logging.getLogger("gemma_broker.redis_store").debug(
-                    "RESERVE_JOB_LUA err=%s job_id=%s member=%s",
-                    message, selected.job_id, member.name,
-                )
-                if "DISPATCHER_FENCE_STALE" in message:
-                    raise LeadershipLost("DISPATCHER_FENCE_STALE") from exc
-                if "RESERVATION_MEMBER_VERSION_STALE" in message:
-                    # Do not spill to a slower member solely because the
-                    # preferred member changed between the authoritative view
-                    # and Lua. The dispatch loop's bounded stale backoff will
-                    # re-read the entire ordered list on the next tick.
-                    raise ReservationStale(
-                        ReasonCode.RESERVATION_STATE_STALE.value
-                    ) from exc
-                if (
-                    "RESERVATION_MEMBER_UNAVAILABLE" in message
-                    or "RESERVATION_STATE_STALE" in message
-                ):
-                    # This member has no atomically proved capacity. It is not
-                    # a queue-head failure; continue to the next ordered member.
+                if isinstance(outcome, Reservation):
+                    return outcome
+                if outcome == "member_stale":
                     reservation_stale_seen = True
                     continue
-                if "QUEUE_HEAD_STALE" in message:
-                    raise ReservationStale("QUEUE_HEAD_STALE") from exc
-                if "JOB_STATE_VERSION_STALE" in message or "ATTEMPT_EXISTS" in message:
-                    raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value) from exc
-                if "JOB_NOT_QUEUED" in message or "QUEUE_CLAIM_CONFLICT" in message:
-                    return None
-                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
-            except RedisError as exc:
-                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
-            return Reservation(job=claimed, member=reserved_member, attempt=attempt)
-
+                if outcome == "job_raced":
+                    # The job left the queue under us; try the next windowed job.
+                    break
         if reservation_stale_seen:
             raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value)
         return None
+
+    def _claim_on_member(
+        self,
+        selected: JobRecord,
+        member: MemberSnapshot,
+        *,
+        now: float,
+        fencing_token: int,
+        leader_owner: str,
+        backend_url: str | None,
+    ) -> "Reservation | str":
+        """One atomic claim of ``selected`` onto ``member``.
+
+        Returns the Reservation, ``"member_stale"`` when this member has no
+        atomically proved capacity (try the next member), or ``"job_raced"``
+        when the job is no longer queued (try the next windowed job).
+        """
+        attempt_id = str(uuid4())
+        claimed = replace(
+            selected,
+            state=JobState.CLAIMED,
+            selected_member=member.name,
+            member_state_version=member.state_version,
+            attempt_count=selected.attempt_count + 1,
+            current_attempt_id=attempt_id,
+            queue_claimed_at=now,
+            state_version=selected.state_version + 1,
+        )
+        reserved_member = replace(
+            member,
+            dispatcher_leases=member.dispatcher_leases + 1,
+            compatible_free_slots=max(0, (member.compatible_free_slots or 0) - 1),
+        )
+        attempt = AttemptRecord(
+            attempt_id=attempt_id,
+            job_id=selected.job_id,
+            member_name=member.name,
+            reservation_fence=fencing_token,
+            backend_url=backend_url or f"member://{member.name}",
+            state=AttemptState.RESERVED,
+            reserved_at=now,
+        )
+        keys = (
+            self._job_key(selected.job_id),
+            self._queue_key(selected.base_priority),
+            self._member_key(member.name),
+            self._lease_key(member.name),
+            self._leader_key(),
+            self._attempt_key(attempt_id),
+        )
+        leadership_now = (
+            float(self._leadership_clock())
+            if self._leadership_clock
+            else now
+        )
+        try:
+            self.client.eval(
+                RESERVE_JOB_LUA, len(keys), *keys,
+                selected.job_id, member.name, member.state_version, now, attempt_id,
+                self._json(claimed.to_dict()), self._json(reserved_member.to_dict()),
+                leader_owner, fencing_token, selected.state_version,
+                self._json(attempt.to_dict()), leadership_now,
+            )
+        except ResponseError as exc:
+            message = str(exc)
+            # Candidate staleness is expected under contention. The
+            # dispatch loop owns the rate-limited operator warning and
+            # cumulative counter; retain candidate detail at debug level.
+            import logging
+            logging.getLogger("gemma_broker.redis_store").debug(
+                "RESERVE_JOB_LUA err=%s job_id=%s member=%s",
+                message, selected.job_id, member.name,
+            )
+            if "DISPATCHER_FENCE_STALE" in message:
+                raise LeadershipLost("DISPATCHER_FENCE_STALE") from exc
+            if "RESERVATION_MEMBER_VERSION_STALE" in message:
+                # Do not spill to a slower member solely because the
+                # preferred member changed between the authoritative view
+                # and Lua. The dispatch loop's bounded stale backoff will
+                # re-read the entire ordered list on the next tick.
+                raise ReservationStale(
+                    ReasonCode.RESERVATION_STATE_STALE.value
+                ) from exc
+            if (
+                "RESERVATION_MEMBER_UNAVAILABLE" in message
+                or "RESERVATION_STATE_STALE" in message
+            ):
+                # This member has no atomically proved capacity. It is not
+                # a queue failure; the caller continues to the next member.
+                return "member_stale"
+            if "QUEUE_MEMBERSHIP_STALE" in message:
+                return "job_raced"
+            if "JOB_STATE_VERSION_STALE" in message or "ATTEMPT_EXISTS" in message:
+                raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value) from exc
+            if "JOB_NOT_QUEUED" in message or "QUEUE_CLAIM_CONFLICT" in message:
+                return "job_raced"
+            raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
+        except RedisError as exc:
+            raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
+        return Reservation(job=claimed, member=reserved_member, attempt=attempt)
 
     def cancel_queued(self, job_id: str, *, completed_at: float) -> JobRecord:
         current = self.get(job_id)
@@ -1834,12 +2238,57 @@ class RedisJobRepository:
         self._notify_terminal(cancelled.job_id)
         return cancelled
 
+    def fail_queued(self, job: JobRecord) -> JobRecord:
+        """Store a terminal record for a QUEUED job and ZREM it in one script."""
+        current = self.get(job.job_id)
+        if current is None:
+            raise ContractError(f"UNKNOWN_JOB_ID:{job.job_id}")
+        if current.state is not JobState.QUEUED:
+            return current
+        try:
+            result = self.client.eval(
+                FAIL_QUEUED_LUA,
+                2,
+                self._job_key(job.job_id),
+                self._queue_key(current.base_priority),
+                current.state_version,
+                job.state_version,
+                self._json(job.to_dict()),
+                job.job_id,
+                job.state.value,
+            )
+        except ResponseError as exc:
+            message = str(exc)
+            if "UNKNOWN_JOB_ID" in message:
+                raise ContractError(f"UNKNOWN_JOB_ID:{job.job_id}") from exc
+            if "JOB_STATE_VERSION_STALE" in message or "JOB_STATE_VERSION_INVALID" in message:
+                raise ReservationStale("JOB_STATE_VERSION_STALE") from exc
+            raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
+        except RedisError as exc:
+            raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
+        outcome = self._text(result[0])
+        if outcome == "already_not_queued":
+            return self.get(job.job_id) or current
+        if outcome != "terminalized":
+            raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
+        self._notify_terminal(job.job_id)
+        return job
+
+    def _reap_terminal_queue_id(self, job_id: str, queue_key: str) -> None:
+        """Drop a terminal job id left in the zset it was read from (gauge-only orphan)."""
+        self._redis(
+            lambda: self.client.eval(
+                REAP_TERMINAL_QUEUE_ID_LUA, 2, self._job_key(job_id), queue_key, job_id,
+            )
+        )
+
     def requeue_claim(
         self,
         job: JobRecord,
         *,
         reason: ReasonCode,
         terminal_at: float | None = None,
+        error: str | None = None,
     ) -> JobRecord:
         current = self.get(job.job_id)
         if current is None:
@@ -1848,6 +2297,21 @@ class RedisJobRepository:
             raise ContractError(f"REQUEUE_INVALID_STATE:{current.state.value}")
         if current.accepted_boundary_crossed:
             raise ContractError(ReasonCode.CANCEL_UNSAFE_AFTER_ACCEPTANCE.value)
+        exhausted = False
+        # Enforce the explicit pre-acceptance requeue budget before another
+        # dispatch cycle can be queued.
+        if reason is ReasonCode.PRE_ACCEPTANCE_REQUEUE:
+            limits = (
+                self._gate_limits
+                if self._gate_limits is not None
+                else DEFAULT_GATE_LIMITS
+            )
+            if not isinstance(limits, BrokerGateLimits):
+                limits = DEFAULT_GATE_LIMITS
+            exhausted = (
+                current.pre_acceptance_requeue_count
+                >= limits.pre_acceptance_requeue_limit
+            )
         attempt_id = current.current_attempt_id
         if not attempt_id:
             raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
@@ -1866,6 +2330,81 @@ class RedisJobRepository:
             error_category=reason,
             transition_history=(*attempt.transition_history, AttemptState.FAILED.value),
         )
+        if exhausted:
+            member_name = current.selected_member or ""
+            if (
+                not member_name
+                or attempt.state is not AttemptState.RESERVED
+                or attempt.job_id != current.job_id
+                or attempt.member_name != member_name
+            ):
+                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
+            member = self.get_member(member_name)
+            if member is None:
+                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
+            terminal = replace(
+                current,
+                state=JobState.FAILED,
+                reason_code=ReasonCode.PRE_ACCEPTANCE_REQUEUE_EXHAUSTED,
+                error=error,
+                state_version=current.state_version + 1,
+            )
+            new_member = replace(
+                member,
+                dispatcher_leases=max(0, member.dispatcher_leases - 1),
+                compatible_free_slots=min(
+                    member.configured_slots, (member.compatible_free_slots or 0) + 1
+                ),
+                state_version=member.state_version + 1,
+            )
+            keys = (
+                self._job_key(current.job_id),
+                self._member_key(member_name),
+                self._lease_key(member_name),
+                self._attempt_key(attempt_id),
+            )
+            argv = [
+                current.state_version,
+                terminal.state_version,
+                self._json(terminal.to_dict()),
+                current.job_id,
+                attempt_id,
+                member.state_version,
+                new_member.state_version,
+                self._json(new_member.to_dict()),
+                new_member.state.value,
+                "1" if new_member.accepting else "0",
+                new_member.compatible_free_slots or 0,
+                new_member.generation_fence,
+                self._json(failed_attempt.to_dict()),
+                attempt_terminal_at,
+                reason.value,
+                self.terminal_attempt_retention_seconds,
+                member_name,
+            ]
+            try:
+                result = self.client.eval(
+                    TERMINALIZE_REQUEUE_CLAIM_LUA, len(keys), *keys, *argv
+                )
+            except ResponseError as exc:
+                message = str(exc)
+                if "UNKNOWN_JOB_ID" in message:
+                    raise ContractError(f"UNKNOWN_JOB_ID:{current.job_id}") from exc
+                if "JOB_STATE_VERSION_STALE" in message:
+                    raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value) from exc
+                if "RESERVATION_STATE_STALE" in message:
+                    raise ReservationStale(ReasonCode.RESERVATION_STATE_STALE.value) from exc
+                if "REQUEUE_INVALID_STATE" in message:
+                    raise ContractError(message) from exc
+                if "CANCEL_UNSAFE_AFTER_ACCEPTANCE" in message:
+                    raise ContractError(ReasonCode.CANCEL_UNSAFE_AFTER_ACCEPTANCE.value) from exc
+                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
+            except RedisError as exc:
+                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
+            if self._text(result[0]) != "terminalized":
+                raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value)
+            self._notify_terminal(terminal.job_id)
+            return terminal
         queued = replace(
             current,
             state=JobState.QUEUED,
@@ -1875,7 +2414,10 @@ class RedisJobRepository:
             queue_claimed_at=None,
             forward_started_at=None,
             reason_code=reason,
-            error=None,
+            error=error,
+            # Track PRE_ACCEPTANCE_REQUEUE cycles explicitly so the budget
+            # is decoupled from attempt_count.
+            pre_acceptance_requeue_count=current.pre_acceptance_requeue_count + 1,
             state_version=current.state_version + 1,
         )
         member_name = current.selected_member or ""

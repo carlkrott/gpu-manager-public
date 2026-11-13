@@ -119,6 +119,8 @@ class SemanticSnapshot:
     maintenance_mode: bool = False
     enabled_service_names: list[str] = field(default_factory=list)
     disabled_service_names: list[str] = field(default_factory=list)
+    # enabled units with no GPU (router, broker, proxies): running, never "idle"
+    always_on_service_names: list[str] = field(default_factory=list)
 
     # Observed runtime ─────────────────────────────────────────────────
     loaded_runtime_services: list[str] = field(default_factory=list)
@@ -385,8 +387,9 @@ def _classify_intentionally_idle(snap: SemanticSnapshot) -> list[str]:
     intentionally_idle: list[str] = [
         name for name in snap.disabled_service_names if name not in loaded
     ]
+    always_on = set(snap.always_on_service_names)
     for name in snap.enabled_service_names:
-        if name in idle_targets:
+        if name in idle_targets or name in always_on:
             continue  # configured idle — must be loaded, not "idle"
         if name in loaded:
             continue
@@ -537,6 +540,7 @@ def snapshot_from_manager(
     maintenance_mode: bool = False,
     enabled_service_names: list[str] | None = None,
     disabled_service_names: list[str] | None = None,
+    always_on_service_names: list[str] | None = None,
     loaded_runtime_services: list[str] | None = None,
     loaded_runtime_bundles: list[dict] | None = None,
     gpu_state_value: str = "",
@@ -566,6 +570,7 @@ def snapshot_from_manager(
         maintenance_mode=bool(maintenance_mode),
         enabled_service_names=list(enabled_service_names or []),
         disabled_service_names=list(disabled_service_names or []),
+        always_on_service_names=list(always_on_service_names or []),
         loaded_runtime_services=list(loaded_runtime_services or []),
         loaded_runtime_bundles=list(loaded_runtime_bundles or []),
         gpu_state_value=gpu_state_value or "",

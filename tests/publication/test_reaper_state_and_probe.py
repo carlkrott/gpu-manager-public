@@ -434,3 +434,15 @@ def test_non_idle_bundle_load_preserves_eviction_latches(monkeypatch):
     assert reconciled is False
     assert fake_vram._llm_evicted is True
     assert fake_vram._gpu_evicted == {"mi50": True}
+
+
+def test_reaper_state_is_off_by_design_under_durable_owner():
+    module = _load_controller()
+    module.ORPHAN_REAPER_ENABLED = True
+    module.scheduler = SimpleNamespace(_running=False, _last_orphan_reaper_at=0.0,
+                                       _expected_pids=set(), _terminated_pids={})
+    module._services_config = {"scheduling": {"maintenance_mode": False, "queue_owner": "durable"}}
+    assert (module._orphan_reaper_status(now=100.0)["state"],
+            module._orphan_reaper_status(now=100.0)["reason"]) == ("off", "durable_queue_owner")
+    module._services_config = {"scheduling": {"maintenance_mode": False}}
+    assert module._orphan_reaper_status(now=100.0)["reason"] == "scheduler_not_running"

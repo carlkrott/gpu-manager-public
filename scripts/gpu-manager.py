@@ -52,9 +52,12 @@ import argparse
 import asyncio
 import copy
 import dataclasses
+from collections import deque
 from collections.abc import Mapping
 import hashlib
 import json
+import secrets
+from threading import Lock
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -69,6 +72,22 @@ from portable_defaults import (
     SECONDARY_GPU_ID,
     empty_services_config,
 )
+from gpu_manager.oom_detection import bind as _bind_oom_detection
+from gpu_manager.memory_policy import bind as _bind_memory_policy
+from gpu_manager.oom_retry import bind as _bind_oom_retry
+from gpu_manager.config_policy import bind as _bind_config_policy
+from gpu_manager.scheduler_state import bind as _bind_scheduler_state
+from gpu_manager.scheduler_helpers import bind as _bind_scheduler_helpers
+from gpu_manager.oom_telemetry import bind as _bind_oom_telemetry
+from gpu_manager.reservations import bind as _bind_reservations
+from gpu_manager.gpu_topology import bind as _bind_gpu_topology
+from gpu_manager.job_models import bind as _bind_job_models
+from gpu_manager.bundle_model import bind as _bind_bundle_model
+from gpu_manager.service_events import bind as _bind_service_events
+from gpu_manager.bundle_queue import bind as _bind_bundle_queue
+from gpu_manager.vram_lifecycle import bind as _bind_vram_lifecycle
+from gpu_manager import fit_validator as _fit_validator
+from gpu_manager import warm_pool as _warm_pool
 
 if TYPE_CHECKING:
     from pipeline_provider_runtime import CompositeProviderExecutor
@@ -77,11 +96,21 @@ if TYPE_CHECKING:
 
 from stage_dispatch import GenerationStageExecutor
 from api_auth import (
+    KDA_GEMMA_DEFAULT_PIN_APP_KEY as _KDA_GEMMA_DEFAULT_PIN_APP_KEY,
+    KDA_GEMMA_MEMBER_PINS_APP_KEY as _KDA_GEMMA_MEMBER_PINS_APP_KEY,
+    KDA_GEMMA_SCOPED_GATE_APP_KEY as _KDA_GEMMA_SCOPED_GATE_APP_KEY,
     api_auth_middleware as _api_auth_middleware,
+    catalog_client_identity as _catalog_client_identity,
     configured_token as _api_token,
     loopback_compatibility_enabled as _allow_unauthenticated_loopback,
+    honcho_gemma_body_is_in_scope as _honcho_gemma_body_is_in_scope,
+    honcho_gemma_request_is_authorized as _honcho_gemma_request_is_authorized,
+    scoped_gemma_default_member as _scoped_gemma_default_member,
+    scoped_gemma_pin_is_unpinned as _scoped_gemma_pin_is_unpinned,
+    scoped_gemma_request_is_authorized as _scoped_gemma_request_is_authorized,
     ws_enforce_first_frame_auth,
 )
+from node_leases import add_node_routes
 from api_contracts import (
     ContractError as _ContractError,
     error_envelope as _error_envelope,
@@ -129,6 +158,7 @@ from gemma_broker.recovery import (
     reduce_recovery,
 )
 from gemma_broker.member_observer import MemberObserver
+from gemma_broker.redis_store import RepositoryUnavailable as _RepositoryUnavailable
 from gpu_manager_contracts import (
     PriorityConvention,
     apply_priority_contract,
@@ -224,6 +254,8 @@ _last_swap_timestamp = 0.0
 _current_selected_group = None
 _drain_cutoffs = {}
 _last_next_decision = {}
+# Full ranked demand list from the last phase-3 refresh (warm-pool look-ahead).
+_last_pending_groups: list = []
 
 
 def _maintenance_mode_enabled(scheduling: Mapping[str, Any] | None) -> bool:
@@ -418,7 +450,8 @@ def _get_phase3_scheduler_state(groups, all_gpu_states, generation_templates):
             next_decision_val = f'demand:{candidate_group}'
             next_decision_reason = f'Pending demand for {candidate_group}'
 
-    global _last_next_decision
+    global _last_next_decision, _last_pending_groups
+    _last_pending_groups = list(pending_groups)
     _last_next_decision = {
         'next_decision': next_decision_val,
         'decision_timestamp': now,
@@ -631,7 +664,6 @@ async def _run_pipeline_stages(
 # directly reference it; all new code should use LIVE_WORKER_OWNED_ADAPTERS
 # or classify_stages() / get_dispatch_mode() instead.
 _KREA_ONLY_PROVIDERS: frozenset[str] = frozenset({
-    "open-design",
     "comfyui",
     "comfyui-qwen",
     "combined-gemma",
@@ -641,7 +673,7 @@ _KREA_ONLY_PROVIDERS: frozenset[str] = frozenset({
 def _has_non_krea_stage(stages: list[dict]) -> bool:
     """
     Return True if any stage in ``stages`` has a provider that is NOT handled
-    by the live ComfyUI/OD worker path (i.e. requires the generic HTTP stage
+    by the live ComfyUI worker path (i.e. requires the generic HTTP stage
     dispatcher or the inline KreaPipelineExecutor handlers).
 
     Delegates to execution_boundary.is_external() (backward-compat shim).
@@ -738,7 +770,9 @@ def _reconcile_pipeline_evidence(
     results: list = []
     by_id: dict[str, object] = {}
     supported_providers = {
-        "prompt_enhance": {"open-design", "n8n"},
+        # The retired controller is gone; n8n remains a valid external
+        # prompt_enhance provider dispatched through the generic transport.
+        "prompt_enhance": {"n8n"},
         "generate": {"comfyui"},
         "qc": {"combined-gemma"},
         "correct": {"comfyui-qwen"},
@@ -908,7 +942,7 @@ class _MixedOwnershipExecutor:
 
     This is the typed seam for the mixed-ownership handoff protocol:
     the GPU Manager worker executes the worker-owned stages (prompt_enhance via
-    OpenDesign, generate via ComfyUI, qc via Combined-Gemma), collects their
+    ComfyUI, qc via Combined-Gemma), collects their
     outputs into a StageContext, and then passes that context to the
     CompositeProviderExecutor via this wrapper.  The wrapper pre-populates the
     fan-in dependency map so external stages (e.g. n8n, http-qc) see the same
@@ -1497,7 +1531,7 @@ def _build_pipeline_executor(executor_class, max_retries, max_loop_count):
             # Delegate to the KreaPipelineExecutor typed handlers.
             # These run in-process with fake responses; the real I/O
             # providers are wired separately by the Worker's actual
-            # executor (e.g. the ComfyUI + OD adapter path).
+            # executor (e.g. the ComfyUI + local-vision adapter path).
             handler_map = {
                 "prompt_enhance": self._handle_prompt_enhance,
                 "generate": self._handle_generate,
@@ -1590,204 +1624,7 @@ async def run_pipeline_dispatch(
     return ctx, results, True
 
 
-
-def _queue_depth_observation(
-    queue,
-    service_name: str,
-    routing_group: str | None = None,
-    *,
-    strict: bool = False,
-) -> dict[str, Any]:
-    """Normalize queue depth without turning missing evidence into demand."""
-
-    fallback = {
-        "depth": 0,
-        "known": False,
-        "reason": "queue_engine_unavailable",
-        "pending": 0,
-    }
-    if queue is None:
-        return fallback
-    observer = getattr(queue, "get_queue_depth_observation", None)
-    if callable(observer):
-        try:
-            result = observer(service_name, routing_group=routing_group)
-            if isinstance(result, Mapping):
-                return {
-                    "depth": max(0, int(result.get("depth", 0) or 0)),
-                    "known": result.get("known") is True,
-                    "reason": str(result.get("reason") or "unknown"),
-                    "pending": max(0, int(result.get("pending", 0) or 0)),
-                    "stream": result.get("stream"),
-                    "error": str(result.get("error") or "")[:240],
-                }
-        except Exception as exc:
-            if strict:
-                raise
-            return {**fallback, "reason": f"observation_error:{type(exc).__name__}"}
-    try:
-        try:
-            depth = queue.get_queue_depth(
-                service_name, routing_group=routing_group, strict=strict
-            )
-        except TypeError as exc:
-            if "strict" not in str(exc):
-                raise
-            # Older queue adapters did not expose the strict keyword.  Retry
-            # the bounded integer API instead of turning a non-strict health
-            # observation into an avoidable unknown-depth result.
-            depth = queue.get_queue_depth(
-                service_name, routing_group=routing_group
-            )
-        return {
-            "depth": max(0, int(depth or 0)),
-            "known": True,
-            "reason": "legacy_integer_api",
-            "pending": 0,
-        }
-    except Exception as exc:
-        if strict:
-            raise
-        return {**fallback, "reason": f"depth_error:{type(exc).__name__}"}
-
-
-def _logical_group_quiescent(routing_group: str) -> tuple[bool, dict]:
-    """Return whether a logical routing group is fully drained.
-
-    Queue lag alone is insufficient: Redis PEL entries may already be
-    assigned to workers, and a backend can still be executing a request.
-    This helper is intentionally group-wide so a GPU service can drain
-    without blocking eligible CPU/other-GPU members of the same group.
-    """
-    snapshot = {
-        'routing_group': routing_group,
-        'queue_depth': 0,
-        'queue_depth_known': False,
-        'queue_depth_reason': 'queue_engine_unavailable',
-        'pending': 0,
-        'active_workers': 0,
-        'job_demand': None,
-    }
-    try:
-        if queue_engine is not None:
-            observation = _queue_depth_observation(
-                queue_engine, routing_group, routing_group, strict=True
-            )
-            snapshot['queue_depth'] = observation['depth']
-            snapshot['queue_depth_known'] = observation['known']
-            snapshot['queue_depth_reason'] = observation['reason']
-            pending_reader = queue_engine.get_pending
-            try:
-                snapshot['pending'] = len(pending_reader(
-                    routing_group, routing_group=routing_group, strict=True
-                ) or [])
-            except TypeError as exc:
-                # Compatibility fakes/older queue adapters may not expose the
-                # strict keyword yet. Keep their established behavior, while
-                # the production RedisQueue takes the fail-closed path above.
-                if "strict" not in str(exc):
-                    raise
-                snapshot['pending'] = len(pending_reader(
-                    routing_group, routing_group=routing_group
-                ) or [])
-            if (
-                snapshot['queue_depth_known'] is not True
-                and snapshot['queue_depth_reason'] != 'external_queue_authority'
-            ):
-                snapshot['error'] = (
-                    'queue depth unavailable: '
-                    f"{snapshot['queue_depth_reason']}"
-                )
-                return False, snapshot
-    except Exception as exc:
-        snapshot['error'] = f'queue inspection failed: {exc}'
-        return False, snapshot
-    try:
-        if worker_supervisor is not None:
-            for pool in worker_supervisor._pools.values():
-                if routing_group in getattr(pool, 'routing_groups', ()):
-                    snapshot['active_workers'] += int(
-                        getattr(pool, 'active_workers', 0) or 0
-                    )
-    except Exception as exc:
-        snapshot['error'] = f'worker inspection failed: {exc}'
-        return False, snapshot
-
-    # Redis stream depth/P.E.L. and worker counters can briefly disagree with
-    # the durable tracker. Include claimed/loading/in-flight records; an
-    # absent or unavailable tracker is not safe evidence that a shared runtime
-    # can be unloaded, so the transition fails closed.
-    tracker = globals().get('job_tracker')
-    if tracker is None or not hasattr(tracker, 'demand_snapshot'):
-        snapshot['error'] = 'job demand tracker unavailable'
-        return False, snapshot
-    try:
-        demand = tracker.demand_snapshot(routing_group=routing_group)
-        snapshot['job_demand'] = demand
-        if demand.get('status') != 'available':
-            snapshot['error'] = 'job demand unavailable'
-            return False, snapshot
-    except Exception as exc:
-        snapshot['error'] = f'job demand inspection failed: {exc}'
-        return False, snapshot
-
-    durable_active = (
-        int((snapshot.get('job_demand') or {}).get('active_demand') or 0)
-        if snapshot.get('job_demand') is not None
-        else 0
-    )
-    return (
-        snapshot['queue_depth'] == 0
-        and snapshot['pending'] == 0
-        and snapshot['active_workers'] == 0
-        and durable_active == 0,
-        snapshot,
-    )
-
-
-async def _wait_for_logical_group_quiescence(
-    routing_group: str, timeout: float = 1800.0, settle_seconds: float = 0.5
-) -> bool:
-    """Wait until a logical group is empty and stays empty briefly.
-
-    New arrivals remain valid work and are consumed by any healthy eligible
-    member.  The settle window closes the check/enqueue race immediately
-    before a higher-priority GPU bundle is admitted.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        empty, snapshot = _logical_group_quiescent(routing_group)
-        if empty:
-            await asyncio.sleep(settle_seconds)
-            empty_again, snapshot_again = _logical_group_quiescent(routing_group)
-            if empty_again:
-                logger.info(
-                    f'Logical group {routing_group} quiescent before swap: '
-                    f'{snapshot_again}'
-                )
-                return True
-            snapshot = snapshot_again
-        logger.info(
-            f'Logical group {routing_group} still draining before swap: '
-            f'{snapshot}'
-        )
-        await asyncio.sleep(0.5)
-    logger.warning(
-        f'Logical group {routing_group} did not quiesce within {timeout}s; '
-        'refusing the bundle swap'
-    )
-    return False
-
-
 _can_consume_last_log = {}
-
-def _log_can_consume_pause(service_name, routing_group, reason, worker_id):
-    now = time.time()
-    key = (service_name, routing_group, reason)
-    last_log = _can_consume_last_log.get(key, 0)
-    if now - last_log >= 10:
-        logger.debug(f"Worker {worker_id} for {service_name} paused on {routing_group}: {reason}")
-        _can_consume_last_log[key] = now
 
 # --- Proactive Dispatch Loop (dry-run mode) ---
 _PROACTIVE_LOOP_INTERVAL_SEC = 2.5
@@ -1823,39 +1660,17 @@ _group_failure_state = {}
 _scheduler_dry_run_mode = True
 
 
-def _get_dual_swap_lock():
-    global _dual_swap_lock
-    if _dual_swap_lock is None:
-        import asyncio
-        _dual_swap_lock = asyncio.Lock()
-    return _dual_swap_lock
-
-
-class _RestoreAdmissionGuard:
-    """Acquire bundle admission before the per-manager restore lock.
-
-    The ordering matches the bundle-load transaction (physical admission
-    first, lifecycle operation second), so a restore cannot observe an empty
-    generation state and then race a new admission into the same GPUs.
-    """
-
-    def __init__(self, manager):
-        self._manager = manager
-        self._admission_lock = _get_dual_swap_lock()
-
-    async def __aenter__(self):
-        await self._admission_lock.acquire()
-        try:
-            await self._manager._evict_lock.acquire()
-        except Exception:
-            self._admission_lock.release()
-            raise
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self._manager._evict_lock.release()
-        self._admission_lock.release()
-        return False
+# Scheduler state bodies live in gpu_manager/scheduler_state.py.  The mutable
+# state above (_dual_swap_lock, _can_consume_last_log) stays owned by this module;
+# bind once, after that state exists, and keep the returned class.
+(
+    _queue_depth_observation,
+    _logical_group_quiescent,
+    _wait_for_logical_group_quiescence,
+    _log_can_consume_pause,
+    _get_dual_swap_lock,
+    _RestoreAdmissionGuard,
+) = _bind_scheduler_state(globals())
 
 
 def _bundle_worker_in_flight(bundle_name: str | None, bundles: dict | None = None) -> int:
@@ -1875,6 +1690,23 @@ def _bundle_worker_in_flight(bundle_name: str | None, bundles: dict | None = Non
         state = _get_gpu_state(gpu_id)
         total += int(getattr(state, "worker_in_flight", 0) or 0)
     return total
+
+
+def _comfyui_execution_interrupted(job_entry: dict) -> bool:
+    """Recognize ComfyUI's terminal interruption message in history status."""
+    status = job_entry.get("status", {}) if isinstance(job_entry, dict) else {}
+    messages = status.get("messages", []) if isinstance(status, dict) else []
+
+    def contains_marker(value: Any) -> bool:
+        if isinstance(value, str):
+            return value == "execution_interrupted"
+        if isinstance(value, dict):
+            return any(contains_marker(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_marker(item) for item in value)
+        return False
+
+    return contains_marker(messages)
 
 
 def _bundle_transition_is_active() -> bool:
@@ -2022,7 +1854,8 @@ def _generation_release_blockers(
         bool(getattr(state, "loading", False))
         or bool(getattr(state, "evicting", False))
         or bool(getattr(state, "draining", False))
-        or str(getattr(state, "state", "")) in {"loading", "evicting", "draining"}
+        or bool(getattr(state, "restoring", False))
+        or str(getattr(state, "state", "")) in {"loading", "evicting", "draining", "restoring"}
         for state in states.values()
     ):
         blockers.append("bundle_transition_active")
@@ -2069,6 +1902,10 @@ def _generation_release_blockers(
                 lingering.add(str(bundle_name))
     if lingering:
         blockers.append("non_idle_bundle_loaded:" + ",".join(sorted(lingering)))
+    for gpu_id, state in states.items():
+        oom_state = str(getattr(state, "oom_state", "idle"))
+        if oom_state in {"detected", "draining", "verifying", "recovering", "oom_failed", "permanent_failed"}:
+            blockers.append(f"oom_recovery_{oom_state}:{gpu_id}")
     return blockers
 
 
@@ -2101,6 +1938,96 @@ def _idle_service_recovery_blockers(service_name: str) -> list[str]:
     return blockers
 
 
+def _generation_activity_evidence() -> list[str]:
+    """Return live signs that a generation job still owns the GPUs.
+
+    Unlike ``_generation_release_blockers`` this deliberately ignores the
+    ``evicting``/``loading``/``draining`` flags themselves: it decides whether
+    one of those flags is stale, and counting the flag as its own owner would
+    make a stuck flag permanent. The evidence is global, not per GPU, because a
+    dual-GPU job holds ``evicting`` on a GPU that runs none of its workers.
+    """
+    evidence: list[str] = []
+    in_flight = sum(
+        int(getattr(state, "worker_in_flight", 0) or 0)
+        for state in _get_all_gpu_states().values()
+    )
+    if in_flight > 0:
+        evidence.append(f"worker_in_flight:{in_flight}")
+    admissions = _comfyui_admission_in_flight()
+    if admissions > 0:
+        evidence.append(f"comfyui_admission_in_flight:{admissions}")
+    sched = globals().get("scheduler")
+    if sched is not None:
+        if bool(getattr(sched, "_swapping", False)):
+            evidence.append("scheduler_swapping")
+        if bool(getattr(sched, "_restoring", False)):
+            evidence.append("scheduler_restoring")
+        queues = getattr(sched, "_gpu_queues", None)
+        if isinstance(queues, dict) and any(
+            getattr(job, "status", None) in ("queued", "running")
+            for jobs in queues.values()
+            for job in jobs
+        ):
+            evidence.append("scheduler_jobs_active")
+    return evidence
+
+
+def _reap_stale_evicting_flags(now: float | None = None) -> list[str]:
+    """Clear per-GPU ``evicting`` flags that no owner holds and that outlived the bound.
+
+    ``evicting`` is legitimately held for a whole generation job, so age alone
+    never clears it: any live owner (see ``_generation_activity_evidence``) or
+    transition keeps it, and the ownerless clock starts at the last sign of
+    activity. A stuck flag is expensive: the idle-restore loop and the idle
+    bundle auto-evict both skip every GPU while any ``evicting`` flag is set, so
+    one stale flag stops LLM restoration fleet-wide. Only the flag is cleared;
+    ``_llm_evicted`` is left alone so the normal idle restore then runs.
+    Returns the GPU ids whose flag was cleared.
+    """
+    now = time.time() if now is None else float(now)
+    states = dict(_get_all_gpu_states())
+    if not any(bool(getattr(state, "evicting", False)) for state in states.values()):
+        return []
+    evidence = _generation_activity_evidence()
+    transitioning = any(
+        bool(getattr(state, "loading", False)) or bool(getattr(state, "draining", False))
+        for state in states.values()
+    )
+    cleared: list[str] = []
+    for gpu_id, state in states.items():
+        if not bool(getattr(state, "evicting", False)):
+            continue
+        if float(getattr(state, "evicting_since", 0.0) or 0.0) <= 0.0:
+            # Set by a path that never stamped it: start its clock now so the
+            # flag is bounded rather than immortal.
+            state.evicting_since = now
+            continue
+        decision = evicting_decision(
+            evicting=True,
+            evicting_since=state.evicting_since,
+            last_activity_at=float(getattr(state, "last_activity_at", 0.0) or 0.0),
+            now=now,
+            worker_in_flight=int(getattr(state, "worker_in_flight", 0) or 0),
+            pending_requests=int(getattr(state, "pending_requests", 0) or 0),
+            loading=bool(getattr(state, "loading", False)),
+            draining=bool(getattr(state, "draining", False)),
+            transition_active=transitioning,
+            generation_blockers=evidence,
+            stale_after_s=EVICTING_STALE_AFTER_S,
+        )
+        if not decision.stale:
+            continue
+        logger.warning(
+            "[evicting-watchdog] %s: clearing stale evicting flag (%s, bound=%.0fs)",
+            gpu_id, decision.reason, EVICTING_STALE_AFTER_S,
+        )
+        state.set_evicting(False, source="stale_evicting_watchdog")
+        _queue_recovery_stats["stale_evicting_cleared"] += 1
+        cleared.append(gpu_id)
+    return cleared
+
+
 def _restore_after_gpu_work_blockers() -> list[str]:
     """Authoritative fences that defer destructive idle-service restoration."""
     blockers = _generation_release_blockers()
@@ -2111,6 +2038,27 @@ def _restore_after_gpu_work_blockers() -> list[str]:
     if admission_in_flight:
         blockers.append(f"comfyui_admission_in_flight:{admission_in_flight}")
     return blockers
+
+
+_IDLE_TTL_MIN_S = 5.0
+_IDLE_TTL_MAX_S = 3600.0
+
+
+def _bundle_idle_ttl_seconds(bundle: dict, scheduling: dict, default: float) -> float:
+    """Bounded per-bundle idle-hold TTL (bundle key, then scheduling key, then default)."""
+    for raw in (
+        (bundle or {}).get("idle_ttl_seconds"),
+        (scheduling or {}).get("generation_idle_ttl_seconds"),
+    ):
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return min(max(value, _IDLE_TTL_MIN_S), _IDLE_TTL_MAX_S)
+    return default
 
 
 def _auto_evict_bundle_blockers(
@@ -2125,11 +2073,63 @@ def _auto_evict_bundle_blockers(
     """
     bundles = bundles or _resolve_bundles()
     ignored = {bundle_name, *_get_linked_bundles(bundle_name, bundles=bundles)}
-    blockers = _generation_release_blockers(ignore_loaded_bundles=ignored)
+    # Scope to the candidate's own GPUs: a bundle resident on another GPU
+    # (e.g. the second small-LLM serve) must not pin this one forever.
+    blockers = _generation_release_blockers(
+        _bundle_physical_gpu_set(bundle_name, bundles=bundles) or None,
+        ignore_loaded_bundles=ignored,
+    )
     admission_in_flight = _comfyui_admission_in_flight()
     if admission_in_flight:
         blockers.append(f"comfyui_admission_in_flight:{admission_in_flight}")
     return blockers
+
+
+# A tracker record left "in_flight" by a crashed worker must not pin a bundle
+# forever, so only records started within this window veto idle eviction.
+_EVICT_TRACKER_IN_FLIGHT_MAX_AGE_S = 1800.0
+
+
+def _bundle_tracker_in_flight_jobs(
+    bundle_name: str,
+    bundles: dict | None = None,
+    *,
+    max_age_s: float = _EVICT_TRACKER_IN_FLIGHT_MAX_AGE_S,
+) -> list[str]:
+    """Return ids of JobTracker jobs still ``in_flight`` on a bundle's services.
+
+    This is the durable twin of ``worker_in_flight``: it reads the job record,
+    so it also covers a job parked in the readiness gate or re-delivered after
+    the in-memory counter was lost. The veto clears by itself once the job
+    reaches a terminal state (completed/failed/cancelled, including the
+    ``readiness_gate_timeout`` failure), because the status is read live.
+    Linked bundles are part of the same candidate. Raises on tracker errors so
+    the caller can fail closed.
+    """
+    if job_tracker is None:
+        return []
+    from datetime import datetime, timezone
+
+    bundles = bundles or _resolve_bundles()
+    names = [bundle_name, *_get_linked_bundles(bundle_name, bundles=bundles)]
+    services: set[str] = set()
+    for name in names:
+        services.update(str(s) for s in (bundles.get(name) or {}).get("services", []))
+    now = datetime.now(timezone.utc)
+    active: list[str] = []
+    for svc_name in sorted(services):
+        for job in job_tracker.get_jobs_by_status(svc_name, "in_flight") or []:
+            started = str(job.get("started_at") or "")
+            try:
+                _st = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                if _st.tzinfo is None:
+                    _st = _st.replace(tzinfo=timezone.utc)
+                age = (now - _st).total_seconds()
+            except (ValueError, TypeError):
+                age = 0.0  # unknown start time: treat as fresh (fail closed)
+            if age <= max_age_s:
+                active.append(str(job.get("job_id") or job.get("id") or svc_name))
+    return active
 
 
 def _normalize_readiness_required_fields(value) -> tuple[str, ...]:
@@ -2245,111 +2245,27 @@ def _bundle_commit_preconditions(
     return not reasons, reasons
 
 
-def _record_load_history(decision):
-    _load_history.insert(0, decision)
-    if len(_load_history) > 50:
-        _load_history.pop()
-
-def _record_head_job_precheck(record):
-    with _head_job_pre_checks_lock:
-        _head_job_pre_checks.insert(0, record)
-        if len(_head_job_pre_checks) > 20:
-            _head_job_pre_checks.pop()
-
-def _group_circuit_state(group, now, config):
-    return _group_failure_state.get(group, {'state': 'closed'})
-
-def _active_group_still_draining(target_group: str) -> bool:
-    """Dry-run check: is any other active group still draining queue lag?
-
-    When the scheduler sees demand:<target_group>, but a different active
-    routing group still reports queue_lag > 0, we hold the load so the
-    active group can drain its accepted/cutoff queue before swap.
-    """
-    for rg, cutoff in _drain_cutoffs.copy().items():
-        if rg == target_group:
-            continue
-        try:
-            if (time.time() - float(cutoff)) <= 60:
-                return True
-        except ValueError:
-            return False
-    return False
-
-def _target_gpus_hold_warm_bundle(target_group: str) -> bool:
-    """Advisory telemetry only.
-
-    Returns True only when at least one target GPU for ``target_group`` is
-    holding a bundle that is NOT the target bundle and NOT a valid linked
-    component of it. Returns False when:
-
-      * no target GPUs can be derived from a reservation or template/bundle
-        topology, or
-      * every target GPU is either idle or already holds the target bundle
-        (including any valid linked bundle component).
-
-    ``requires_eviction`` is **advisory, factual decision telemetry**: it tells
-    operators whether a swap will be required for the upcoming load. It is NOT
-    a second control path in the dispatcher. ``_evict_then_load_bundle`` is the
-    authoritative atomic state-transition / readiness path and runs its own
-    priority-aware precheck. See ``_dispatch_scheduler_decision``.
-
-    NOTE: this function deliberately swallows exceptions from the GPU state
-    read and converts unreadable state into a "warm, unknown" signal so the
-    caller can choose to fail closed. The fail-closed path is implemented in
-    ``_scheduler_evaluate_load`` (which switches to a non-dispatch action when
-    state cannot be inspected) rather than here, so this helper remains a
-    pure telemetry predicate.
-    """
-    grp_res = {}
-    try:
-        grp_res = _group_reservations.get(target_group, {}) or {}
-    except Exception:
-        grp_res = {}
-    target_gpus: list[str] = []
-    if isinstance(grp_res, dict) and grp_res.get('requires_gpus'):
-        for gid in grp_res.get('requires_gpus') or []:
-            if gid and gid not in target_gpus:
-                target_gpus.append(gid)
-    if not target_gpus:
-        # Fall back to a config-driven derivation rather than hard-coded names:
-        # the proactive loop must not silently default to "warm, no eviction"
-        # when it can't see reservation state.
-        target_gpus = list(_resolve_group_target_gpus(target_group) or [])
-    else:
-        # Reservation slice is non-empty — UNION with topology so a partial or
-        # stale reservation can NEVER hide a linked gpu that needs warm-state
-        # inspection. Without this, a partial reservation that omits the linked
-        # gpu would silently mask an evictor resident on that gpu.
-        for gid in list(_resolve_group_target_gpus(target_group) or []):
-            if gid and gid not in target_gpus:
-                target_gpus.append(gid)
-    if not target_gpus:
-        return False
-
-    target_bundle, linked_bundles = _resolve_target_bundle_components(target_group)
-    accepted_names = set()
-    if target_bundle:
-        accepted_names.add(target_bundle)
-        accepted_names.update(linked_bundles or [])
-
-    for gid in target_gpus:
-        try:
-            gs = _get_gpu_state(gid)
-        except Exception:
-            # Fail-closed signal: the caller will see this via
-            # _scheduler_evaluate_load's state-unreadable branch and emit a
-            # non-dispatch action. Returning False here would falsely advertise
-            # "cold, no eviction" for a GPU whose state we cannot inspect.
-            raise _TargetStateUnreadable(target_group, gid)
-        warm = getattr(gs, 'loaded_bundle', None) or getattr(gs, 'current_bundle', None)
-        if not warm:
-            continue
-        if accepted_names and warm in accepted_names:
-            # Same target bundle (or a valid linked component) — not an eviction.
-            continue
-        return True
-    return False
+# Scheduler helper bodies live in gpu_manager/scheduler_helpers.py.  Their state
+# (_load_history, _head_job_pre_checks, _idle_decision_signature, ...) stays owned
+# by this module; bind once and keep the returned functions.
+(
+    _record_load_history,
+    _record_head_job_precheck,
+    _group_circuit_state,
+    _active_group_still_draining,
+    _target_gpus_hold_warm_bundle,
+    _resolve_target_bundle_components,
+    _resolve_group_target_gpus,
+    _scheduler_precheck_head_jobs,
+    _scheduler_run_precheck,
+    _refresh_phase3_scheduler_state,
+    _scheduler_evaluate_load,
+    _resolve_scheduler_bundle_for_group,
+    _is_repeat_idle_decision,
+    _dispatch_scheduler_decision,
+    _proactive_dispatch_loop,
+    _should_suppress_proactive_spacing,
+) = _bind_scheduler_helpers(globals())
 
 
 class _TargetStateUnreadable(Exception):
@@ -2367,607 +2283,12 @@ class _TargetStateUnreadable(Exception):
         self.gpu_id = gpu_id
 
 
-def _resolve_target_bundle_components(target_group: str) -> tuple[str | None, list[str]]:
-    """Resolve (target_bundle_name, [linked_bundle_names]) for a routing group.
+from idle_targets import BACKOFF_BASE_S, BACKOFF_MAX_S, DisabledMemberReporter, IdleTargetPlanner
 
-    Reads ``_services_config.generation_templates`` for the template that maps
-    to ``target_group`` and pulls the bundle's ``linked_to`` chain from the
-    in-memory ``_services_config.bundles``.
+_IDLE_PLANNER = IdleTargetPlanner(lambda msg: logger.info("%s", msg))
+_MEMBER_REPORTER = DisabledMemberReporter(lambda msg: logger.info("%s", msg))
+_idle_decision_signature: tuple | None = None
 
-    If the in-memory ``_services_config.bundles`` section is absent, falls back
-    to the cached/disk ``_resolve_bundles()`` resolver — same safe-fallback
-    policy used by ``_resolve_group_target_gpus``. The fallback MUST NOT
-    mutate the caller-provided ``_services_config`` (monkeypatched in tests);
-    it only refreshes the bundle cache that ``_resolve_bundles`` owns.
-
-    Returns ``(None, [])`` if the group has no template/bundle or if the
-    bundle cannot be resolved via either source.
-    """
-    templates = ((_services_config or {}).get('generation_templates') or {})
-    bundle_name: str | None = None
-    for tmpl in templates.values():
-        if not isinstance(tmpl, dict):
-            continue
-        if tmpl.get('routing_group') == target_group:
-            cand = tmpl.get('bundle')
-            if cand and bundle_name is None:
-                bundle_name = str(cand)
-            elif cand and bundle_name != str(cand):
-                # Ambiguous mapping for a single group → refuse to derive.
-                return None, []
-    if not bundle_name:
-        return None, []
-
-    # Walk in-memory bundles first; never trigger _resolve_bundles() if we
-    # have the topology locally. _resolve_bundles() may reach disk via
-    # _load_services_config() which CAN clobber a monkeypatched _services_config.
-    in_memory_bundles = ((_services_config or {}).get('bundles') or {})
-    if in_memory_bundles:
-        linked: list[str] = []
-        try:
-            for ln in _get_linked_bundles(bundle_name, bundles=in_memory_bundles) or []:
-                if ln and ln not in linked:
-                    linked.append(str(ln))
-        except Exception:
-            pass
-        return bundle_name, linked
-
-    # In-memory bundles section is missing — fall back to the cached/disk
-    # resolver. Safe-fallback policy matches _resolve_group_target_gpus:
-    # snapshot/restore _services_config so _resolve_bundles() → _load_services_config()
-    # cannot clobber a caller-provided (monkeypatched) value.
-    snapshot = _services_config
-    try:
-        resolved = _resolve_bundles()
-    except Exception:
-        return bundle_name, []
-    finally:
-        try:
-            globals()['_services_config'] = snapshot
-        except Exception:
-            pass
-    if not resolved:
-        return bundle_name, []
-    linked: list[str] = []
-    try:
-        for ln in _get_linked_bundles(bundle_name, bundles=resolved) or []:
-            if ln and ln not in linked:
-                linked.append(str(ln))
-    except Exception:
-        pass
-    return bundle_name, linked
-
-
-def _resolve_group_target_gpus(target_group: str) -> list[str]:
-    """Derive the full set of target GPUs for ``target_group`` from current config.
-
-    Order of precedence:
-      1. ``_group_reservations[group].requires_gpus`` (HTTP path; pure in-memory).
-      2. The target bundle's primary GPU + every linked GPU via
-         ``_collect_linked_gpus`` (config-driven; works on a fresh start).
-         This step needs ``_resolve_bundles()``, which may read disk if
-         ``_services_config`` does not yet carry a ``bundles`` section.
-
-    The two sources are UNIONed (deduped, order preserved) so that a partial
-    or stale reservation can NEVER hide the topology-derived linked GPUs.
-    A partial reservation that only mentions the primary gpu must still
-    surface the linked gpu through step 2 — otherwise the proactive loop
-    would inspect only a subset of the topology and incorrectly conclude
-    a valid linked component is an evictor.
-
-    Returns an empty list iff neither source resolves — fail closed so the
-    caller can choose to advertise a non-dispatch action.
-
-    Safe-fallback policy: when the topology step needs ``_resolve_bundles()``
-    and that resolver reaches disk via ``_load_services_config()``, the call
-    MAY overwrite the module-level ``_services_config``. To preserve a
-    caller-provided (e.g. monkeypatched) ``_services_config``, we snapshot
-    and restore around the resolver call. The snapshot/restore is a no-op
-    when ``_resolve_bundles`` only refreshes its own cache.
-    """
-    union: list[str] = []
-
-    # 1) Reservation-driven path — pure memory. Hot path for the steady state.
-    try:
-        grp_res = _group_reservations.get(target_group, {}) or {}
-    except Exception:
-        grp_res = {}
-    if isinstance(grp_res, dict) and grp_res.get('requires_gpus'):
-        for gid in grp_res.get('requires_gpus') or []:
-            if gid and gid not in union:
-                union.append(gid)
-
-    # 2) Config-driven path. Find the template's bundle in the in-memory
-    # _services_config first to avoid triggering a disk load (which would
-    # overwrite the caller's monkeypatched _services_config).
-    templates = ((_services_config or {}).get('generation_templates') or {})
-    bundle_name: str | None = None
-    for tmpl in templates.values():
-        if not isinstance(tmpl, dict):
-            continue
-        if tmpl.get('routing_group') == target_group:
-            cand = tmpl.get('bundle')
-            if cand and bundle_name is None:
-                bundle_name = str(cand)
-            elif cand and bundle_name != str(cand):
-                # Ambiguous mapping: still return what we have so far
-                # (the reservation-derived subset is better than nothing).
-                return list(dict.fromkeys(union))
-    if not bundle_name:
-        return list(dict.fromkeys(union))
-
-    # Look the bundle up in-memory first.
-    in_memory_bundles = ((_services_config or {}).get('bundles') or {})
-    bundle_cfg = in_memory_bundles.get(bundle_name)
-    if bundle_cfg is None:
-        # Snapshot _services_config so a disk-backed _resolve_bundles() does
-        # not clobber a caller-provided (monkeypatched) value. _load_services_config()
-        # inside _resolve_bundles() may promote a freshly-read config to the
-        # module global; we restore it on the way out.
-        snapshot = _services_config
-        try:
-            bundles = _resolve_bundles()
-        except Exception:
-            return list(dict.fromkeys(union))
-        finally:
-            # _resolve_bundles() may have mutated _services_config via
-            # _load_services_config(); restore the caller's snapshot.
-            try:
-                # pylint: disable=global-statement
-                globals()['_services_config'] = snapshot
-            except Exception:
-                pass
-        bundle_cfg = bundles.get(bundle_name) or {}
-        bundles_for_walk = bundles
-    else:
-        bundles_for_walk = in_memory_bundles
-    try:
-        for gid in _collect_linked_gpus(
-            bundle_cfg, bundles_for_walk, bundle_name=bundle_name
-        ):
-            if gid and gid not in union:
-                union.append(gid)
-    except Exception:
-        pass
-    return list(dict.fromkeys(union))
-
-def _scheduler_precheck_head_jobs(group: str) -> dict:
-    if 'queue_engine' not in globals() or not queue_engine or not getattr(queue_engine, 'r', None):
-        return {'group': group, 'decision': 'unknown', 'skipped_reason': 'no_queue_engine'}
-    if 'job_tracker' not in globals() or not job_tracker:
-        return {'group': group, 'decision': 'unknown', 'skipped_reason': 'no_job_tracker'}
-
-    try:
-        # Inspect the same logical stream set as the queue worker.  Lane mode
-        # is opt-in, but the scheduler precheck must not silently ignore a
-        # ready interactive job when it is enabled; the legacy stream remains
-        # last for drain/replay compatibility.
-        specs = (
-            queue_engine._stream_specs(group, routing_group=group)
-            if getattr(queue_engine, 'priority_lanes_enabled', False)
-            else [(queue_engine._stream(group, routing_group=group), None)]
-        )
-        entries = []
-        for stream, _lane in specs:
-            entries.extend(queue_engine.r.xrange(stream, count=10))
-    except Exception as e:
-        return {'group': group, 'decision': 'unknown', 'skipped_reason': f'redis_error_or_missing: {e}'}
-
-    if not entries:
-        return {'group': group, 'decision': 'skip', 'skipped_reason': 'empty'}
-
-    queued_job_ids = []
-    saw_cancelled = False
-    for entry_id, data in entries:
-        job_id = data.get('job_id')
-        if not job_id:
-            continue
-
-        job = job_tracker.get_job(job_id)
-        if not job:
-            continue
-
-        # JobTracker.get_job may return either a Job-shaped object with a
-        # `.status` attribute (legacy / live JobTracker) OR a plain mapping
-        # (rehydrated payloads, see handle_get_job). A stream entry alone is
-        # not dispatch authority: only a durable *queued* job may cause a
-        # scheduler-owned bundle transition. Claimed/in-flight entries remain
-        # in Redis Streams until terminal ACK and must not trigger a second
-        # swap after the worker has already taken ownership.
-        if isinstance(job, Mapping):
-            status = job.get('status')
-        else:
-            status = getattr(job, 'status', None)
-
-        if status == 'queued':
-            queued_job_ids.append(str(job_id))
-        elif status == 'cancelled':
-            saw_cancelled = True
-
-    if not queued_job_ids:
-        reason = 'all_cancelled' if saw_cancelled else 'no_durable_queued_job'
-        return {
-            'group': group,
-            'decision': 'skip',
-            'skipped_reason': reason,
-            'head_job_ids': [],
-        }
-
-    return {
-        'group': group,
-        'decision': 'proceed',
-        'skipped_reason': 'none',
-        'head_job_ids': queued_job_ids,
-    }
-
-def _scheduler_run_precheck(group: str) -> dict:
-    """Run precheck and record it in the head_job_pre_checks ring buffer."""
-    record = _scheduler_precheck_head_jobs(group)
-    try:
-        record['recorded_at'] = time.time()
-    except Exception:
-        pass
-    _record_head_job_precheck(record)
-    return record
-
-
-def _refresh_phase3_scheduler_state() -> dict:
-    """Refresh phase-3 demand/grace state without an observer request."""
-    all_gpu_states = _get_all_gpu_states()
-    generation_templates = (_services_config.get("generation_templates", {}) or {})
-    groups = {}
-    for service_name, service_cfg in (_services_config.get("services", {}) or {}).items():
-        routing_group = service_cfg.get("routing_group") or service_name
-        group = groups.setdefault(
-            routing_group,
-            {
-                "type": "unknown",
-                "priority": service_cfg.get("priority", 50),
-                "queue_lag": 0,
-            },
-        )
-        if service_cfg.get("type") == "llm_backend":
-            group["type"] = "llm"
-        elif service_cfg.get("type") == "generation_backend" or service_cfg.get("bundle"):
-            group["type"] = "generation"
-
-    if queue_engine is not None:
-        for routing_group, group in groups.items():
-            try:
-                observation = _queue_depth_observation(
-                    queue_engine, routing_group, routing_group
-                )
-                group["queue_lag"] = (
-                    observation["depth"] if observation["known"] else 0
-                )
-                group["queue_lag_observed"] = observation["depth"]
-                group["queue_lag_known"] = observation["known"]
-                group["queue_lag_reason"] = observation["reason"]
-            except Exception as exc:
-                logger.debug("phase3 refresh queue-depth failed for %s: %s", routing_group, exc)
-
-    return _get_phase3_scheduler_state(groups, all_gpu_states, generation_templates)
-
-
-def _scheduler_evaluate_load(now=None) -> dict:
-    global _last_decision
-    if now is None:
-        now = time.time()
-
-    config = _phase3_scheduling_config()
-    dry_run_mode = config.get('scheduler_dry_run_mode', True)
-    decision = {
-        'action': 'noop',
-        'reason': 'default',
-        'target_gpus': [],
-        'head_job_ids': [],
-        'decision_id': str(uuid.uuid4()),
-        'decided_at': now,
-        'group': None,
-        'dry_run': dry_run_mode,
-        'dispatch_performed': False
-    }
-
-    if not config.get('scheduler_owns_load'):
-        decision['reason'] = 'scheduler_owns_load_false'
-        _last_decision = decision.copy()
-        _record_load_history(decision)
-        return decision
-
-    last_next = _last_next_decision.get('next_decision')
-
-    if last_next == 'awaiting_grace':
-        decision['action'] = 'awaiting_grace'
-        decision['reason'] = 'awaiting_grace phase 3 state'
-    elif 'queue_engine' not in globals() or not queue_engine or not _services_config:
-        decision['action'] = 'awaiting_judging'
-        decision['reason'] = 'no queue_engine or service-groups info'
-    elif isinstance(last_next, str) and last_next.startswith('demand:'):
-        group = last_next.split(':', 1)[1]
-        decision['group'] = group
-        precheck = _scheduler_run_precheck(group)
-        head_job_ids = precheck.get('head_job_ids') or []
-        if isinstance(head_job_ids, (list, tuple)):
-            decision['head_job_ids'] = [
-                str(job_id) for job_id in head_job_ids
-                if isinstance(job_id, str) and job_id
-            ]
-        if (
-            precheck.get('skipped_reason') in (
-                'empty', 'all_cancelled', 'no_durable_queued_job'
-            )
-            or not decision['head_job_ids']
-        ):
-            decision['action'] = 'pre_load_failed_skip'
-            decision['reason'] = (
-                'precheck has no durable queued head job: '
-                f"{precheck.get('skipped_reason', 'missing_head_job_ids')}"
-            )
-        elif _active_group_still_draining(group):
-            decision['action'] = 'hold_drain'
-            decision['reason'] = 'active group draining; defer load'
-        else:
-            target_gpus = list(_resolve_group_target_gpus(group) or [])
-            # If we couldn't derive ANY target GPUs from config, fail closed:
-            # do not advertise a demand_load the dispatcher can't actually act
-            # on. (Advisory telemetry only — the authoritative atomic path is
-            # still _evict_then_load_bundle, which validates targets itself.)
-            if not target_gpus:
-                decision['action'] = 'insufficient_visibility'
-                decision['reason'] = (
-                    f"unreadable target_gpus for group {group!r}: "
-                    "no template/bundle resolution available"
-                )
-                decision['requires_eviction'] = False
-            elif group in {'comfyui-gen', 'image-gen'}:
-                decision['action'] = 'dual_gpu_load'
-                decision['target_gpus'] = target_gpus
-                decision['reason'] = 'demand load for dual gpu'
-                try:
-                    decision['requires_eviction'] = _target_gpus_hold_warm_bundle(group)
-                except _TargetStateUnreadable as exc:
-                    decision['action'] = 'insufficient_visibility'
-                    decision['reason'] = (
-                        f"unreadable target state for group {group!r}: "
-                        f"gpu {exc.gpu_id!r}"
-                    )
-                    decision['requires_eviction'] = False
-            else:
-                decision['action'] = 'demand_load'
-                decision['target_gpus'] = target_gpus
-                decision['reason'] = 'demand load'
-                try:
-                    decision['requires_eviction'] = _target_gpus_hold_warm_bundle(group)
-                except _TargetStateUnreadable as exc:
-                    decision['action'] = 'insufficient_visibility'
-                    decision['reason'] = (
-                        f"unreadable target state for group {group!r}: "
-                        f"gpu {exc.gpu_id!r}"
-                    )
-                    decision['requires_eviction'] = False
-    elif last_next == 'idle':
-        idle_preferred = _last_next_decision.get('idle_preferred', False)
-        if idle_preferred:
-            decision['action'] = 'idle_load'
-            decision['reason'] = 'idle_preferred'
-            # This remains dry-run telemetry, but it must identify the
-            # configured per-GPU idle bundle scope. An empty target list made
-            # restore/accounting evidence ambiguous during dual-GPU recovery.
-            idle_services = ((_services_config or {}).get('scheduling') or {}).get(
-                'idle_services', {}
-            ) or {}
-            decision['target_gpus'] = sorted(
-                str(gpu_id) for gpu_id in idle_services if gpu_id
-            )
-            if not decision['target_gpus']:
-                decision['target_gpus'] = sorted(
-                    str(gpu_id) for gpu_id in _get_all_gpu_states() if gpu_id
-                )
-        else:
-            decision['action'] = 'noop'
-            decision['reason'] = 'idle noop'
-
-    logger.info(f"evaluator.decision: {json.dumps(decision)}")
-    _last_decision = decision.copy()
-    _record_load_history(decision)
-    return decision
-
-
-def _resolve_scheduler_bundle_for_group(group: str) -> tuple[str | None, int | None, str | None]:
-    """Resolve exactly one configured generation bundle for a selected group."""
-    templates = (_services_config or {}).get("generation_templates", {}) or {}
-    bundles = []
-    for template in templates.values():
-        if not isinstance(template, dict) or template.get("routing_group") != group:
-            continue
-        bundle = template.get("bundle")
-        if bundle and bundle not in bundles:
-            bundles.append(str(bundle))
-    if len(bundles) != 1:
-        if not bundles:
-            return None, None, "no_configured_bundle_for_group"
-        return None, None, "ambiguous_configured_bundles_for_group"
-    return bundles[0], _service_group_priority(group, {}, templates), None
-
-
-async def _dispatch_scheduler_decision(decision: dict) -> dict:
-    """Execute one demand decision only behind three independent live gates."""
-    result = dict(decision)
-    result["dispatch_performed"] = False
-    if result.get("action") not in {"demand_load", "dual_gpu_load"}:
-        result["dispatch_reason"] = "non_dispatch_action"
-        return result
-
-    config = _phase3_scheduling_config()
-    if not config.get("scheduler_owns_load"):
-        result["dispatch_reason"] = "scheduler_owns_load_false"
-        return result
-    if config.get("scheduler_dry_run_mode", True):
-        result["dispatch_reason"] = "scheduler_dry_run_mode"
-        return result
-    if not config.get("proactive_scheduling_enabled", False):
-        result["dispatch_reason"] = "proactive_scheduling_disabled"
-        return result
-
-    head_job_ids = result.get("head_job_ids")
-    if (
-        not isinstance(head_job_ids, list)
-        or not any(isinstance(job_id, str) and job_id for job_id in head_job_ids)
-    ):
-        result["dispatch_reason"] = "no_durable_head_job"
-        return result
-
-    group = result.get("group")
-    if not isinstance(group, str) or not group:
-        result["dispatch_reason"] = "missing_selected_group"
-        return result
-    bundle, priority, resolution_error = _resolve_scheduler_bundle_for_group(group)
-    if resolution_error or bundle is None or priority is None:
-        result["dispatch_reason"] = resolution_error or "invalid_bundle_resolution"
-        return result
-
-    result["bundle"] = bundle
-    try:
-        loaded = await _evict_then_load_bundle(
-            bundle,
-            reason=f"scheduler:{group}",
-            priority=priority,
-        )
-    except Exception as exc:
-        result["dispatch_reason"] = f"bundle_load_raised:{type(exc).__name__}"
-        result["dispatch_error"] = str(exc)[:300]
-        return result
-    if not loaded:
-        result["dispatch_reason"] = "bundle_load_failed"
-        return result
-
-    result["dispatch_performed"] = True
-    result["dispatch_reason"] = "bundle_loaded"
-    return result
-
-
-async def _proactive_dispatch_loop():
-    """Evaluate demand continuously and dispatch only behind the live triple gate.
-
-    In dry-run mode this records would-have decisions. A real bundle transition
-    requires scheduler ownership, non-dry-run configuration, and explicit
-    proactive scheduling enablement.
-    """
-    global _last_decision
-    logger.info(
-        "Proactive dispatch startup grace: waiting %.1fs before first decision",
-        GPU_PROBE_STARTUP_GRACE_S,
-    )
-    await asyncio.sleep(GPU_PROBE_STARTUP_GRACE_S)
-    try:
-        import time as _time
-        _proactive_dispatch_state["last_iteration_at"] = _time.time()
-    except Exception as e:
-        logger.warning(f"proactive_dispatch_loop import failed: {e}")
-        return
-    while True:
-        try:
-            _proactive_dispatch_state["iteration_count"] += 1
-            _proactive_dispatch_state["last_iteration_at"] = _time.time()
-            # Read phase 3 scheduling config (returns the env-var-aware dict)
-            config = _phase3_scheduling_config()
-            live_dispatch_enabled = bool(
-                config.get("scheduler_owns_load")
-                and not config.get("scheduler_dry_run_mode", True)
-                and config.get("proactive_scheduling_enabled", False)
-            )
-            _proactive_dispatch_state["dry_run"] = not live_dispatch_enabled
-            # Skip if scheduler is not the owner
-            if not config.get("scheduler_owns_load"):
-                await asyncio.sleep(_PROACTIVE_LOOP_INTERVAL_SEC)
-                continue
-            # Get a fresh decision
-            now = _time.time()
-            _refresh_phase3_scheduler_state()
-            decision = _scheduler_evaluate_load(now)
-            if not isinstance(decision, dict):
-                await asyncio.sleep(_PROACTIVE_LOOP_INTERVAL_SEC)
-                continue
-            action = decision.get("action", "noop")
-            # Classify and update counters
-            _proactive_dispatch_state["last_decision"] = decision
-            # The 10-second same-action spacing suppresses **dry-run telemetry
-            # only**. Live dispatch fires every iteration regardless of the
-            # previous decision, because _evict_then_load_bundle is the
-            # authoritative atomic path and idempotency is enforced there
-            # (priority-aware precheck + readiness probe). See
-            # _should_suppress_proactive_spacing.
-            global _PROACTIVE_LAST_DECISION
-            last_recorded_at = _proactive_dispatch_state.get("last_action_recorded_at", 0.0)
-            last_decision_action = (
-                _PROACTIVE_LAST_DECISION.get("action")
-                if isinstance(_PROACTIVE_LAST_DECISION, dict)
-                else None
-            )
-            suppress_telemetry = _should_suppress_proactive_spacing(
-                now=now,
-                action=action,
-                last_action_recorded_at=last_recorded_at,
-                last_decision_action=last_decision_action,
-                dry_run=not live_dispatch_enabled,
-            )
-            if suppress_telemetry:
-                _proactive_dispatch_state["spaced_actions"] += 1
-            else:
-                # Record the would-have-done
-                if action in ("demand_load", "dual_gpu_load", "idle_load"):
-                    _proactive_dispatch_state["would_have_loaded"] += 1
-                elif action == "evict_only":
-                    _proactive_dispatch_state["would_have_evicted"] += 1
-                elif action in ("hold_drain", "awaiting_grace"):
-                    _proactive_dispatch_state["would_have_held"] += 1
-                _PROACTIVE_LAST_DECISION = decision
-                _proactive_dispatch_state["last_action_recorded_at"] = now
-            if live_dispatch_enabled:
-                dispatched = await _dispatch_scheduler_decision(decision)
-                _proactive_dispatch_state["last_decision"] = dispatched
-                _last_decision = dispatched.copy()
-                _record_load_history(dispatched)
-                if dispatched.get("dispatch_performed"):
-                    _proactive_dispatch_state["dispatched"] += 1
-                elif dispatched.get("action") in {"demand_load", "dual_gpu_load"}:
-                    _proactive_dispatch_state["dispatch_failures"] += 1
-        except Exception as e:
-            _proactive_dispatch_state["errors"].append({
-                "at": _time.time(),
-                "error": str(e)[:200]
-            })
-            # Cap errors list at 10
-            if len(_proactive_dispatch_state["errors"]) > 10:
-                _proactive_dispatch_state["errors"] = _proactive_dispatch_state["errors"][-10:]
-            logger.warning(f"proactive_dispatch_loop error: {e}")
-        await asyncio.sleep(_PROACTIVE_LOOP_INTERVAL_SEC)
-
-
-def _should_suppress_proactive_spacing(
-    *,
-    now: float,
-    action: str,
-    last_action_recorded_at: float,
-    last_decision_action: str | None,
-    dry_run: bool,
-) -> bool:
-    """Decide whether the proactive loop should suppress dry-run telemetry.
-
-    Returns True iff the previous decision was the same action AND it was
-    recorded less than ``_PROACTIVE_SPACING_WINDOW_SEC`` seconds ago AND we
-    are in dry-run mode. Live dispatch is NEVER suppressed by this rule —
-    see the docstring on ``_proactive_dispatch_loop`` for why.
-    """
-    if not dry_run:
-        return False
-    if last_decision_action is None:
-        return False
-    if action != last_decision_action:
-        return False
-    if (now - last_action_recorded_at) >= _PROACTIVE_SPACING_WINDOW_SEC:
-        return False
-    return True
 
 # --- Phase 5 Reservation Skeleton ---
 _gpu_reservations = {}
@@ -2978,293 +2299,15 @@ _ingress_blocked_by_reservation = 0
 _ingress_blocked_by_reservation_by_group = {}
 _reservation_config_warnings = []
 
-def _phase5_reservation_config() -> dict:
-    root = _services_config or {}
-    res_cfg = root.get('reservations', {}) or {}
-    explicit_path = root.get('gpu_reservations_path') or res_cfg.get('gpu_reservations_path')
-    path = explicit_path or '/run/gpu-manager/reservations.json'
-    defaults = res_cfg.get('reservation_defaults', {}) or {}
-    persistence_enabled = bool(explicit_path) or bool(res_cfg.get('enabled') or res_cfg.get('persistence_enabled'))
-    return {
-        'gpu_reservations_path': path,
-        'reservation_defaults': defaults,
-        'persistence_enabled': persistence_enabled
-    }
 
-def _derive_group_reservations(groups=None, generation_templates=None) -> dict:
-    global _reservation_config_warnings
-    warnings = []
-    derived = {}
-    if groups is None:
-        groups = {}
-    if generation_templates is None:
-        generation_templates = {}
-    # Qualification/draft templates remain visible in the endpoint's raw
-    # inventory, but they must not create operational GPU reservations or
-    # warnings that look like active queue ownership.  Services are filtered
-    # separately by _is_queue_consumer_service().
-    generation_templates = {
-        name: template
-        for name, template in generation_templates.items()
-        if isinstance(template, Mapping)
-        and _service_is_publicly_qualified(template)
-        and not is_retired_minimax_comfyui_template(template)
-    }
 
-    routing_groups_config = {}
-    try:
-        routing_groups_config = _services_config.get('routing_groups', {}) or {}
-    except Exception:
-        routing_groups_config = {}
 
-    all_groups = set(list(groups.keys()) + list(generation_templates.keys()) + list(routing_groups_config.keys()))
-    for t in generation_templates.values():
-        if t.get('routing_group'):
-            all_groups.add(t['routing_group'])
 
-    krea_like_groups = {'comfyui-gen', 'image', 'image-edit-krea2'}
-    for grp_name in sorted(all_groups):
-        explicit = routing_groups_config.get(grp_name, {}) or {}
-        requires_gpus = list(dict.fromkeys(explicit.get('requires_gpus', []) or []))
-        mode = explicit.get('gpu_reservation_mode', explicit.get('mode', 'exclusive'))
-        hold_s = explicit.get('gpu_reservation_hold_s', explicit.get('hold_s', 120))
-        priority = _service_group_priority(grp_name, groups, generation_templates)
-        owner = explicit.get('owner')
-        description = explicit.get('description')
 
-        if 'priority' in explicit:
-            priority = _coerce_group_priority(explicit.get('priority'), allow_cpu_fallback=True)
 
-        if not requires_gpus:
-            # infer from template bundle
-            tmpl = generation_templates.get(grp_name)
-            if not tmpl:
-                for t in generation_templates.values():
-                    if t.get('routing_group') == grp_name:
-                        tmpl = t
-                        break
-            if not tmpl:
-                tmpl = {}
-            bundle = tmpl.get('bundle')
-            if bundle:
-                try:
-                    bundle_map = _resolve_bundles()
-                    res = bundle_map.get(bundle)
-                    if res and res.get('gpu_id'):
-                        requires_gpus.append(res['gpu_id'])
-                        try:
-                            linked = _collect_linked_gpus(res, bundle_map)
-                            for lg in linked:
-                                if lg not in requires_gpus:
-                                    requires_gpus.append(lg)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            basename = str(tmpl.get('workflow_template', '')).split('/')[-1]
-            if ('krea2_multigpu' in basename or 'multigpu' in basename) and len(requires_gpus) <= 1:
-                warnings.append(f"group '{grp_name}': inferred single GPU but template suggests multigpu")
-            if 'image-edit-krea2' in str(tmpl.get('workflow_template', '')) and len(requires_gpus) <= 1:
-                warnings.append(f"group '{grp_name}': ambiguous/missing routing_group config; image-edit-krea2 requires both gpu_primary and gpu_secondary but inferred only {requires_gpus}")
 
-        if grp_name in krea_like_groups:
-            if grp_name not in routing_groups_config:
-                warnings.append(f"group '{grp_name}': missing routing_groups[{grp_name}] config; inferred {requires_gpus or 'no GPUs'}")
-            if len(requires_gpus) <= 1:
-                warnings.append(f"group '{grp_name}': configured for only {requires_gpus[0] if requires_gpus else 'no GPU'}, but known Krea path needs both gpu_primary and gpu_secondary")
 
-        if grp_name in routing_groups_config and 'priority' not in explicit:
-            warnings.append(f"group '{grp_name}': routing_groups entry missing priority; derived ownership priority {priority}")
 
-        derived[grp_name] = {
-            'requires_gpus': requires_gpus,
-            'mode': mode,
-            'hold_s': hold_s,
-            'priority': priority,
-        }
-        if owner is not None:
-            derived[grp_name]['owner'] = owner
-        if description is not None:
-            derived[grp_name]['description'] = description
-
-    _reservation_config_warnings = warnings
-    return derived
-
-def _validate_reservation_config(group_reservations) -> list:
-    warnings = []
-    known_gpus = []
-    try:
-        known_gpus = list(_services_config.get('gpu_devices', {}).keys())
-    except Exception:
-        pass
-
-    for grp, res in group_reservations.items():
-        if len(res.get('requires_gpus', [])) > 1:
-            try:
-                tmpl = _services_config.get('generation_templates', {}).get(grp, {})
-                bundle = tmpl.get('bundle')
-                if bundle:
-                    b_info = _resolve_bundles().get(bundle, {})
-                    b_gpu = b_info.get('gpu_id')
-                    try:
-                        linked = _collect_linked_gpus(b_info, _resolve_bundles()) if b_info else []
-                    except Exception:
-                        linked = []
-                    evidence = [b_gpu] + list(linked)
-                    if not any(g in evidence for g in res['requires_gpus']):
-                        warnings.append(f"group '{grp}': requires_gpus > 1 but no bundle/link evidence inferred")
-            except Exception:
-                pass
-
-        if grp in {'comfyui-gen', 'image', 'image-edit-krea2'} and set(res.get('requires_gpus', [])) <= {'gpu_primary'}:
-            warnings.append(f"group '{grp}': configured for only gpu_primary, but known Krea path needs both gpu_primary and gpu_secondary")
-
-        if known_gpus:
-            for g in res.get('requires_gpus', []):
-                if g not in known_gpus:
-                    warnings.append(f"group '{grp}': unknown gpu_id '{g}' in requires_gpus")
-
-    try:
-        config = _phase3_scheduling_config()
-        if config.get('scheduler_owns_load'):
-            templates = _services_config.get('generation_templates', {})
-            for name, tmpl in templates.items():
-                if tmpl.get('evict_first'):
-                    warnings.append(f"template '{name}': evict_first is forbidden when scheduler_owns_load=true (runtime ignores it; remove from config)")
-    except Exception:
-        pass
-
-    return warnings
-
-def _record_reservation_change(action, group, token, gpu_ids, **kwargs):
-    global _last_reservation_change
-    now = time.time()
-    record = {
-        'timestamp': now,
-        'action': action,
-        'group': group,
-        'token': token,
-        'gpu_ids': gpu_ids
-    }
-    record.update(kwargs)
-    _reservation_history.insert(0, record)
-    while len(_reservation_history) > 50:
-        _reservation_history.pop()
-
-    _last_reservation_change = {
-        'group': group,
-        'gpu_ids': gpu_ids,
-        'action': action,
-        'token': token,
-        'at': now
-    }
-    if 'reason' in kwargs:
-        _last_reservation_change['reason'] = kwargs['reason']
-    if 'mode' in kwargs:
-        _last_reservation_change['mode'] = kwargs['mode']
-    if 'hold_s' in kwargs:
-        _last_reservation_change['hold_s'] = kwargs['hold_s']
-
-def reserve_gpus(group, gpu_ids, token=None, mode='exclusive', hold_s=120) -> tuple:
-    if not token:
-        token = str(uuid.uuid4())
-    now = time.time()
-
-    # check conflict
-    for gid in gpu_ids:
-        if gid in _gpu_reservations:
-            res = _gpu_reservations[gid]
-            if res['group'] != group or res['token'] != token:
-                if res['hold_expires_at'] > now:
-                    return False, {'conflict_gpu': gid, 'reserved_by': res['group']}
-
-    # success
-    for gid in gpu_ids:
-        _gpu_reservations[gid] = {
-            'group': group,
-            'token': token,
-            'reserved_at': now,
-            'hold_expires_at': now + hold_s,
-            'mode': mode
-        }
-
-    _record_reservation_change('reserve', group, token, gpu_ids, mode=mode, hold_s=hold_s)
-    _persist_reservations()
-    return True, {'token': token, 'expires_at': now + hold_s}
-
-def release_gpus(group, token, reason='release') -> tuple:
-    released = []
-    for gid, res in list(_gpu_reservations.items()):
-        if res['group'] == group and res['token'] == token:
-            del _gpu_reservations[gid]
-            released.append(gid)
-
-    if released:
-        _record_reservation_change(reason, group, token, released)
-        _persist_reservations()
-        return True, {'released': released}
-    return False, {'reason': 'not_found_or_mismatch'}
-
-def expire_reservations(now=None) -> list:
-    if now is None:
-        now = time.time()
-    expired = []
-    for gid, res in list(_gpu_reservations.items()):
-        if res['hold_expires_at'] <= now:
-            expired.append((gid, res))
-            del _gpu_reservations[gid]
-
-    if expired:
-        for gid, res in expired:
-            _record_reservation_change('expire', res['group'], res['token'], [gid])
-        _persist_reservations()
-    return [e[0] for e in expired]
-
-def _reservation_persistence_path() -> str:
-    return _phase5_reservation_config().get('gpu_reservations_path', '/run/gpu-manager/reservations.json')
-
-def _persist_reservations() -> dict:
-    path = _reservation_persistence_path()
-    config = _phase5_reservation_config()
-    # Explicitly check if persistence is configured
-    if not config.get('persistence_enabled'):
-        return {'ok': False, 'reason': 'not_enabled', 'path': path}
-
-    try:
-        import tempfile
-        import os
-        import json
-
-        data = {
-            'reservations': _gpu_reservations,
-            'last_change': _last_reservation_change,
-            'timestamp': time.time()
-        }
-
-        dir_name = os.path.dirname(path)
-        if not os.path.exists(dir_name):
-            os.makedirs(dir_name, exist_ok=True)
-
-        fd, temp_path = tempfile.mkstemp(dir=dir_name, prefix='reservations_', suffix='.json.tmp')
-        with os.fdopen(fd, 'w') as f:
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-
-        if os.path.exists(path):
-            try:
-                os.replace(path, path + '.bak')
-            except Exception:
-                pass
-        os.replace(temp_path, path)
-        return {'ok': True, 'path': path}
-    except Exception as e:
-        return {'ok': False, 'reason': 'error', 'details': str(e)}
-
-def _record_ingress_blocked_by_reservation(group):
-    global _ingress_blocked_by_reservation
-    _ingress_blocked_by_reservation += 1
-    _ingress_blocked_by_reservation_by_group[group] = _ingress_blocked_by_reservation_by_group.get(group, 0) + 1
 
 # ----------------------------------
 
@@ -3276,7 +2319,7 @@ import subprocess
 import sys
 import signal
 import socket
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from enum import Enum
 from aiohttp import web, ClientSession, ClientTimeout, ClientError, ClientConnectorError, ServerDisconnectedError
 import redis as _redis_mod
@@ -3289,11 +2332,38 @@ from queue_engine import (
 from queue_engine import terminalize_if_impossible as terminalize_job_if_impossible
 from queue_engine import AsyncRedisQueue, AsyncSlotManager, AsyncCapacityReporter, AsyncFleetGossiper
 import queue_engine
+from queue_recovery import (
+    GENERATION_POLL_DEADLINE_MAX_S,
+    RECONCILE_SWEEP_INTERVAL_S,
+    RECONCILE_SWEEP_WINDOW_S,
+    RESTART_REQUEUE_MAX,
+    PelAction,
+    SlotAction,
+    bounded_lease_s,
+    classify_boot_slot,
+    classify_pel_entry,
+    evicting_decision,
+    evicting_stale_after_s,
+    generation_poll_deadline_s,
+    queue_reason as _queue_reason_code,
+    service_polls_workflows,
+)
+from comfyui_liveness import (
+    LOST_COMPLETION_ERROR_TYPE,
+    LostCompletionTracker,
+    PromptLiveness,
+    lost_completion_grace_s,
+    probe_prompt,
+)
 from bundle_lifecycle import (
     BundleLifecycleController,
     DesiredState as BundleDesiredState,
     RedisBundleLifecycleStore,
+    exclude_active_child_transitions as _exclude_active_child_transitions,
 )
+from admission_affirmation import AdmissionController, AdmissionStatus, dry_run_config
+from placement_orchestrator import PlacementOrchestrator, PlacementDecisionStatus
+from hardware_recognition import recognize_hardware_device
 
 # Plan 04 §1: canonical semantic reducer. Every health/state surface that
 # needs runtime_mode / contradictions / active_llm_route / blocked_reasons /
@@ -3374,7 +2444,6 @@ except ImportError as e:
 
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://localhost:8188")
 LLM_BACKEND_URL = os.environ.get("LLM_BACKEND_URL", "http://localhost:8092")
-VISION_BACKEND_URL = os.environ.get("VISION_BACKEND_URL", "http://localhost:8090")
 ACESTEP_URL = os.environ.get("ACESTEP_URL", "http://localhost:8001")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8091"))
 HEALTH_POLL_INTERVAL = 5    # seconds between health/queue checks
@@ -3514,7 +2583,11 @@ def _orphan_reaper_status(*, now: float | None = None) -> dict[str, Any]:
     if _maintenance_mode_enabled(scheduling):
         state.update(state="paused", reason="maintenance_mode")
     elif manager is None or getattr(manager, "_running", False) is not True:
-        state.update(state="paused", reason="scheduler_not_running")
+        # the reaper ticks inside the legacy scheduler loop; with the durable
+        # queue owner that loop is fenced, so "off" is by design, not a fault
+        durable = _queue_owner_mode(scheduling) == "durable"
+        state.update(state="off" if durable else "paused",
+                     reason="durable_queue_owner" if durable else "scheduler_not_running")
     elif (
         state["last_tick_age_s"] is None
         or state["last_tick_age_s"] > max(ORPHAN_REAPER_INTERVAL_S * 2, 60.0)
@@ -3554,6 +2627,11 @@ TRANSITION_STEPS = {
         {"id": "wait_vram_load",  "label": "Load model to GPU",             "weight": 40, "verify": "vram_above_pct"},
         {"id": "wait_healthy",    "label": "Wait for LLM ready",            "weight": 30, "verify": "http_healthy"},
         {"id": "set_cgroup",      "label": "Apply CPU affinity",            "weight": 5,  "verify": "cgroup_matches"},
+    ],
+    "restart": [
+        {"id": "stop_old",          "label": "Stop service",                  "weight": 10, "verify": "systemctl_inactive"},
+        {"id": "start_new",         "label": "Start service",                 "weight": 55, "verify": "systemctl_active"},
+        {"id": "wait_healthy",      "label": "Wait for service ready",       "weight": 35, "verify": "http_healthy"},
     ],
     "relief": [
         {"id": "restore_temp",     "label": "Restore LLM for relief",       "weight": 15, "verify": "llm_healthy"},
@@ -3604,17 +2682,40 @@ def _service_health_check(service_name: str) -> bool:
 
 
 def _reconcile_stale_queues() -> int:
-    """Flush stale queue entries and reset counters on startup.
-    Called once during create_app(). Returns number of entries flushed."""
+    """Reset capacity counters for DOWN services on startup.
+    Called once during create_app(). Returns number of entries flushed.
+
+    Queued entries are durable work: a backend being down at boot (evicted for
+    a generation job, mid-restart) is normal, and the durable workers deliver
+    the entry once it returns. Entries are therefore flushed only under the
+    ``legacy`` owner, where the durable supervisor is fenced and nothing would
+    ever consume them; under ``split``/``durable`` they are preserved.
+    """
     if not queue_engine:
         return 0
     flushed = 0
+    durable_consumers = _queue_owner_mode() != 'legacy'
     services = _services_config.get("services", {})
     for svc_name, svc_cfg in services.items():
         if svc_cfg.get("type") != "llm_backend" or not svc_cfg.get("enabled"):
             continue
         if not _service_health_check(svc_name):
-            count = queue_engine.purge(svc_name)
+            if durable_consumers:
+                try:
+                    kept = queue_engine.get_queue_depth(
+                        svc_name, svc_cfg.get("routing_group")
+                    )
+                except Exception:
+                    kept = 0
+                if kept:
+                    logger.info(
+                        "Reconcile: preserved %d queued entries for %s "
+                        "(service DOWN, durable consumers own the stream)",
+                        kept, svc_name,
+                    )
+                count = 0
+            else:
+                count = queue_engine.purge(svc_name)
             flushed += count
             if count:
                 logger.warning("Reconcile: flushed %d stale entries from %s (service DOWN)",
@@ -3776,8 +2877,15 @@ def _canonical_runtime_semantics(readiness: dict | None = None) -> dict:
     enabled_units = [
         _unit(name) for name, cfg in services.items() if cfg.get("enabled", False)
     ]
+    # a unit shared with an enabled service (fleet-llm-router) is not "disabled"
     disabled_units = [
-        _unit(name) for name, cfg in services.items() if not cfg.get("enabled", False)
+        unit for name, cfg in services.items() if not cfg.get("enabled", False)
+        if (unit := _unit(name)) not in enabled_units
+    ]
+    always_on_units = [
+        _unit(name) for name, cfg in services.items()
+        if cfg.get("enabled", False) and not cfg.get("gpu_id") and not cfg.get("gpu_ids")
+        and cfg.get("type") != "generation_backend"  # on-demand jobs stay "idle"
     ]
     states = list(globals().get("_gpu_states", {}).values())
     manager = globals().get("vram")
@@ -3793,6 +2901,7 @@ def _canonical_runtime_semantics(readiness: dict | None = None) -> dict:
         maintenance_mode=_maintenance_mode_enabled(scheduling),
         enabled_service_names=enabled_units,
         disabled_service_names=disabled_units,
+        always_on_service_names=always_on_units,
         loaded_runtime_services=runtime["services"],
         loaded_runtime_bundles=runtime["bundles"],
         gpu_state_value=str(gpu_state or ""),
@@ -3858,6 +2967,27 @@ def _get_idle_service_port(gpu_id: str | None = None) -> int:
         svc = config.get("services", {}).get(idle_svc, {})
         return svc.get("port", 8092)
     return 8092
+
+
+async def _wait_for_idle_service_healthy(gpu_id: str | None, timeout: float) -> bool:
+    """Poll /health of *gpu_id*'s idle service.
+
+    vram._wait_for_llm_healthy (byte-frozen template) resolves the port without a
+    GPU, so with only per-GPU idle_services it polled the :8092 default: a healthy
+    Gemma-RX6950XT timed out after 90 s and was unloaded (2026-10-11 03:09:50).
+    """
+    url = f"http://localhost:{_get_idle_service_port(gpu_id)}/health"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            async with vram.session.get(url, timeout=ClientTimeout(total=5, connect=3)) as resp:
+                if resp.status == 200 and (await resp.json()).get("status") == "ok":
+                    llm.update_health(True)
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+    return False
 
 
 def _get_all_idle_service_names() -> list[str]:
@@ -4003,6 +3133,7 @@ LLM_RELIEF_MAX_DURATION = 120  # max seconds to spend in relief before resuming 
 LLM_RESTORE_TIMEOUT = 90    # max seconds to wait for Qwen3.6 to become healthy
 IDLE_RESTORE_INTERVAL = 10  # check every N seconds if LLM should be restored
 COMFYUI_IDLE_COOLDOWN = 120  # seconds before auto-stopping ComfyUI when idle
+COMFYUI_STOPPED_NOTICE_INTERVAL_S = 300  # re-log "stopped, explicit start needed" at most this often
 
 # Model input names that identify the primary diffusion model
 MODEL_KEY_FIELDS = [
@@ -4062,6 +3193,36 @@ OOM_EVENT_TTL_S = 7 * 86400            # 7 days
 
 # Rate limiting
 OOM_FORCE_RESET_MIN_INTERVAL_S = 30    # Rate-limit oom_recovery_force_reset to once per 30s
+
+# Bound for an ownerless `evicting` flag. `evicting` is legitimately held for
+# the whole generation job, so this only applies once no owner remains. It is
+# derived from the observed operation deadlines (drain, restore health wait,
+# idle-restore cadence) and never drops below the OOM stuck-eviction floor; a
+# bare 90s would clear a restore that is using its full LLM_RESTORE_TIMEOUT.
+EVICTING_STALE_AFTER_S = evicting_stale_after_s(
+    drain_timeout_s=DRAIN_TIMEOUT,
+    restore_timeout_s=LLM_RESTORE_TIMEOUT,
+    idle_restore_interval_s=IDLE_RESTORE_INTERVAL,
+    floor_s=OOM_EVICTING_STUCK_TIMEOUT_S,
+)
+
+# Process start marks the boundary between leases held by this process (live
+# workers) and leases left behind by a previous incarnation (orphans).
+_PROCESS_STARTED_AT = time.time()
+
+# Counters for queue recovery, exposed on GET /v1/queue. In-process: they
+# describe what this incarnation has reconciled, not a durable ledger.
+_queue_recovery_stats: dict[str, int] = {
+    "reconcile_sweeps": 0,
+    "pel_preserved": 0,
+    "pel_requeued": 0,
+    "pel_dead_lettered": 0,
+    "pel_acked_terminal": 0,
+    "pel_cancelled": 0,
+    "forwarded_recovered": 0,
+    "slots_released_at_boot": 0,
+    "stale_evicting_cleared": 0,
+}
 _OOM_DEAD_LETTER_CAP = 100             # Per adversarial #11: cap dead-letter list at 100
 _OOM_DEAD_LETTER_TTL_S = 30 * 86400    # Per adversarial #11: 30 days TTL
 
@@ -4111,1168 +3272,80 @@ _TASK8A_RESTART_UNITS = (
 )
 
 
-class _MemoryCapRejectReason(Enum):
-    MAX_NOT_FINITE = "max_not_finite"
-    HIGH_GEQ_MAX = "high_geq_max"
-    HIGH_EXCEEDS_P99 = "high_exceeds_p99_x_1_10"
-    SWAP_MAX_NOT_FINITE = "swap_max_not_finite"
-    SWAP_EXCEEDS_P99 = "swap_exceeds_p99_x_1_25"
-    CONFLICTING_ALIASES = "conflicting_aliases"
-
-
-class _MemoryCapProvenance(dict):
-    """Mapping result with attribute access for the audit's ``.valid`` form."""
-
-    def __init__(
-        self,
-        valid: bool,
-        reason: str,
-        headroom_mib: int,
-        swap_envelope_mib: int,
-    ) -> None:
-        super().__init__(
-            valid=valid,
-            reason=reason,
-            headroom_mib=headroom_mib,
-            swap_envelope_mib=swap_envelope_mib,
-        )
-
-    @property
-    def valid(self) -> bool:
-        return self["valid"]
-
-    @property
-    def reason(self) -> str:
-        return self["reason"]
-
-    @property
-    def headroom_mib(self) -> int:
-        return self["headroom_mib"]
-
-    @property
-    def swap_envelope_mib(self) -> int:
-        return self["swap_envelope_mib"]
-
-    def as_dict(self) -> dict:
-        return dict(self)
-
-
-def _finite_positive_cap(value) -> int | None:
-    """Normalize one cgroup byte cap, rejecting zero/infinity/sentinels."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if value != value or value in (float("inf"), float("-inf")):
-        return None
-    integer = int(value)
-    if integer <= 0 or integer >= _TASK8A_UINT64_MAX:
-        return None
-    return integer
-
-
-def _positive_measurement(value) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    number = float(value)
-    if number <= 0 or number != number or number == float("inf"):
-        return None
-    return number
-
-
-def _memory_cap_provenance(
-    memory_max_bytes=None,
-    memory_high_bytes=None,
-    memory_swap_max_bytes=None,
-    working_set_p99_mib=None,
-    working_set_swap_p99_mib=None,
-    **aliases,
-) -> _MemoryCapProvenance:
-    """Validate finite memory caps against measured p99 envelopes.
-
-    Both the Pythonic parameter names and the names used by ``systemctl show``
-    in the Task 8A audit (``MemoryMax``, ``MemoryHigh``, ``MemorySwapMax``,
-    ``p99``, ``p99_swap``) are accepted.  Unknown/missing evidence rejects.
-    Supplying both spellings is permitted only when the values are identical;
-    conflicting spellings are rejected rather than silently giving the alias
-    precedence.
-    """
-    alias_pairs = {
-        "MemoryMax": ("memory_max_bytes", memory_max_bytes),
-        "MemoryHigh": ("memory_high_bytes", memory_high_bytes),
-        "MemorySwapMax": ("memory_swap_max_bytes", memory_swap_max_bytes),
-        "p99": ("working_set_p99_mib", working_set_p99_mib),
-        "p99_swap": ("working_set_swap_p99_mib", working_set_swap_p99_mib),
-    }
-    for alias, (python_name, python_value) in alias_pairs.items():
-        if alias not in aliases:
-            continue
-        alias_value = aliases.pop(alias)
-        if python_value is not None and alias_value != python_value:
-            return _MemoryCapProvenance(
-                False, _MemoryCapRejectReason.CONFLICTING_ALIASES.value, 0, 0
-            )
-        locals_value = alias_value if python_value is None else python_value
-        if python_name == "memory_max_bytes":
-            memory_max_bytes = locals_value
-        elif python_name == "memory_high_bytes":
-            memory_high_bytes = locals_value
-        elif python_name == "memory_swap_max_bytes":
-            memory_swap_max_bytes = locals_value
-        elif python_name == "working_set_p99_mib":
-            working_set_p99_mib = locals_value
-        else:
-            working_set_swap_p99_mib = locals_value
-    if aliases:
-        return _MemoryCapProvenance(
-            False, _MemoryCapRejectReason.CONFLICTING_ALIASES.value, 0, 0
-        )
-
-    maximum = _finite_positive_cap(memory_max_bytes)
-    high = _finite_positive_cap(memory_high_bytes)
-    if maximum is None or high is None:
-        return _MemoryCapProvenance(
-            False, _MemoryCapRejectReason.MAX_NOT_FINITE.value, 0, 0
-        )
-    headroom_mib = max(0, (maximum - high) // _TASK8A_MIB)
-    if high >= maximum:
-        return _MemoryCapProvenance(
-            False, _MemoryCapRejectReason.HIGH_GEQ_MAX.value, headroom_mib, 0
-        )
-
-    p99 = _positive_measurement(working_set_p99_mib)
-    if p99 is None or high > p99 * 1.10 * _TASK8A_MIB:
-        return _MemoryCapProvenance(
-            False, _MemoryCapRejectReason.HIGH_EXCEEDS_P99.value,
-            headroom_mib, 0,
-        )
-
-    swap_max = _finite_positive_cap(memory_swap_max_bytes)
-    if swap_max is None:
-        return _MemoryCapProvenance(
-            False, _MemoryCapRejectReason.SWAP_MAX_NOT_FINITE.value,
-            headroom_mib, 0,
-        )
-    swap_p99 = _positive_measurement(working_set_swap_p99_mib)
-    swap_envelope_mib = int(swap_p99 * 1.25) if swap_p99 is not None else 0
-    if swap_p99 is None or swap_max > swap_p99 * 1.25 * _TASK8A_MIB:
-        return _MemoryCapProvenance(
-            False, _MemoryCapRejectReason.SWAP_EXCEEDS_P99.value,
-            headroom_mib, swap_envelope_mib,
-        )
-    return _MemoryCapProvenance(True, "", headroom_mib, swap_envelope_mib)
-
-
-def _normalized_unit_name(unit) -> str:
-    if not isinstance(unit, str):
-        return ""
-    normalized = unit.strip().lower()
-    return normalized[:-8] if normalized.endswith(".service") else normalized
-
-
-def _is_cpu_llm_unit(unit: str) -> bool:
-    return _normalized_unit_name(unit) in {"gemma-cpu", "gemma-cpu-vision"}
-
-
-def _validate_production_parallel_invariant(services_config: dict) -> None:
-    """Reject multi-worker generation backends in explicit strict mode.
-
-    The worker supervisor accepts the newer ``worker_parallel`` and
-    ``queue_parallel`` fields while retaining the legacy ``parallel`` field.
-    Validate the same precedence before a startup or hot-reload candidate is
-    promoted, but keep the guard opt-in so existing qualification configs are
-    not changed implicitly.
-    """
-    if not isinstance(services_config, dict):
-        raise ValueError("services config must be a JSON object")
-    if services_config.get("strict_production_parallel") is not True:
-        return
-    services = services_config.get("services", {})
-    if not isinstance(services, dict):
-        raise ValueError("services config 'services' must be an object")
-    for service_name, service_config in services.items():
-        if not isinstance(service_config, dict):
-            continue
-        if service_config.get("type") != "generation_backend":
-            continue
-        effective = 1
-        selected_field = "default"
-        for field in ("worker_parallel", "queue_parallel", "parallel"):
-            if field not in service_config or service_config[field] is None:
-                continue
-            value = service_config[field]
-            if isinstance(value, bool):
-                raise ValueError(
-                    f"production parallel invariant: {service_name} has "
-                    f"invalid boolean {field}={value!r}"
-                )
-            try:
-                effective = int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"production parallel invariant: {service_name} has "
-                    f"invalid {field}={value!r}"
-                ) from exc
-            selected_field = field
-            break
-        if effective > 1:
-            raise ValueError(
-                "production parallel invariant: "
-                f"{service_name} effective {selected_field}={effective} "
-                "exceeds strict maximum 1"
-            )
+(
+    _MemoryCapRejectReason,
+    _MemoryCapProvenance,
+    _finite_positive_cap,
+    _positive_measurement,
+    _memory_cap_provenance,
+    _normalized_unit_name,
+    _is_cpu_llm_unit,
+    _validate_production_parallel_invariant,
+) = _bind_memory_policy(globals())
 
 
 # Physical capacity is supplied by each portable registry entry as ``vram_mib``
 # plus ``vram_reserve_mib``.  No machine-specific ceiling is embedded here.
 
 
-def _validate_linked_bundle_graph(config: dict) -> tuple[list[str], list[str]]:
-    """Fail-closed validation of the linked-bundle graph.
-
-    Inspects every bundle's ``linked_to``, ``linked_from`` and legacy
-    ``linked_bundles`` fields and emits:
-
-      * **errors** — graph corruption that must block the load:
-        unknown bundle names, self-links, cycles, broken
-        ``linked_from`` ↔ ``linked_to`` asymmetry, ``linked_from``
-        listing a parent that does not actually link back, duplicate
-        GPU ownership (two bundles with the same ``gpu_id`` and at
-        least one not idle), and unknown GPU / service references.
-      * **warnings** — recoverable inconsistencies such as a
-        non-empty ``linked_from`` for a bundle that has no
-        corresponding reverse pointer (advisory only — the runtime
-        bidirectional resolver handles this transparently).
-
-    This function is intentionally read-only: it inspects the supplied
-    config dict and never mutates it. Errors and warnings are surfaced
-    via ``/status`` so they are visible at startup and on every
-    hot-reload without changing the parsed config.
-    """
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    if not isinstance(config, dict):
-        return errors, warnings
-
-    bundles_raw = config.get("bundles", {})
-    if not isinstance(bundles_raw, dict) or not bundles_raw:
-        # Backward-compat path: legacy configs auto-generate bundles from
-        # services. Surface those as a separate graph once generated.
-        return errors, warnings
-
-    gpu_devices = config.get("gpu_devices", {}) or {}
-    if not isinstance(gpu_devices, dict):
-        gpu_devices = {}
-    known_gpus = {str(g) for g in gpu_devices.keys()}
-
-    services = config.get("services", {}) or {}
-    if not isinstance(services, dict):
-        services = {}
-    known_services = {str(s) for s in services.keys()}
-
-    # Pass 1: basic shape validation (self-links, unknown links, type errors,
-    # linked_from ↔ linked_to / linked_bundles symmetry).
-    forward_edges: dict[str, set[str]] = {}
-    reverse_edges: dict[str, set[str]] = {}
-    ownership: dict[str, list[str]] = {}
-
-    for name, bundle in bundles_raw.items():
-        if not isinstance(bundle, dict):
-            errors.append(f"bundle '{name}': not a JSON object")
-            continue
-
-        # Normalise the three link fields into lists for analysis. We do not
-        # mutate the bundle; we just collect locally.
-        def _as_list(field: str) -> list:
-            value = bundle.get(field, [])
-            if value is None:
-                return []
-            if not isinstance(value, list):
-                errors.append(
-                    f"bundle '{name}': '{field}' must be a list, got "
-                    f"{type(value).__name__}"
-                )
-                return []
-            return [str(item) for item in value]
-
-        linked_to = _as_list("linked_to")
-        linked_from = _as_list("linked_from")
-        linked_bundles = _as_list("linked_bundles")
-
-        forward_edges[name] = set(linked_to) | set(linked_bundles)
-        reverse_edges[name] = set(linked_from)
-
-        # Self-link checks.
-        for field, items in (
-            ("linked_to", linked_to),
-            ("linked_from", linked_from),
-            ("linked_bundles", linked_bundles),
-        ):
-            if name in items:
-                errors.append(
-                    f"bundle '{name}': '{field}' contains self-link"
-                )
-
-        # Unknown bundle references.
-        all_targets = set(linked_to) | set(linked_from) | set(linked_bundles)
-        for target in all_targets:
-            if target == name:
-                continue  # already reported as self-link
-            if target not in bundles_raw:
-                errors.append(
-                    f"bundle '{name}': references unknown bundle '{target}'"
-                )
-
-        # Symmetry: A → B in linked_to implies B's linked_from contains A.
-        for target in linked_to:
-            target_from = (
-                bundles_raw.get(target, {}).get("linked_from", [])
-                if isinstance(bundles_raw.get(target), dict)
-                else []
-            )
-            target_from_list = target_from if isinstance(target_from, list) else []
-            if name not in target_from_list:
-                warnings.append(
-                    f"bundle '{name}': linked_to '{target}' but '{target}' "
-                    f"does not list '{name}' in linked_from "
-                    f"(bidirectional resolver will still treat as linked)"
-                )
-
-        # Symmetry: A → B in linked_from means B should list A in linked_to
-        # (or linked_bundles). If neither, the reverse edge is dangling.
-        for parent in linked_from:
-            if parent == name:
-                continue  # self-link already reported
-            parent_bundle = bundles_raw.get(parent)
-            if not isinstance(parent_bundle, dict):
-                continue  # unknown parent already flagged above
-            parent_links = (
-                set(parent_bundle.get("linked_to", []) or [])
-                | set(parent_bundle.get("linked_bundles", []) or [])
-            )
-            if name not in parent_links:
-                errors.append(
-                    f"bundle '{name}': linked_from '{parent}' is asymmetric — "
-                    f"'{parent}' does not list '{name}' in linked_to/"
-                    f"linked_bundles"
-                )
-
-        # Unknown GPU / service references.
-        gpu_id = bundle.get("gpu_id")
-        if gpu_id is not None and known_gpus and str(gpu_id) not in known_gpus:
-            errors.append(
-                f"bundle '{name}': gpu_id '{gpu_id}' not declared in "
-                f"gpu_devices (known: {sorted(known_gpus)})"
-            )
-
-        bundle_services = bundle.get("services", [])
-        if isinstance(bundle_services, list) and known_services:
-            for svc in bundle_services:
-                if str(svc) not in known_services:
-                    errors.append(
-                        f"bundle '{name}': references unknown service '{svc}'"
-                    )
-
-        # Ownership: at most one non-idle bundle per GPU. Idle bundles
-        # (the default LLM slot) may share a GPU with at most one other
-        # non-idle bundle IF the runtime explicitly permits it; the
-        # current contract is "exactly one non-idle owner".
-        if gpu_id is not None:
-            ownership.setdefault(str(gpu_id), []).append(name)
-
-    # Pass 2: cycle detection via DFS over the merged forward edge set.
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color: dict[str, int] = {n: WHITE for n in forward_edges}
-    cycle_reported: set[frozenset] = set()
-
-    def _visit(node: str, stack: list[str]) -> None:
-        if color.get(node, BLACK) == GRAY:
-            # Back-edge -> cycle.
-            if node in stack:
-                idx = stack.index(node)
-                cyc = stack[idx:] + [node]
-                # Canonicalise so A->B->C and C->B->A produce the same record.
-                canonical = frozenset(cyc[:-1])
-                if canonical not in cycle_reported:
-                    cycle_reported.add(canonical)
-                    errors.append(
-                        "linked-bundle cycle: "
-                        + " -> ".join(cyc)
-                    )
-            return
-        if color.get(node, BLACK) == BLACK:
-            return
-        color[node] = GRAY
-        stack.append(node)
-        for nxt in sorted(forward_edges.get(node, set())):
-            _visit(nxt, stack)
-        stack.pop()
-        color[node] = BLACK
-
-    for node in sorted(forward_edges.keys()):
-        if color[node] == WHITE:
-            _visit(node, [])
-
-    # Pass 3: enumerate alternative candidates sharing each GPU. Multiple
-    # configured bundles are expected (ComfyUI, Qwen, ACE-Step, LLM routes);
-    # they are not simultaneous owners. Runtime exclusivity is enforced by the
-    # lifecycle controller and transition graph, so this is observable advice,
-    # not a static configuration error.
-    for gid, names in sorted(ownership.items()):
-        non_idle = [n for n in names if not bundles_raw.get(n, {}).get("idle", False)]
-        if len(non_idle) > 1:
-            warnings.append(
-                f"gpu '{gid}': alternative non-idle bundle candidates require "
-                f"controller fencing: {sorted(non_idle)}"
-            )
-
-    # Pass 4: orphan candidates. A bundle is an *orphan candidate* if no
-    # other bundle lists it in ``linked_to`` or ``linked_bundles``. Such a
-    # bundle is reachable only as a top-level entry point; runtime
-    # admission treats it as eligible for direct activation, so we surface
-    # the candidate as a warning for operator visibility rather than as an
-    # error. Multiple orphans are expected (each top-level bundle starts
-    # one), so we cap the report length.
-    incoming: dict[str, set[str]] = {n: set() for n in bundles_raw}
-    for parent_name, parent in bundles_raw.items():
-        if not isinstance(parent, dict):
-            continue
-        links = set(parent.get("linked_to", []) or []) | set(
-            parent.get("linked_bundles", []) or []
-        )
-        for child in links:
-            if child in incoming:
-                incoming[child].add(parent_name)
-    orphan_candidates = sorted(n for n, parents in incoming.items() if not parents)
-    if orphan_candidates:
-        warnings.append(
-            "linked-bundle orphan candidates (no incoming linked_to/"
-            f"linked_bundles): {orphan_candidates}"
-        )
-
-    return errors, warnings
-
-
-def _validate_config_policy(config: dict) -> tuple[list[str], list[str]]:
-    """Return the configured per-device VRAM ceiling.
-
-    The registry supplies physical capacity and reserve values.  The controller
-    never embeds a machine-specific card ceiling.
-    """
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    if not isinstance(config, dict):
-        return errors, warnings
-
-    # Device capacity is validated generically below from the registry entry.
-    gpu_devices = config.get("gpu_devices", {}) or {}
-    scheduling = config.get("scheduling", {}) or {}
-    if not isinstance(scheduling, dict):
-        scheduling = {}
-
-    scheduler_owns_load = bool(scheduling.get("scheduler_owns_load", False))
-
-    # 2) Scheduler-owned evict_first -> ERROR (was warning in 5.2.79).
-    # Plan 06 demands the prune cannot regress silently: if the
-    # operator wanted eviction ordering on a scheduler-owned
-    # template, that intent was lost and the template must be fixed.
-    if scheduler_owns_load:
-        templates = config.get("generation_templates", {}) or {}
-        if isinstance(templates, dict):
-            for tpl_name, tpl in templates.items():
-                if not isinstance(tpl, dict):
-                    continue
-                evict = tpl.get("evict_first")
-                if evict:  # truthy: non-empty list / non-None
-                    errors.append(
-                        f"template '{tpl_name}': evict_first is forbidden "
-                        f"when scheduler_owns_load=true "
-                        f"(runtime ignores the directive; remove it)"
-                    )
-
-    # 2b) VRAM target / ceiling / reserve coherence per gpu_device.
-    if isinstance(gpu_devices, dict):
-        for gid, gdev in gpu_devices.items():
-            if not isinstance(gdev, dict):
-                continue
-            try:
-                target = (
-                    int(gdev["vram_target_mib"])
-                    if gdev.get("vram_target_mib") is not None
-                    else None
-                )
-            except (TypeError, ValueError):
-                errors.append(
-                    f"gpu_devices.{gid}.vram_target_mib must be an integer, "
-                    f"got {gdev.get('vram_target_mib')!r}"
-                )
-                target = None
-            try:
-                ceiling = (
-                    int(gdev["vram_ceiling_mib"])
-                    if gdev.get("vram_ceiling_mib") is not None
-                    else None
-                )
-            except (TypeError, ValueError):
-                errors.append(
-                    f"gpu_devices.{gid}.vram_ceiling_mib must be an integer, "
-                    f"got {gdev.get('vram_ceiling_mib')!r}"
-                )
-                ceiling = None
-            try:
-                reserve = (
-                    int(gdev["vram_reserve_mib"])
-                    if gdev.get("vram_reserve_mib") is not None
-                    else None
-                )
-            except (TypeError, ValueError):
-                errors.append(
-                    f"gpu_devices.{gid}.vram_reserve_mib must be an integer, "
-                    f"got {gdev.get('vram_reserve_mib')!r}"
-                )
-                reserve = None
-            try:
-                physical = (
-                    int(gdev["vram_mib"])
-                    if gdev.get("vram_mib") is not None
-                    else None
-                )
-            except (TypeError, ValueError):
-                errors.append(
-                    f"gpu_devices.{gid}.vram_mib must be an integer, "
-                    f"got {gdev.get('vram_mib')!r}"
-                )
-                physical = None
-            if target is not None and ceiling is not None and target > ceiling:
-                errors.append(
-                    f"gpu_devices.{gid}: vram_target_mib={target} exceeds "
-                    f"vram_ceiling_mib={ceiling}"
-                )
-            if (
-                ceiling is not None
-                and physical is not None
-                and reserve is not None
-                and ceiling > (physical - reserve)
-            ):
-                errors.append(
-                    f"gpu_devices.{gid}: vram_ceiling_mib={ceiling} exceeds "
-                    f"physical-reserve "
-                    f"({physical} - {reserve} = {physical - reserve}); "
-                    f"scheduler cannot satisfy the reserve headroom"
-                )
-
-    # 3) Idle / pin precedence. The order is:
-    #    pinned_service > scheduling.idle_services[gpu_id] > scheduling.idle_service
-    # A pinned generation_backend is allowed to override the idle LLM. The
-    # differing service types express the normal pin use-case and are not a
-    # schema conflict; the warning below makes precedence operator-visible.
-    pinned_service = scheduling.get("pinned_service")
-    idle_services = scheduling.get("idle_services", {}) or {}
-    global_idle_service = scheduling.get("idle_service")
-
-    services_map = config.get("services", {}) or {}
-    if not isinstance(services_map, dict):
-        services_map = {}
-
-    # 4) Legacy idle_job semantics. idle_job is the obsolete keepalive
-    # hook (ComfyUI image at priority 10) pre-dating idle_services. It
-    # is dormant when enabled=False (the default). When enabled=True it
-    # conflicts with the modern idle selector (idle_services or global
-    # idle_service) and with scheduler_owns_load (the scheduler does
-    # not honour legacy keepalive jobs).
-    idle_job = scheduling.get("idle_job", {}) or {}
-    if isinstance(idle_job, dict) and idle_job.get("enabled") is True:
-        modern_idle_active = bool(
-            (isinstance(idle_services, dict) and idle_services)
-            or global_idle_service
-        )
-        if modern_idle_active:
-            errors.append(
-                "scheduling.idle_job.enabled=true conflicts with "
-                "scheduling.idle_services / scheduling.idle_service "
-                "(legacy keepalive cannot coexist with the modern idle "
-                "selector; disable idle_job and migrate to idle_services)"
-            )
-        elif scheduler_owns_load:
-            errors.append(
-                "scheduling.idle_job.enabled=true conflicts with "
-                "scheduler_owns_load=true "
-                "(the scheduler does not honour legacy keepalive jobs; "
-                "disable idle_job and rely on scheduling.idle_services "
-                "or scheduling.idle_service instead)"
-            )
-
-    # Informational precedence note (warning) when more than one selector
-    # is configured so operators see the resolution order at startup.
-    if pinned_service and (global_idle_service or (isinstance(idle_services, dict) and idle_services)):
-        warnings.append(
-            "scheduling precedence is pinned_service > "
-            "idle_services[gpu_id] > idle_service (global); only the "
-            "highest-precedence selector fires per request"
-        )
-
-    return errors, warnings
-
-
-def _validate_config_for_observability(config: dict) -> tuple[list[str], list[str]]:
-    """Combine graph and policy validation without mutating the candidate."""
-    graph_errors, graph_warnings = _validate_linked_bundle_graph(config)
-    policy_errors, policy_warnings = _validate_config_policy(config)
-    errors = list(dict.fromkeys([*graph_errors, *policy_errors]))
-    warnings = list(dict.fromkeys([*graph_warnings, *policy_warnings]))
-    bundles = config.get("bundles") or {}
-    if isinstance(bundles, Mapping):
-        for bundle_name, bundle in bundles.items():
-            if not isinstance(bundle, Mapping) or not (
-                "runtime_instance" in bundle or "runtime_profile" in bundle
-            ):
-                continue
-            try:
-                resolve_checked_runtime_binding(config, str(bundle_name))
-            except CheckedRuntimeError as exc:
-                errors.append(f"bundle {bundle_name!r}: {exc}")
-    errors.extend(checked_runtime_authority_errors(config))
-    return list(dict.fromkeys(errors)), warnings
-
-
-def _expected_restart_policy(unit: str = "gemma-cpu") -> dict[str, int]:
-    policies = {
-        "gemma-cpu": {
-            "RestartSec": 120,
-            "StartLimitIntervalSec": 900,
-            "StartLimitBurst": 5,
-        },
-        "gemma-cpu-vision": {
-            "RestartSec": 120,
-            "StartLimitIntervalSec": 900,
-            "StartLimitBurst": 5,
-        },
-        "llm-primary": {
-            "RestartSec": 10,
-            "StartLimitIntervalSec": 10,
-            "StartLimitBurst": 5,
-        },
-        "llm-secondary": {
-            "RestartSec": 15,
-            "StartLimitIntervalSec": 10,
-            "StartLimitBurst": 5,
-        },
-        "gpu-manager": {
-            "RestartSec": 10,
-            "StartLimitIntervalSec": 10,
-            "StartLimitBurst": 5,
-        },
-    }
-    policy = policies.get(_normalized_unit_name(unit))
-    return dict(policy) if policy else {}
-
-
-def _systemd_restart_policy_drift(unit, dropin_dir, systemctl_cat_path):
-    """Return expected restart-policy directives that differ from evidence.
-
-    ``systemctl cat`` is the authoritative merged base-unit/drop-in view;
-    drop-ins are applied afterward to make the precedence explicit.  This is
-    intentionally read-only and reports only the numeric damping directives
-    tracked by ``_expected_restart_policy``.
-    """
-    from pathlib import Path
-
-    unit_name = _normalized_unit_name(unit)
-    expected = _expected_restart_policy(unit_name)
-    if not expected:
-        return {}
-
-    def parse_lines(lines):
-        result = {}
-        for raw in lines:
-            line = raw.strip()
-            if not line or line.startswith(("#", ";")) or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            if key in expected:
-                result[key] = value.strip()
-        return result
-
-    cat_path = Path(systemctl_cat_path)
-    marker = f"=== {unit_name}.service (systemctl cat) ==="
-    lines = cat_path.read_text().splitlines()
-    try:
-        start = lines.index(marker) + 1
-    except ValueError as exc:
-        raise ValueError(f"systemctl cat evidence has no section for {unit_name}") from exc
-    end = next(
-        (index for index in range(start, len(lines)) if lines[index].startswith("=== ")),
-        len(lines),
-    )
-    deployed = parse_lines(lines[start:end])
-    for conf in sorted(Path(dropin_dir).glob("*.conf")):
-        deployed.update(parse_lines(conf.read_text().splitlines()))
-
-    drift = {}
-    for key, expected_value in expected.items():
-        deployed_value = deployed.get(key)
-        if deployed_value is None:
-            drift[key] = ("", expected_value)
-            continue
-        try:
-            numeric = int(str(deployed_value).rstrip("s"))
-        except ValueError:
-            drift[key] = (deployed_value, expected_value)
-            continue
-        if numeric != expected_value:
-            drift[key] = (deployed_value, expected_value)
-    return drift
-
-
-def _oom_damping_shape(unit: str = "gemma-cpu") -> dict:
-    policy = _expected_restart_policy(unit)
-    restart_window = policy.get("RestartSec")
-    observable = (
-        "covers_amplification"
-        if restart_window is not None
-        and OOM_WATCHDOG_POLL_INTERVAL_S < restart_window
-        else "unknown_policy"
-    )
-    return {
-        "watchdog_interval_s": OOM_WATCHDOG_POLL_INTERVAL_S,
-        "expected_respawn_window_s": restart_window,
-        "expected_damping_factor": 1 if policy.get("StartLimitBurst", 0) > 0 else 0,
-        "watchdog_observability": observable,
-    }
-
-
-def _count_pinned_compute_idles(idle_map, compute_gpu_ids) -> int:
-    if not isinstance(idle_map, Mapping) or not isinstance(
-        compute_gpu_ids, (set, frozenset, list, tuple)
-    ):
-        return 0
-    compute = {str(gpu_id) for gpu_id in compute_gpu_ids}
-    return sum(
-        1 for gpu_id, service in idle_map.items()
-        if str(gpu_id) in compute and bool(service)
-    )
-
-
-def _validate_idle_policy(
-    idle_map,
-    compute_gpu_ids,
-    allow_count=1,
-    thermal_provenance=None,
-) -> tuple[bool, str]:
-    """Validate compute-idle count without mutating scheduler configuration."""
-    if not isinstance(idle_map, Mapping) or not isinstance(
-        compute_gpu_ids, (set, frozenset, list, tuple)
-    ):
-        return False, "idle_policy_input_invalid"
-    if isinstance(allow_count, bool) or not isinstance(allow_count, int) or allow_count < 0:
-        return False, "allow_count_invalid"
-    pinned = _count_pinned_compute_idles(idle_map, compute_gpu_ids)
-    if pinned <= allow_count:
-        return True, ""
-    if allow_count == 0:
-        return False, "compute_idles_not_allowed"
-    if not isinstance(thermal_provenance, Mapping):
-        return False, "two_compute_idles_without_thermal_provenance"
-
-    p99 = _positive_measurement(thermal_provenance.get("junction_p99_c"))
-    cooled = _positive_measurement(thermal_provenance.get("junction_cooled_c"))
-    critical = _positive_measurement(
-        thermal_provenance.get("junction_crit_c", 110.0)
-    )
-    if p99 is not None and critical is not None and p99 >= critical:
-        return False, "junction_at_or_above_crit"
-    if cooled is not None and critical is not None and cooled >= critical:
-        return False, "junction_at_or_above_crit"
-    if p99 is None or cooled is None or critical is None:
-        return False, "thermal_provenance_incomplete"
-    return True, "two_compute_idles_with_thermal_provenance"
-
-
-def _junction_crit_aborted(per_gpu) -> bool | tuple[str, str]:
-    """Classify per-GPU junction evidence as critical, safe, or unknown."""
-    if not isinstance(per_gpu, Mapping) or not per_gpu:
-        return "unknown", "no_telemetry"
-    telemetry_rows = [row for row in per_gpu.values() if isinstance(row, Mapping)]
-    for telemetry in telemetry_rows:
-        if is_junction_critical(telemetry):
-            return True
-    if not telemetry_rows:
-        return "unknown", "no_telemetry"
-    for telemetry in telemetry_rows:
-        junction = telemetry.get("temp_junction_c")
-        critical = telemetry.get("temp_junction_crit_c")
-        if junction is None:
-            return "unknown", "junction_channel_unreadable"
-        if critical is None:
-            return "unknown", "threshold_unknown"
-        try:
-            float(junction)
-            float(critical)
-        except (TypeError, ValueError):
-            return "unknown", "junction_channel_unreadable"
-    return False
-
-
-def _parse_psi_avg10(psi_text: str) -> tuple[float | None, float | None]:
-    some = None
-    full = None
-    if not isinstance(psi_text, str):
-        return some, full
-    for raw_line in psi_text.splitlines():
-        fields = raw_line.split()
-        if not fields:
-            continue
-        target = fields[0]
-        for field in fields[1:]:
-            if not field.startswith("avg10="):
-                continue
-            try:
-                value = float(field.split("=", 1)[1])
-            except (TypeError, ValueError):
-                value = None
-            if target == "some":
-                some = value
-            elif target == "full":
-                full = value
-    return some, full
-
-
-def _psi_full_stall_pct(
-    psi_path: str,
-    *,
-    some_avg10=None,
-    full_avg10=None,
-    psi_text: str | None = None,
-    abort_threshold_pct: float = _TASK8A_PSI_FULL_ABORT_PCT,
-) -> dict:
-    """Classify injected PSI memory evidence; never opens ``psi_path``."""
-    del psi_path  # path is provenance only; I/O belongs to an authorized wrapper.
-    if psi_text is not None:
-        parsed_some, parsed_full = _parse_psi_avg10(psi_text)
-        if some_avg10 is None:
-            some_avg10 = parsed_some
-        if full_avg10 is None:
-            full_avg10 = parsed_full
-    try:
-        some = None if some_avg10 is None else float(some_avg10)
-        full = None if full_avg10 is None else float(full_avg10)
-    except (TypeError, ValueError):
-        some, full = None, None
-    result = {
-        "some_pct": some,
-        "full_pct": full,
-        "abort_threshold_pct": float(abort_threshold_pct),
-        "abort": full is None or full >= float(abort_threshold_pct),
-    }
-    if full is None:
-        result["reason"] = "psi_full_unreadable"
-    return result
-
-
-def _parse_cgroup_memory_events(events_text: str) -> dict[str, int] | None:
-    if not isinstance(events_text, str) or not events_text.strip():
-        return None
-    result: dict[str, int] = {}
-    try:
-        for line in events_text.splitlines():
-            key, raw_value = line.split()
-            value = int(raw_value)
-            if value < 0:
-                return None
-            result[key] = value
-    except (TypeError, ValueError):
-        return None
-    return result or None
-
-
-def _cgroup_events_oom(per_unit) -> dict:
-    """Return nonzero memory.events OOM/high deltas, unknown fail-closed."""
-    if not isinstance(per_unit, Mapping):
-        return {"any_oom": True, "delta": {"_input": {"unknown": 1}}}
-    delta: dict[str, dict[str, int]] = {}
-    for unit, events in per_unit.items():
-        if not isinstance(events, Mapping):
-            delta[str(unit)] = {"unknown": 1}
-            continue
-        nonzero = {
-            key: int(events.get(key, 0) or 0)
-            for key in ("high", "max", "oom", "oom_kill")
-            if int(events.get(key, 0) or 0) > 0
-        }
-        if nonzero:
-            delta[str(unit)] = nonzero
-    return {"any_oom": bool(delta), "delta": delta}
-
-
-def _journal_timestamp(line: str) -> str | None:
-    match = re.match(r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\b", line)
-    return match.group(1) if match else None
-
-
-def _parse_prior_boot_thrash(journal_block: str) -> dict:
-    """Parse a caller-supplied prior-boot kernel journal block (no I/O)."""
-    lines = journal_block.splitlines() if isinstance(journal_block, str) else []
-    oom_markers: list[str] = []
-    memcgs: list[str] = []
-    page_alloc_failures = 0
-    amdgpu_userptr = 0
-    for line_number, line in enumerate(lines):
-        lower = line.lower()
-        is_oom = (
-            "invoked oom-killer" in lower
-            or "oom-kill:" in lower
-            or "out of memory: killed process" in lower
-        )
-        if is_oom:
-            timestamp = _journal_timestamp(line)
-            # Timestamp is provenance only.  The line number is part of the
-            # event key so same-second bursts remain distinct.
-            oom_markers.append(timestamp or f"line:{line_number}")
-        if "page allocation failure" in lower:
-            page_alloc_failures += 1
-        if "amdgpu_amdkfd_restore_userptr_worker" in lower:
-            amdgpu_userptr += 1
-        match = re.search(r"task_memcg=([^,\s]+)", line)
-        if match:
-            memcgs.append(match.group(1))
-    counts = {memcg: memcgs.count(memcg) for memcg in set(memcgs)}
-    dominant = max(counts, key=lambda key: (counts[key], key)) if counts else None
-    first = oom_markers[0] if oom_markers else None
-    last = oom_markers[-1] if oom_markers else None
-    # Synthetic no-timestamp markers are useful for counting but are not valid
-    # timestamp provenance.
-    first = None if isinstance(first, str) and first.startswith("line:") else first
-    last = None if isinstance(last, str) and last.startswith("line:") else last
-    return {
-        "oom_kills": len(oom_markers),
-        "killed_processes": len(oom_markers),
-        "page_alloc_failures": page_alloc_failures,
-        "amdgpu_userptr": amdgpu_userptr,
-        "first_oom_ts": first,
-        "last_oom_ts": last,
-        "distinct_memcgs": len(counts),
-        "dominant_memcg": dominant,
-    }
-
-
-def _prior_boot_oom_rate_per_minute(parsed: Mapping) -> float:
-    first = parsed.get("first_oom_ts")
-    last = parsed.get("last_oom_ts")
-    if not isinstance(first, str) or not isinstance(last, str):
-        return 0.0
-    try:
-        from datetime import datetime
-        start = datetime.strptime(f"2000 {first}", "%Y %b %d %H:%M:%S")
-        end = datetime.strptime(f"2000 {last}", "%Y %b %d %H:%M:%S")
-    except (TypeError, ValueError):
-        return 0.0
-    elapsed_minutes = (end - start).total_seconds() / 60.0
-    if elapsed_minutes <= 0:
-        return 0.0
-    return float(parsed.get("oom_kills", 0) or 0) / elapsed_minutes
-
-
-def _prior_boot_is_thrash(parsed) -> bool:
-    if not isinstance(parsed, Mapping) or not parsed:
-        return True
-    try:
-        return (
-            int(parsed.get("oom_kills", 0) or 0) > 10
-            or int(parsed.get("page_alloc_failures", 0) or 0) > 0
-            or int(parsed.get("distinct_memcgs", 0) or 0) > 3
-            or _prior_boot_oom_rate_per_minute(parsed) > 0.5
-        )
-    except (TypeError, ValueError):
-        return True
-
-
-def _oom_counters_snapshot(
-    restart_signals_fn=None,
-    *,
-    _read_restart_signals_fn=None,
-    now: float | None = None,
-) -> dict:
-    """Join existing OOM scopes with injected systemd restart evidence."""
-    sample_ts = time.time() if now is None else float(now)
-    reader = restart_signals_fn or _read_restart_signals_fn
-    health = _oom_health_section(now=sample_ts)
-    restart_signals: dict = {
-        "scope": "systemd",
-        "sample_ts": sample_ts,
-        "complete": reader is not None,
-        "read_errors": {},
-    }
-    for unit in _TASK8A_RESTART_UNITS:
-        normalized = _normalized_unit_name(unit)
-        data = None
-        if reader is not None:
-            try:
-                candidate = reader(normalized)
-                if isinstance(candidate, Mapping):
-                    data = candidate
-                else:
-                    raise ValueError("restart reader returned non-mapping")
-            except Exception as exc:
-                restart_signals["read_errors"][normalized] = str(exc)
-                restart_signals["complete"] = False
-        else:
-            restart_signals["read_errors"][normalized] = "reader_not_injected"
-        raw_restarts = data.get("NRestarts") if data is not None else None
-        restart_usec = data.get("RestartUSec") if data is not None else None
-        if data is None:
-            count = None
-        elif isinstance(raw_restarts, bool) or raw_restarts is None:
-            count = None
-            restart_signals["read_errors"][normalized] = "invalid_NRestarts"
-            restart_signals["complete"] = False
-        else:
-            try:
-                count = int(raw_restarts)
-            except (TypeError, ValueError):
-                count = None
-                restart_signals["read_errors"][normalized] = "invalid_NRestarts"
-                restart_signals["complete"] = False
-        restart_signals[f"nrestarts_{normalized}"] = count
-        restart_signals[f"restart_usec_{normalized}"] = (
-            restart_usec if count is not None else None
-        )
-    return {
-        "process_events": health["process_events"],
-        "dead_letter_retained": health["dead_letter_retained"],
-        "watchdog": health["watchdog"],
-        "restart_signals": restart_signals,
-    }
-
-
-def _watchdog_should_escalate(
-    counters,
-    prior_boot,
-    junction,
-    psi,
-    cgroup,
-) -> tuple[bool, str]:
-    if not isinstance(counters, Mapping) or not isinstance(
-        counters.get("process_events"), Mapping
-    ):
-        return True, "counters_unknown"
-    process = counters["process_events"]
-    if not isinstance(process.get("total_events"), (int, float)) or not isinstance(
-        process.get("active_recoveries"), Mapping
-    ):
-        return True, "counters_unknown"
-    active = process["active_recoveries"]
-    active_state = next(
-        (
-            state
-            for state in active.values()
-            if state in {"detected", "draining", "verifying", "recovering"}
-        ),
-        None,
-    )
-    if int(process.get("total_events", 0) or 0) > 0 and active_state:
-        return True, "oom_state_detected" if active_state == "detected" else "oom_recovery_active"
-    if prior_boot is None:
-        return True, "prior_boot_unknown"
-    prior_thrash = (
-        prior_boot
-        if isinstance(prior_boot, bool)
-        else _prior_boot_is_thrash(prior_boot)
-    )
-    if prior_thrash:
-        return True, "prior_boot_thrash"
-    junction_verdict = _junction_crit_aborted(
-        {"watchdog": junction} if isinstance(junction, Mapping) else {}
-    )
-    if junction_verdict is True:
-        return True, "junction_critical"
-    if junction_verdict is not False:
-        return True, "junction_unknown"
-    try:
-        full_pct = psi.get("full_pct")
-        if full_pct is None:
-            return True, "psi_unknown"
-        if float(full_pct) >= _TASK8A_PSI_FULL_ABORT_PCT:
-            return True, "psi_full_stall"
-    except (AttributeError, TypeError, ValueError):
-        return True, "psi_unknown"
-    if not isinstance(cgroup, Mapping) or not isinstance(cgroup.get("any_oom"), bool):
-        return True, "cgroup_unknown"
-    if cgroup.get("any_oom") is True:
-        return True, "cgroup_oom_increment"
-    return False, "clear"
-
-
-def _should_admit_generation(cfg, *, junction, psi, prior_boot) -> bool:
-    """Pure fail-closed generation admission gate for Task 8A evidence."""
-    if not isinstance(cfg, Mapping):
-        return False
-    oom = cfg.get("oom")
-    if not isinstance(oom, Mapping) or not isinstance(oom.get("any_oom"), bool):
-        return False
-    if oom.get("any_oom"):
-        return False
-    junction_verdict = _junction_crit_aborted(
-        {"admission": junction} if isinstance(junction, Mapping) else {}
-    )
-    if junction_verdict is not False:
-        return False
-    if not isinstance(psi, Mapping) or psi.get("full_pct") is None:
-        return False
-    try:
-        if float(psi["full_pct"]) >= _TASK8A_PSI_FULL_ABORT_PCT:
-            return False
-    except (TypeError, ValueError):
-        return False
-    if prior_boot is not False:
-        return False
-    return True
-
-
-def _watchdog_ladder_snapshot(
-    gpu_id: str,
-    *,
-    restart_ts: float | None = None,
-    state_timestamps: Mapping | None = None,
-) -> list[tuple[str, float]]:
-    """Return a replayable monotonic escalation ladder from injected times."""
-    del gpu_id  # identity is carried by the caller; this helper has no I/O.
-    anchor = _scheduler_started_at if restart_ts is None else float(restart_ts)
-    supplied = state_timestamps if isinstance(state_timestamps, Mapping) else {}
-    states = (
-        "idle", "detected", "draining", "verifying", "recovering",
-        "restored", "permanent_failed",
-    )
-    result: list[tuple[str, float]] = []
-    last = anchor
-    for state in states:
-        candidate = supplied.get(state, anchor if state == "idle" else last)
-        try:
-            since = max(last, float(candidate))
-        except (TypeError, ValueError):
-            since = last
-        result.append((state, since))
-        last = since
-    result[0] = ("idle", anchor)
-    return result
+# Config policy bodies live in gpu_manager/config_policy.py; the vram ceiling
+# check there enforces the physical-reserve limit against facade globals.
+(
+    _validate_linked_bundle_graph,
+    _validate_config_policy,
+    _validate_config_for_observability,
+    _expected_restart_policy,
+    _systemd_restart_policy_drift,
+    _oom_damping_shape,
+    _count_pinned_compute_idles,
+    _validate_idle_policy,
+) = _bind_config_policy(globals())
+
+
+(
+    _junction_crit_aborted,
+    _parse_psi_avg10,
+    _psi_full_stall_pct,
+    _parse_cgroup_memory_events,
+    _cgroup_events_oom,
+    _journal_timestamp,
+    _parse_prior_boot_thrash,
+    _prior_boot_oom_rate_per_minute,
+    _prior_boot_is_thrash,
+    _oom_counters_snapshot,
+    _watchdog_should_escalate,
+    _should_admit_generation,
+    _watchdog_ladder_snapshot,
+) = _bind_oom_telemetry(globals())
+
+(
+    _phase5_reservation_config,
+    _derive_group_reservations,
+    _validate_reservation_config,
+    _record_reservation_change,
+    reserve_gpus,
+    release_gpus,
+    expire_reservations,
+    _reservation_persistence_path,
+    _persist_reservations,
+    _record_ingress_blocked_by_reservation,
+) = _bind_reservations(globals())
+
+(
+    _normalise_pcie,
+    _scan_render_node_fdinfo_cached,
+    _build_render_node_to_gpu_map_cached,
+    _read_proc_name,
+    _scan_render_node_fdinfo,
+    _render_node_to_gpu_id,
+    _build_render_node_to_gpu_map,
+    _gpu_has_active_generation_tenant,
+) = _bind_gpu_topology(globals())
 
 
 # ── GPU State Machine ──────────────────────────────────────────────
 
-class GpuState(Enum):
-    """GPU state machine states.
-
-    LLM_LOADED    → Qwen3.6 on GPU, serving requests (default idle state)
-    DRAINING      → Waiting for active LLM requests to finish before evicting
-    GPU_WORK      → ComfyUI or ACE-Step using GPU
-    LLM_RELIEF    → Temporary LLM restore to clear queued request backlog
-    RESTORING     → Qwen3.6 reloading to GPU after GPU work complete
-    """
-    LLM_LOADED = "llm_loaded"
-    DRAINING = "draining"
-    GPU_WORK = "gpu_work"
-    LLM_RELIEF = "llm_relief"
-    RESTORING = "restoring"
+GpuState, GpuBundleState, BundleCoordinator = _bind_bundle_model(globals())
 
 
 # ── Per-GPU Priority System ────────────────────────────────────────
@@ -5283,619 +3356,12 @@ class GpuState(Enum):
 # without affecting other GPUs.
 
 
-class GpuBundleState:
-    """Per-GPU bundle state tracker.
-
-    Tracks what bundle is loaded on this GPU, its priority, whether it's
-    draining, and the priority queue of pending requests.
-    """
-
-    def __init__(self, gpu_id: str):
-        self.gpu_id = gpu_id
-        self.loaded_bundle: str | None = None  # Currently loaded bundle name
-        self.bundle_priority: int = 0          # Priority of the loaded bundle
-        self.draining: bool = False            # True when draining pending requests
-        self.drain_started_at: float | None = None  # When drain began
-        self._drain_event = asyncio.Event()    # Signals drain completion
-        self.pending_requests: int = 0         # Count of in-flight requests
-        self.state: str = "idle"               # idle | loaded | draining | evicting | loading
-        # Priority queue: list of (priority, timestamp, bundle_name, request_data) tuples
-        # Sorted by -priority (highest first), then +timestamp (FIFO within same priority)
-        self.priority_queue: list[dict] = []
-        # ── Phase 0: fields formerly in scheduler._gpu_state[gpu_id] ────
-        # GpuBundleState is now the SINGLE SOURCE OF TRUTH for these. Setters
-        # below mirror changes back to scheduler._gpu_state for /health.
-        self.loaded_bundles: list[str] = []    # Mirror of scheduler._gpu_state["loaded_bundles"]
-        self.evicting: bool = False            # Mirror of scheduler._gpu_state["evicting"]
-        self.current_priority: int = 0         # Mirror of scheduler._gpu_state["current_priority"]
-        self.loading: bool = False             # Mirror of scheduler._gpu_state["loading"]
-        # Audit fields (setters populate)
-        self.last_change_ts: float | None = None
-        self.last_event: str | None = None
-        self.events: list[dict] = []
-        # ── Phase 4g: idle-bundle auto-eviction activity timestamp ─────
-        self.last_activity_at: float = 0.0
-        # Phase 5.2.36: count of workers currently executing a job in
-        # _execute_job for this bundle. _auto_evict_idle_bundles skips
-        # evictions when this is > 0, preventing the auto-evict from
-        # killing comfyui mid-inference (Bug C race).
-        self.worker_in_flight: int = 0
-        # ── Phase 5.2.4: post-load grace deadline (used by _auto_evict) ─
-        # Set in _load_bundle after port-ready check. Auto-evict skips
-        # bundles where now < this value, so backends that need warmup
-        # (e.g. ComfyUI's ComfyRegistry fetch) are not freed mid-grace.
-        self.bundle_post_load_grace_at: float = 0.0
-        # ── Phase 4h.3 S5: backoff for repeated unload failures ────────
-        self.last_evict_attempt_at: float = 0.0
-        # ── Phase 5.1.5 P0-1: bundle-load grace (auto-evict skip) ────
-        # Set in _load_bundle after port-ready check; auto-evict skips
-        # bundles within _BUNDLE_LOAD_GRACE_SECONDS of being loaded.
-        self.bundle_loaded_at: float = 0.0
-        # ── Phase 1: OOM Recovery State Machine fields ────────────────
-        # See OOM_RECOVERY_STATE_MACHINE_DESIGN.md §A.2 for the per-GPU
-        # oom sub-state machine. All OOM state lives here, no parallel
-        # dict (Phase 0 unified the state owner). Values are written
-        # through set_oom_state() / record_oom_event() to keep the audit
-        # ring buffer consistent.
-        self.oom_event_count: int = 0                  # Lifetime OOM events on this GPU
-        self.oom_recovery_count: int = 0               # Successful recoveries
-        self.oom_permanent_failure_count: int = 0      # Permanent failures
-        self.oom_state: str = "idle"                   # idle | detected | draining | verifying | recovering | restored | permanent_failed
-        self.oom_state_since: float = 0.0              # time.time() when entered current state
-        self.oom_last_event_ts: float = 0.0            # time.time() of last OOM event
-        self.oom_last_reason: str = ""                 # Free-form reason string
-        self.oom_active_recovery_job_id: str = ""      # Job being recovered, or ""
-        self.oom_retry_attempted: bool = False         # True if an auto-retry was already issued
-        self.oom_recent_failure_times: deque = deque(maxlen=10)  # timestamps for permanent-failure window
-        # ── Phase 5: OOM-implicated service tracker ────────────────────
-        # Set by WorkerPool._worker_loop right before _handle_oom_event so
-        # _resolve_service_for_gpu can fall back to it when the GPU has
-        # no loaded bundles (typical race: OOM kills the worker before the
-        # bundle is registered as loaded).
-        self.oom_last_service_name: str | None = None
-        # ── Phase 7: oom_state transition timestamp ────────────────────
-        # Mirror of oom_state_since; named differently so the supervisor's
-        # TTL gate has its own field (clearer intent, future-proof if
-        # oom_state_since semantics drift). Updated by set_oom_state().
-        self.oom_state_changed_at: float = 0.0
-        # State schema version — bumped whenever GpuBundleState adds required
-        # fields. from_dict() reads this and runs migrations as needed.
-        self.state_version: int = 4
-
-    def _record_event(self, label: str, **fields) -> None:
-        """Record a state change. Keeps a bounded 50-entry ring buffer."""
-        self.last_change_ts = time.time()
-        self.last_event = label
-        evt = {"ts": self.last_change_ts, "event": label, **fields}
-        self.events.append(evt)
-        if len(self.events) > 50:
-            self.events = self.events[-50:]
-
-    def set_evicting(self, value: bool, source: str = "unknown") -> None:
-        """Set evicting flag atomically; records the change for audit.
-
-        `source` identifies the caller (e.g. "evict_llm", "restore_llm",
-        "_load_bundle") so divergence debugging has a trail.
-        """
-        old = self.evicting
-        self.evicting = bool(value)
-        self._record_event(
-            f"evicting={self.evicting}",
-            old=old, new=self.evicting, source=source,
-        )
-        if old != self.evicting:
-            logger.info(
-                f"[gpu-bundle:{self.gpu_id}] evicting: {old} -> {self.evicting} "
-                f"(source={source})"
-            )
-            if self.evicting:
-                self.state = "evicting"
-            elif self.state == "evicting":
-                self.state = "idle" if not self.loaded_bundles else "loaded"
-        _sync_legacy_gpu_state(self.gpu_id, self)
-
-    def set_draining(self, value: bool, source: str = "unknown") -> None:
-        """Set draining flag atomically; syncs to legacy dict."""
-        old = self.draining
-        self.draining = bool(value)
-        self._record_event(
-            f"draining={self.draining}",
-            old=old, new=self.draining, source=source,
-        )
-        if old != self.draining:
-            logger.debug(
-                f"[gpu-bundle:{self.gpu_id}] draining: {old} -> {self.draining} "
-                f"(source={source})"
-            )
-        _sync_legacy_gpu_state(self.gpu_id, self)
-
-    def set_loaded_bundles(self, bundles, source: str = "unknown") -> None:
-        """Set loaded_bundles list atomically; syncs to legacy dict."""
-        old = list(self.loaded_bundles)
-        self.loaded_bundles = list(bundles) if bundles else []
-        self._record_event(
-            f"loaded_bundles={self.loaded_bundles}",
-            old=old, new=self.loaded_bundles, source=source,
-        )
-        if old != self.loaded_bundles:
-            logger.debug(
-                f"[gpu-bundle:{self.gpu_id}] loaded_bundles: {old} -> {self.loaded_bundles} "
-                f"(source={source})"
-            )
-        _sync_legacy_gpu_state(self.gpu_id, self)
-
-    def set_current_priority(self, value: int, source: str = "unknown") -> None:
-        """Set current_priority atomically; syncs to legacy dict."""
-        old = self.current_priority
-        self.current_priority = int(value)
-        self._record_event(
-            f"current_priority={self.current_priority}",
-            old=old, new=self.current_priority, source=source,
-        )
-        _sync_legacy_gpu_state(self.gpu_id, self)
-
-    def set_loading(self, value: bool, source: str = "unknown") -> None:
-        """Set loading flag atomically; syncs to legacy dict."""
-        old = self.loading
-        self.loading = bool(value)
-        self._record_event(
-            f"loading={self.loading}",
-            old=old, new=self.loading, source=source,
-        )
-        _sync_legacy_gpu_state(self.gpu_id, self)
-
-    def touch_activity(self, source: str = "unknown") -> None:
-        """Stamp last_activity_at for idle-bundle auto-eviction decisions.
-
-        Deliberately does NOT call _record_event: at 10 jobs/s this floods
-        the audit ring (was 99% of entries). The timestamp itself is the
-        signal — see Phase 4h.3 S3.
-
-        Call sites: _load_bundle start (M3), _load_bundle success,
-        WorkerPool._execute_job completion (S4).
-        """
-        self.last_activity_at = time.time()
-
-    def clear_eviction(self, source: str) -> None:
-        """Atomically clear evicting + loading + draining after a load/restore.
-
-        Used at every successful bundle load/restore path so evicting can
-        never get stuck True (the original Phase 0 bug).
-        """
-        self.set_evicting(False, source=source)
-        self.set_loading(False, source=source)
-        self.set_draining(False, source=source)
-
-    # ── Phase 1: OOM Recovery state setters ────────────────────────────
-    # The OOM sub-state machine lives entirely on GpuBundleState. Allowed
-    # values for oom_state: idle | detected | draining | verifying |
-    # recovering | restored | permanent_failed. Setters validate and
-    # record the change in the audit ring buffer.
-    _VALID_OOM_STATES = frozenset({
-        "idle", "detected", "draining", "verifying",
-        "recovering", "restored", "permanent_failed",
-    })
-
-    def set_oom_state(self, value: str, source: str = "unknown", reason: str = "") -> None:
-        """Set oom_state atomically; records the change for audit.
-
-        Unknown states are coerced to "idle" so a bad transition cannot
-        wedge the state machine (worst case: we lose the bad state and
-        treat it as no-recovery-needed).
-        """
-        if value not in self._VALID_OOM_STATES:
-            logger.warning(
-                f"[gpu-bundle:{self.gpu_id}] set_oom_state: unknown state "
-                f"'{value}' (source={source}); coercing to 'idle'"
-            )
-            value = "idle"
-        old = self.oom_state
-        self.oom_state = value
-        self.oom_state_since = time.time()
-        # Phase 7: also stamp the dedicated supervisor-readable field.
-        # Only stamp on actual transitions (old != new) — repeats of
-        # the same state shouldn't reset the supervisor's TTL clock.
-        if old != value:
-            self.oom_state_changed_at = self.oom_state_since
-        if reason:
-            self.oom_last_reason = reason
-        self._record_event(
-            f"oom_state={self.oom_state}",
-            old=old, new=self.oom_state, source=source, reason=reason,
-        )
-        if old != self.oom_state:
-            logger.info(
-                f"[gpu-bundle:{self.gpu_id}] oom_state: {old} -> {self.oom_state} "
-                f"(source={source}, reason={reason!r})"
-            )
-
-    def record_oom_event(self, reason: str, job_id: str = "") -> None:
-        """Record an OOM event on this GPU. Bumps counters and timestamps.
-
-        Does NOT change oom_state — the caller decides whether this is a
-        new detection (→ "detected"), a recovery-in-progress marker, etc.
-        The only side effect on oom_state is: if we're in a "happy" state
-        (idle or restored) we leave it alone; if the caller wants to move
-        to "detected" they should call set_oom_state("detected", ...) right
-        after.
-        """
-        self.oom_event_count += 1
-        self.oom_last_event_ts = time.time()
-        if reason:
-            self.oom_last_reason = reason
-        if job_id:
-            self.oom_active_recovery_job_id = job_id
-        # Track the failure in the bounded window for permanent-failure detection
-        self.oom_recent_failure_times.append(time.time())
-        self._record_event(
-            "oom_event",
-            reason=reason, job_id=job_id,
-            count=self.oom_event_count,
-        )
-        logger.info(
-            f"[gpu-bundle:{self.gpu_id}] OOM event recorded "
-            f"(count={self.oom_event_count}, reason={reason!r}, job_id={job_id!r})"
-        )
-
-    def enqueue(self, bundle_name: str, priority: int, request_data: dict) -> None:
-        """Add a request to this GPU's priority queue, sorted by priority."""
-        import bisect
-        entry = {
-            "bundle_name": bundle_name,
-            "priority": priority,
-            "enqueued_at": time.time(),
-            "request_data": request_data,
-        }
-        # Insert in priority order: higher priority first, FIFO within same priority
-        # Sort key: (-priority, +timestamp)
-        self.priority_queue.append(entry)
-        self.priority_queue.sort(key=lambda e: (-e["priority"], e["enqueued_at"]))
-        logger.debug(
-            f"GPU[{self.gpu_id}]: enqueued {bundle_name} priority={priority} "
-            f"(queue depth: {len(self.priority_queue)})"
-        )
-
-    def peek_next(self) -> dict | None:
-        """Look at the highest-priority item without removing it."""
-        if self.priority_queue:
-            return self.priority_queue[0]
-        return None
-
-    def dequeue_next(self) -> dict | None:
-        """Remove and return the highest-priority item."""
-        if self.priority_queue:
-            entry = self.priority_queue.pop(0)
-            logger.debug(
-                f"GPU[{self.gpu_id}]: dequeued {entry['bundle_name']} "
-                f"priority={entry['priority']}"
-            )
-            return entry
-        return None
-
-    def start_drain(self) -> None:
-        """Mark GPU as draining — stop accepting new requests for current bundle."""
-        self.draining = True
-        self.drain_started_at = time.time()
-        self._drain_event.clear()
-        self.state = "draining"
-        logger.info(f"GPU[{self.gpu_id}]: drain started (pending={self.pending_requests})")
-
-    async def wait_drain(self, timeout: float = DRAIN_TIMEOUT) -> bool:
-        """Wait for all pending requests to complete, or timeout.
-
-        Returns True if drained successfully, False on timeout.
-        """
-        if self.pending_requests == 0:
-            logger.info(f"GPU[{self.gpu_id}]: no pending requests — drain immediate")
-            self.draining = False
-            self.drain_started_at = None
-            self._drain_event.set()
-            return True
-
-        logger.info(
-            f"GPU[{self.gpu_id}]: waiting for {self.pending_requests} "
-            f"pending request(s) to complete (timeout={timeout}s)"
-        )
-        try:
-            await asyncio.wait_for(self._drain_event.wait(), timeout=timeout)
-            logger.info(f"GPU[{self.gpu_id}]: drain complete")
-            return True
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"GPU[{self.gpu_id}]: drain timeout after {timeout}s "
-                f"({self.pending_requests} still pending)"
-            )
-            return False
-
-    def request_started(self) -> None:
-        """Called when a request begins processing on this GPU."""
-        self.pending_requests += 1
-
-    def request_finished(self) -> None:
-        """Called when a request finishes processing on this GPU."""
-        self.pending_requests = max(0, self.pending_requests - 1)
-        if self.pending_requests == 0 and self.draining:
-            self._drain_event.set()
-
-    def to_dict(self) -> dict:
-        """Serialize for state persistence."""
-        return {
-            "gpu_id": self.gpu_id,
-            "loaded_bundle": self.loaded_bundle,
-            "bundle_priority": self.bundle_priority,
-            "draining": self.draining,
-            "drain_started_at": self.drain_started_at,
-            "pending_requests": self.pending_requests,
-            "state": self.state,
-            "queue_depth": len(self.priority_queue),
-            "queue_items": [
-                {"bundle": e["bundle_name"], "priority": e["priority"],
-                 "enqueued_at": e["enqueued_at"]}
-                for e in self.priority_queue
-            ],
-            # ── Phase 0: unified fields ──────────────────────────────
-            "loaded_bundles": list(self.loaded_bundles),
-            "evicting": self.evicting,
-            "current_priority": self.current_priority,
-            "loading": self.loading,
-            # ── Phase 4g: idle-bundle auto-eviction activity timestamp ───
-            "last_activity_at": self.last_activity_at,
-            # ── Phase 5.2.36: in-flight worker counter (state_version bump → 5) ─
-            "worker_in_flight": self.worker_in_flight,
-            # ── Phase 1: OOM fields (state_version bump → 2) ──────────
-            "state_version": BUNDLE_STATE_SCHEMA_VERSION,
-            "oom_event_count": self.oom_event_count,
-            "oom_recovery_count": self.oom_recovery_count,
-            "oom_permanent_failure_count": self.oom_permanent_failure_count,
-            "oom_state": self.oom_state,
-            "oom_state_since": self.oom_state_since,
-            "oom_last_event_ts": self.oom_last_event_ts,
-            "oom_last_reason": self.oom_last_reason,
-            "oom_active_recovery_job_id": self.oom_active_recovery_job_id,
-            "oom_retry_attempted": self.oom_retry_attempted,
-            "oom_recent_failure_times": list(self.oom_recent_failure_times),
-            # ── Phase 5/7: OOM-implicated service + state-change timestamp ──
-            # state_version bump → 3. oom_last_service_name is set by the
-            # WorkerPool right before _handle_oom_event so _resolve_service_for_gpu
-            # can recover the offending service even when the GPU has no
-            # loaded_bundle recorded yet. oom_state_changed_at mirrors
-            # oom_state_since and is read by the supervisor's TTL gate.
-            "oom_last_service_name": self.oom_last_service_name,
-            "oom_state_changed_at": self.oom_state_changed_at,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "GpuBundleState":
-        """Deserialize from persisted state.
-
-        Reads ``state_version`` and runs migration when an older shape is
-        detected.
-
-        Migration history:
-          v1 (Phase 0 baseline, no OOM fields): OOM fields stay at __init__
-              defaults; logged once per GPU at load.
-          v2 (Phase 1, full OOM state machine): same as v3 except no
-              ``oom_last_service_name`` / ``oom_state_changed_at`` keys.
-              Initialized to defaults on load.
-          v3 (Phase 5/7, OOM-implicated service tracker + state-change
-              timestamp): the current shape written by to_dict().
-
-        Newer-than-current versions are accepted as-is and logged.
-        """
-        gpu = cls(data.get("gpu_id", "unknown"))
-        gpu.loaded_bundle = data.get("loaded_bundle")
-        gpu.bundle_priority = data.get("bundle_priority", 0)
-        gpu.draining = data.get("draining", False)
-        gpu.drain_started_at = data.get("drain_started_at")
-        gpu.pending_requests = data.get("pending_requests", 0)
-        gpu.state = data.get("state", "idle")
-        # ── Phase 0: backward-compat defaults for new fields ────────
-        gpu.loaded_bundles = list(data.get("loaded_bundles") or [])
-        gpu.evicting = bool(data.get("evicting", False))
-        gpu.current_priority = int(data.get("current_priority", 0))
-        gpu.loading = bool(data.get("loading", False))
-        gpu.last_activity_at = float(data.get("last_activity_at", 0.0))
-        gpu.worker_in_flight = int(data.get("worker_in_flight", 0) or 0)
-        # ── State-shape migration gate ────────────────────────────
-        # v1 → v2: OOM fields added. v2 → v3: oom_last_service_name +
-        # oom_state_changed_at added. v3 → v4: last_activity_at added.
-        # Newer-than-4 is accepted as-is and logged.
-        saved_version = int(data.get("state_version", 1))
-        if saved_version < 2:
-            logger.info(
-                f"[gpu-bundle:{gpu.gpu_id}] migrating state.json v{saved_version} → v2 "
-                f"(OOM fields initialized to defaults)"
-            )
-        if saved_version < 3:
-            # v3 adds oom_last_service_name + oom_state_changed_at. v2 files
-            # never had them; default them so downstream consumers (the
-            # supervisor's TTL gate, _resolve_service_for_gpu) see sane values.
-            logger.info(
-                f"[gpu-bundle:{gpu.gpu_id}] migrating state.json v{saved_version} → v3 "
-                f"(oom_last_service_name + oom_state_changed_at initialized to defaults)"
-            )
-        if saved_version < 4:
-            # v4 adds last_activity_at. v3 files never had it; default to 0.0
-            # so auto-evict treats the bundle as needing an activity stamp.
-            logger.info(
-                f"[gpu-bundle:{gpu.gpu_id}] migrating state.json v{saved_version} → v4 "
-                f"(last_activity_at initialized to 0.0)"
-            )
-        if saved_version < BUNDLE_STATE_SCHEMA_VERSION:
-            # v5 adds worker_in_flight. v4 files never had it; default to 0
-            # so auto-evict treats the bundle as not having an in-flight
-            # worker (the safe behaviour — eviction proceeds normally).
-            logger.info(
-                f"[gpu-bundle:{gpu.gpu_id}] migrating state.json v{saved_version} → v5 "
-                f"(worker_in_flight initialized to 0)"
-            )
-        elif saved_version > BUNDLE_STATE_SCHEMA_VERSION:
-            # Plan 04 §4: this nested per-GPU bundle state schema is v5. An
-            # old binary on a newer file must say "up to v5", not "up to v4"
-            # (that copy-paste bug is what the plan flagged as a confirmed
-            # contradiction against the top-level manager state which is
-            # also a v-series schema with its own version).
-            logger.warning(
-                f"[gpu-bundle:{gpu.gpu_id}] state.json is v{saved_version}, this binary "
-                f"understands up to v{BUNDLE_STATE_SCHEMA_VERSION} — proceeding with best-effort load"
-            )
-        gpu.state_version = max(saved_version, BUNDLE_STATE_SCHEMA_VERSION)
-        gpu.oom_event_count = int(data.get("oom_event_count", 0))
-        gpu.oom_recovery_count = int(data.get("oom_recovery_count", 0))
-        gpu.oom_permanent_failure_count = int(data.get("oom_permanent_failure_count", 0))
-        gpu.oom_state = data.get("oom_state", "idle")
-        # Validate: bad persisted state can't wedge us
-        if gpu.oom_state not in cls._VALID_OOM_STATES:
-            logger.warning(
-                f"[gpu-bundle:{gpu.gpu_id}] persisted oom_state={gpu.oom_state!r} "
-                f"is not in valid set; coercing to 'idle'"
-            )
-            gpu.oom_state = "idle"
-        gpu.oom_state_since = float(data.get("oom_state_since", 0.0))
-        gpu.oom_last_event_ts = float(data.get("oom_last_event_ts", 0.0))
-        gpu.oom_last_reason = data.get("oom_last_reason", "")
-        gpu.oom_active_recovery_job_id = data.get("oom_active_recovery_job_id", "")
-        gpu.oom_retry_attempted = bool(data.get("oom_retry_attempted", False))
-        # The deque maxlen is set in __init__; .extend() will respect it.
-        saved_failures = data.get("oom_recent_failure_times") or []
-        gpu.oom_recent_failure_times.extend(float(t) for t in saved_failures)
-        # ── Phase 5/7: OOM-implicated service + state-change timestamp ──
-        # Use .get() with explicit defaults so a v2 file (no key at all)
-        # initializes cleanly. None / 0.0 are the documented defaults.
-        gpu.oom_last_service_name = data.get("oom_last_service_name", None)
-        gpu.oom_state_changed_at = float(data.get("oom_state_changed_at", 0.0))
-        # Note: queue items are not restored — they're ephemeral
-        return gpu
-
-
 # ── Per-GPU State Registry ────────────────────────────────────────
 
 _gpu_states: dict[str, GpuBundleState] = {}  # gpu_id -> GpuBundleState
 
 
 # ── Cross-GPU Bundle Coordination ──────────────────────────────────
-
-class BundleCoordinator:
-    """Tracks per-bundle-job GPU readiness for cross-GPU coordination.
-
-    When a bundle spans multiple GPUs (e.g. sulphur-diffusion on gpu_primary
-    linked to sulphur-encoder on gpu_secondary), all GPUs must load their components
-    before the bundle can start.  This coordinator tracks which GPUs have
-    finished loading and resolves the shared Future when all are ready.
-    """
-
-    def __init__(self):
-        self._active_jobs: dict[str, dict] = {}  # bundle_job_id -> info
-        self._lock = asyncio.Lock()
-
-    async def register_job(
-        self,
-        bundle_job_id: str,
-        bundle_name: str,
-        gpu_ids: list[str],
-        priority: int,
-        request_data: dict,
-    ) -> asyncio.Future:
-        """Register a new bundle job spanning multiple GPUs.
-
-        Returns a Future that resolves when ALL GPUs are ready.
-        """
-        async with self._lock:
-            loop = asyncio.get_event_loop()
-            future = loop.create_future()
-            self._active_jobs[bundle_job_id] = {
-                "bundle_name": bundle_name,
-                "gpu_ids": set(gpu_ids),
-                "ready_gpus": set(),
-                "priority": priority,
-                "request_data": request_data,
-                "future": future,
-                "created_at": time.time(),
-            }
-            logger.info(
-                f"BundleCoordinator: registered job {bundle_job_id} "
-                f"for '{bundle_name}' across GPUs {gpu_ids}"
-            )
-            return future
-
-    async def mark_gpu_ready(self, bundle_job_id: str, gpu_id: str) -> bool:
-        """Mark a GPU as ready for a bundle job.
-
-        Returns True if ALL GPUs are now ready (bundle can start).
-        """
-        async with self._lock:
-            job = self._active_jobs.get(bundle_job_id)
-            if not job:
-                logger.warning(
-                    f"BundleCoordinator: mark_gpu_ready for unknown job {bundle_job_id}"
-                )
-                return False
-            job["ready_gpus"].add(gpu_id)
-            all_ready = job["ready_gpus"] >= job["gpu_ids"]
-            logger.info(
-                f"BundleCoordinator: job {bundle_job_id} GPU {gpu_id} ready "
-                f"({len(job['ready_gpus'])}/{len(job['gpu_ids'])}) — all_ready={all_ready}"
-            )
-            return all_ready
-
-    async def complete_job(self, bundle_job_id: str, success: bool = True) -> None:
-        """Resolve the Future and clean up the job."""
-        async with self._lock:
-            job = self._active_jobs.pop(bundle_job_id, None)
-            if job and not job["future"].done():
-                if success:
-                    job["future"].set_result(True)
-                else:
-                    job["future"].set_exception(
-                        RuntimeError(f"Bundle job {bundle_job_id} failed")
-                    )
-            logger.info(
-                f"BundleCoordinator: job {bundle_job_id} completed (success={success})"
-            )
-
-    def is_gpu_ready(self, bundle_job_id: str, gpu_id: str) -> bool:
-        """Check if a specific GPU is ready for a bundle job."""
-        job = self._active_jobs.get(bundle_job_id)
-        if not job:
-            return False
-        return gpu_id in job["ready_gpus"]
-
-    def get_all_ready(self, bundle_job_id: str) -> set:
-        """Return set of ready GPUs for a bundle job."""
-        job = self._active_jobs.get(bundle_job_id)
-        if not job:
-            return set()
-        return job["ready_gpus"].copy()
-
-    def get_job_info(self, bundle_job_id: str) -> dict | None:
-        """Get full job info for a bundle job."""
-        job = self._active_jobs.get(bundle_job_id)
-        if not job:
-            return None
-        return {
-            "bundle_name": job["bundle_name"],
-            "gpu_ids": list(job["gpu_ids"]),
-            "ready_gpus": list(job["ready_gpus"]),
-            "priority": job["priority"],
-            "created_at": job["created_at"],
-        }
-
-    def cleanup_stale(self, max_age: float = 600.0) -> int:
-        """Remove jobs older than max_age seconds. Returns count removed."""
-        now = time.time()
-        stale = [
-            bid for bid, job in self._active_jobs.items()
-            if (now - job["created_at"]) > max_age
-        ]
-        for bid in stale:
-            job = self._active_jobs.pop(bid, None)
-            if job and not job["future"].done():
-                job["future"].set_exception(
-                    RuntimeError(f"Bundle job {bid} timed out after {max_age}s")
-                )
-            logger.warning(f"BundleCoordinator: cleaned up stale job {bid}")
-        return len(stale)
-
 
 bundle_coordinator = BundleCoordinator()
 
@@ -5908,197 +3374,14 @@ bundle_coordinator = BundleCoordinator()
 _OOM_PATTERN = re.compile(OOM_DETECTION_REGEX)
 
 
-def _detect_oom_in_history(
-    status_str: str = "",
-    messages: list | None = None,
-    response_body: str = "",
-    status_code: int = 200,
-    model_size_hint_gb: float = 0.0,
-    vram_free_mib: int = 0,
-    vram_total_mib: int = 0,
-) -> dict | None:
-    """Detect OOM from a ComfyUI / ACE-Step / generic generation response.
-
-    Returns a dict with detection details if OOM is suspected, None otherwise.
-
-    Sources (any one triggers):
-    1. status_str == 'error' AND any message matches OOM_DETECTION_REGEX
-    2. response_body matches OOM_DETECTION_REGEX
-    3. status_code is 5xx AND vram_free_mib < OOM_VRAM_PRESSURE_THRESHOLD_MIB
-    4. model_size_hint_gb * 1024 > vram_total_mib * 0.9 (model too big to fit)
-
-    Per adversarial check #7: do NOT use bare 'OOM' substring. The regex
-    OOM_DETECTION_REGEX requires the OOM marker to be preceded by cuda/HIP/
-    RuntimeError/torch.cuda to avoid false positives.
-    """
-    messages = messages or []
-
-    # Source 1: status_str=error AND messages match OOM regex
-    if status_str == "error":
-        for msg in messages:
-            msg_text = str(msg)
-            if _OOM_PATTERN.search(msg_text):
-                return {
-                    "source": "history_messages",
-                    "reason": "status_str=error, message matched OOM regex",
-                    "details": msg_text[:500],
-                }
-
-    # Source 2: response body matches OOM regex
-    if response_body:
-        match = _OOM_PATTERN.search(response_body)
-        if match:
-            return {
-                "source": "response_body",
-                "reason": "response body matched OOM regex",
-                "details": match.group(0)[:200],
-            }
-
-    # Source 3: 5xx + low VRAM (corroborates a backend OOM)
-    if status_code >= 500 and vram_free_mib > 0 and vram_free_mib < OOM_VRAM_PRESSURE_THRESHOLD_MIB:
-        return {
-            "source": "5xx_low_vram",
-            "reason": (
-                f"HTTP {status_code} with VRAM {vram_free_mib} MiB free "
-                f"(< {OOM_VRAM_PRESSURE_THRESHOLD_MIB})"
-            ),
-            "details": f"status={status_code}, free={vram_free_mib} MiB",
-        }
-
-    # Source 4: model size too big to fit
-    if model_size_hint_gb > 0 and vram_total_mib > 0:
-        required_mib = model_size_hint_gb * 1024
-        if required_mib > vram_total_mib * 0.9:
-            return {
-                "source": "model_too_large",
-                "reason": (
-                    f"Model {model_size_hint_gb:.1f} GB > 90% of VRAM "
-                    f"{vram_total_mib/1024:.1f} GB"
-                ),
-                "details": f"required={required_mib:.0f} MiB, available={vram_total_mib*0.9:.0f} MiB",
-            }
-
-    # A transport/server failure alone is not evidence of GPU memory pressure.
-    # Reporting it as OOM triggers destructive recovery of otherwise healthy
-    # model owners. Require one of the corroborated sources above.
-    return None
+_oom_detection_bound = _bind_oom_detection(globals())
+_detect_oom_in_history = _oom_detection_bound[0]
 
 
-def _verify_oom_via_vram(gpu_id: str) -> dict:
-    """Confirm OOM by reading the cached VRAM snapshot for a GPU.
-
-    Returns:
-        {gpu_id, available, free_mib, used_mib, total_mib, pressure, critical}
-        where `pressure` is True if free < OOM_VRAM_PRESSURE_THRESHOLD_MIB and
-        `critical` is True if free < OOM_VRAM_CRITICAL_THRESHOLD_MIB.
-
-        If the snapshot cannot be obtained the function returns
-        {gpu_id, available: False} (or {gpu_id, available: False, error: str}).
-    """
-    try:
-        snapshot = None
-        vram_mod = globals().get("vram")
-        if vram_mod is not None and hasattr(vram_mod, "get_snapshot"):
-            try:
-                snapshot = vram_mod.get_snapshot(gpu_id)
-            except Exception as e:
-                logger.debug(f"[oom-detect] vram.get_snapshot({gpu_id}) raised: {e}")
-        # Fallback: read from the cached poll result
-        if snapshot is None:
-            cache = globals().get("_vram_cache") or {}
-            for gpu in cache.get("gpus") or []:
-                # Match by gpu_id string or card name; the polled cache
-                # uses "card" + "pci_address" rather than "gpu_id".
-                if gpu.get("gpu_id") == gpu_id or gpu.get("card") == gpu_id:
-                    snapshot = gpu
-                    break
-        if snapshot is None:
-            return {"gpu_id": gpu_id, "available": False}
-        free = int(snapshot.get("free_mib") or snapshot.get("free_vram_mib") or 0)
-        total = int(snapshot.get("total_mib") or snapshot.get("total_vram_mib") or 0)
-        used = int(snapshot.get("used_mib") or snapshot.get("vram_used_mib") or (total - free if total else 0))
-        return {
-            "gpu_id": gpu_id,
-            "available": True,
-            "free_mib": free,
-            "used_mib": used,
-            "total_mib": total,
-            "pressure": free > 0 and free < OOM_VRAM_PRESSURE_THRESHOLD_MIB,
-            "critical": free > 0 and free < OOM_VRAM_CRITICAL_THRESHOLD_MIB,
-        }
-    except Exception as e:
-        logger.debug(f"[oom-detect] vram verify failed for {gpu_id}: {e}")
-        return {"gpu_id": gpu_id, "available": False, "error": str(e)}
+_verify_oom_via_vram = _oom_detection_bound[1]
 
 
-def _detect_silent_oom_via_dmesg(since_ts: float = 0.0) -> list[dict]:
-    """Scan dmesg for OOM-killer events on Linux.
-
-    Returns a list of dicts with keys: ts, pid, name, gpu_hint, raw_line.
-    Called by the watchdog to catch process kills that did not surface to
-    the worker (e.g. the kernel reaped a backend process before its 5xx
-    reached the worker).
-
-    Recognised patterns:
-      - 'Out of memory: Killed process <pid> (<name>)' (Linux kernel OOM killer)
-      - 'memory cgroup out of memory: Killed process <pid> (<name>)' (cgroup OOM)
-      - 'oom-kill:constraint=CONSTRAINT_MEMCG ... Killed process <pid> (<name>)'
-        (constraint-based OOM)
-
-    The kernel OOM-killer message format changed in 5.14+ and may include
-    additional fields; we only require pid+name for our purposes.
-    """
-    events: list[dict] = []
-    try:
-        # dmesg --since only works on journald; fall back to last 200 lines
-        args = None
-        if since_ts and since_ts > 0:
-            try:
-                ago = max(1, int(time.time() - since_ts))
-                args = ["dmesg", "--since", f"{ago}s ago"]
-            except Exception:
-                args = None
-        if args is None:
-            args = ["dmesg", "-T", "-l", "emerg,alert,crit,err,warn"]
-        result = subprocess.run(
-            args, capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0 or not (result.stdout or "").strip():
-            # Fallback: just get last 200 lines
-            result = subprocess.run(
-                ["dmesg", "-T"], capture_output=True, text=True, timeout=5,
-            )
-            lines = (result.stdout or "").splitlines()[-200:]
-        else:
-            lines = (result.stdout or "").splitlines()
-        oom_patterns = [
-            re.compile(r"Out of memory: Killed process (\d+) \((\S+)\)", re.IGNORECASE),
-            re.compile(r"memory cgroup out of memory: Killed process (\d+) \((\S+)\)", re.IGNORECASE),
-            re.compile(r"oom-kill:constraint=CONSTRAINT_MEMCG.*?Killed process (\d+) \((\S+)\)", re.IGNORECASE),
-        ]
-        for line in lines:
-            for pat in oom_patterns:
-                m = pat.search(line)
-                if m:
-                    try:
-                        pid = int(m.group(1))
-                    except (TypeError, ValueError):
-                        pid = 0
-                    name = m.group(2) or ""
-                    gpu_hint = "cpu"
-                    if any(x in name.lower() for x in ("python", "comfyui", "main.py", "sd-server", "llama", "ideogram", "sulphur", "acestep", "gemma", "qwen")):
-                        gpu_hint = "gpu_likely"
-                    events.append({
-                        "ts": time.time(),
-                        "pid": pid,
-                        "name": name,
-                        "gpu_hint": gpu_hint,
-                        "raw_line": line[:300],
-                    })
-                    break
-    except Exception as e:
-        logger.debug(f"[oom-detect] dmesg scan failed: {e}")
-    return events
+_detect_silent_oom_via_dmesg = _oom_detection_bound[2]
 
 
 # Module-level ring buffer of recent OOM events (capped) for /health surfacing.
@@ -6168,37 +3451,13 @@ _bundle_load_locks: dict[str, "asyncio.Lock"] = {}     # bundle_name -> lock (Ph
 _bundle_admission_locks: dict[str, "asyncio.Lock"] = {}
 
 
-def _get_force_recover_lock(service_name: str) -> "asyncio.Lock":
-    """Per-service lock for _force_recover_failed_service to prevent reentrancy.
-
-    Per adversarial #5: returning the same asyncio.Lock instance for a given
-    service_name means concurrent callers (pipeline + watchdog + worker) will
-    queue rather than race. Creates the lock on first use so we don't need a
-    running event loop at import time.
-    """
-    lock = _force_recover_locks.get(service_name)
-    if lock is None:
-        lock = asyncio.Lock()
-        _force_recover_locks[service_name] = lock
-    return lock
+_get_force_recover_lock = _oom_detection_bound[3]
 
 
-def _get_bundle_load_lock(bundle_name: str) -> "asyncio.Lock":
-    """Per-bundle lock for _load_bundle to prevent concurrent load races."""
-    lock = _bundle_load_locks.get(bundle_name)
-    if lock is None:
-        lock = asyncio.Lock()
-        _bundle_load_locks[bundle_name] = lock
-    return lock
+_get_bundle_load_lock = _oom_detection_bound[4]
 
 
-def _get_bundle_admission_lock(bundle_name: str) -> "asyncio.Lock":
-    """Serialize every admission path for a bundle, including eviction."""
-    lock = _bundle_admission_locks.get(bundle_name)
-    if lock is None:
-        lock = asyncio.Lock()
-        _bundle_admission_locks[bundle_name] = lock
-    return lock
+_get_bundle_admission_lock = _oom_detection_bound[5]
 
 
 # ---------------------------------------------------------------------------
@@ -6216,269 +3475,46 @@ def _get_bundle_admission_lock(bundle_name: str) -> "asyncio.Lock":
 # second controller is allowed to mutate the same host.
 # ---------------------------------------------------------------------------
 
-class _PhysicalResourceSetLock:
-    """Acquire all canonical resource locks in a deterministic order."""
-
-    def __init__(self, resource_ids: tuple[str, ...], atoms: tuple["asyncio.Lock", ...]):
-        self.resource_ids = resource_ids
-        self._atoms = atoms
-        self._acquired = False
-
-    def locked(self) -> bool:
-        return self._acquired or any(lock.locked() for lock in self._atoms)
-
-    async def __aenter__(self):
-        acquired: list["asyncio.Lock"] = []
-        try:
-            for lock in self._atoms:
-                await lock.acquire()
-                acquired.append(lock)
-        except BaseException:
-            for lock in reversed(acquired):
-                lock.release()
-            raise
-        self._acquired = True
-        return self
-
-    async def __aexit__(self, *_exc):
-        for lock in reversed(self._atoms):
-            if lock.locked():
-                lock.release()
-        self._acquired = False
+_PhysicalResourceSetLock = _oom_detection_bound[6]
 
 
 _physical_resource_locks: dict[tuple[str, ...], _PhysicalResourceSetLock] = {}
 _physical_resource_atom_locks: dict[str, "asyncio.Lock"] = {}
 
 
-def _get_physical_resource_lock(
-    gpu_ids: "list[str] | tuple[str, ...] | set[str]",
-) -> _PhysicalResourceSetLock:
-    """Return a composite lock for the SORTED physical resource ID set.
-
-    Two bundles that touch the same physical GPU set resolve to the SAME
-    composite regardless of ordering or bundle name. Intersecting sets share
-    their per-device atom locks, so a dual-GPU request conflicts with either
-    single-GPU request that touches one of its devices. A disjoint set has no
-    shared atoms and can proceed concurrently.
-    """
-    normalized = tuple(sorted(
-        {str(g) for g in gpu_ids if g}
-    ))
-    if not normalized:
-        raise ValueError(
-            "_get_physical_resource_lock requires at least one GPU id"
-        )
-    lock = _physical_resource_locks.get(normalized)
-    if lock is None:
-        atoms = tuple(
-            _physical_resource_atom_locks.setdefault(resource_id, asyncio.Lock())
-            for resource_id in normalized
-        )
-        lock = _PhysicalResourceSetLock(normalized, atoms)
-        _physical_resource_locks[normalized] = lock
-    return lock
+_get_physical_resource_lock = _oom_detection_bound[7]
 
 
-def _reset_physical_resource_locks_for_tests() -> None:
-    """Test helper: clear the physical-resource lock cache."""
-    _physical_resource_locks.clear()
-    _physical_resource_atom_locks.clear()
+_reset_physical_resource_locks_for_tests = _oom_detection_bound[8]
 
 
-def _bundle_physical_gpu_set(
-    bundle_name: str, bundles: dict | None = None
-) -> tuple[str, ...]:
-    """Return the sorted physical GPU set touched by *bundle_name*.
-
-    Walks ``linked_to`` and ``linked_from`` so the result spans every
-    physical GPU the bundle needs to own. Used to derive the physical
-    admission lock key.
-    """
-    if bundles is None:
-        bundles = _resolve_bundles()
-    bundle = bundles.get(bundle_name) or {}
-    primary = bundle.get("gpu_id")
-    gpus: list[str] = []
-    if primary:
-        gpus.append(str(primary))
-    for linked_name in _get_linked_bundles(bundle_name, bundles=bundles):
-        lgid = (bundles.get(linked_name) or {}).get("gpu_id")
-        if lgid and lgid not in gpus:
-            gpus.append(str(lgid))
-    return tuple(sorted(gpus))
+_bundle_physical_gpu_set = _oom_detection_bound[9]
 
 
-def _recent_oom_events(limit: int = 100) -> list[dict]:
-    """Return recent OOM events for the /health endpoint."""
-    return list(_recent_oom_events_log)[-limit:]
+_recent_oom_events = _oom_detection_bound[10]
 
 
 # ── Phase 5: OOM Redis pool lifecycle ──────────────────────────────
-async def _init_oom_redis():
-    """Initialize the OOM Redis pool. Called from create_app on_startup.
-
-    Per adversarial #11: dead-letter list lives in Redis (sorted set,
-    capped, TTL). We prefer to reuse the existing _queue_redis client
-    (synchronous redis-py) when available — that keeps the lifecycle tied
-    to a single, already-tested connection. If _queue_redis is not set
-    (Redis unavailable at create_app time), we open a dedicated client.
-    """
-    global _oom_redis_pool
-    try:
-        existing = globals().get("_queue_redis") or globals().get("redis_client")
-        if existing is not None:
-            _oom_redis_pool = existing
-            logger.info("[oom-redis] Reusing existing _queue_redis client for dead-letter store")
-            return
-        # Fallback: open a dedicated client using the same credential source
-        # as the queue engine; this must not drift from the shared client.
-        _oom_redis_pool = _redis_mod.Redis(**_redis_connection_kwargs())
-        await asyncio.to_thread(_oom_redis_pool.ping)
-        logger.info("[oom-redis] Connected to dedicated redis://localhost:6379/0 client")
-    except Exception as e:
-        logger.warning(f"[oom-redis] Failed to initialize: {e}")
-        _oom_redis_pool = None
+_init_oom_redis = _oom_detection_bound[11]
 
 
-async def _close_oom_redis():
-    """Close the OOM Redis pool. Called on app shutdown.
-
-    No-op if we reused the shared _queue_redis client (which is owned by
-    the queue engine and closed elsewhere).
-    """
-    global _oom_redis_pool
-    if _oom_redis_pool is None:
-        return
-    shared = globals().get("_queue_redis")
-    if _oom_redis_pool is shared:
-        # Shared client — don't close it here, owner handles lifecycle.
-        _oom_redis_pool = None
-        return
-    try:
-        await asyncio.to_thread(_oom_redis_pool.close)
-    except Exception:
-        pass
-    _oom_redis_pool = None
+_close_oom_redis = _oom_detection_bound[12]
 
 
-def _dead_letter_identity(entry: dict) -> tuple[str, str] | None:
-    """Stable dead-letter identity; blank job IDs are intentionally unkeyed."""
-    if not isinstance(entry, dict):
-        return None
-    job_id = str(entry.get("job_id", "")).strip()
-    if not job_id:
-        return None
-    return job_id, str(entry.get("gpu_id", "")).strip()
+_dead_letter_identity = _oom_detection_bound[13]
 
 
-def _matching_dead_letter_members(raw_members: list, job_id: str, gpu_id: str) -> list:
-    target = (str(job_id).strip(), str(gpu_id).strip())
-    matches = []
-    if not target[0]:
-        return matches
-    for raw in raw_members:
-        try:
-            text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            if _dead_letter_identity(json.loads(text)) == target:
-                matches.append(raw)
-        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-    return matches
+_matching_dead_letter_members = _oom_detection_bound[14]
 
 
 # ── Phase 5: Dead-letter list management ────────────────────────────
-async def _add_to_dead_letter(job_id: str, gpu_id: str, reason: str, last_state: str) -> bool:
-    """Add a job to the dead-letter list (Redis sorted set, capped, TTL).
-
-    Per adversarial #11: sorted set keyed by timestamp (newest = highest
-    score), trimmed to the most recent _OOM_DEAD_LETTER_CAP entries, with
-    a whole-set TTL of _OOM_DEAD_LETTER_TTL_S so abandoned lists expire
-    automatically. Best-effort: returns False if Redis is unreachable.
-    """
-    if _oom_redis_pool is None:
-        return False
-    try:
-        score = time.time()
-        entry = {
-            "job_id": job_id,
-            "gpu_id": gpu_id,
-            "reason": reason,
-            "last_state": last_state,
-            "ts": score,
-        }
-        member = json.dumps(entry, sort_keys=True, separators=(",", ":"))
-        # Replace prior records for the same job/GPU identity before inserting
-        # the latest terminal state. This prevents one recovery from inflating
-        # retained history when multiple failure branches report it.
-        raw_members = await asyncio.to_thread(
-            _oom_redis_pool.zrange, OOM_REDIS_DEAD_LETTER, 0, -1
-        )
-        duplicates = _matching_dead_letter_members(raw_members, job_id, gpu_id)
-        if duplicates:
-            await asyncio.to_thread(
-                _oom_redis_pool.zrem, OOM_REDIS_DEAD_LETTER, *duplicates
-            )
-        # ZADD with score=ts; trim oldest entries if over cap (rank 0..-(CAP+1))
-        await asyncio.to_thread(
-            _oom_redis_pool.zadd, OOM_REDIS_DEAD_LETTER, {member: score}
-        )
-        await asyncio.to_thread(
-            _oom_redis_pool.zremrangebyrank,
-            OOM_REDIS_DEAD_LETTER, 0, -(_OOM_DEAD_LETTER_CAP + 1),
-        )
-        await asyncio.to_thread(
-            _oom_redis_pool.expire, OOM_REDIS_DEAD_LETTER, _OOM_DEAD_LETTER_TTL_S
-        )
-        return True
-    except Exception as e:
-        logger.debug(f"[oom-dead-letter] Add failed: {e}")
-        return False
+_add_to_dead_letter = _oom_detection_bound[15]
 
 
-async def _get_dead_letters(limit: int = 100) -> list[dict]:
-    """Return the most recent dead-letter entries (newest first).
-
-    Sorted set is keyed by score=ts; ZREVRANGE returns newest first.
-
-    Returns an empty list if Redis is unreachable, but raises
-    RuntimeError on a hard Redis error so callers can distinguish
-    "no entries" from "Redis went away". The watchdog's
-    ``_refresh_dead_letter_cache`` uses the raise to decide whether
-    to stamp the refresh timestamp.
-    """
-    if _oom_redis_pool is None:
-        return []
-    try:
-        raw = await asyncio.to_thread(
-            _oom_redis_pool.zrevrange, OOM_REDIS_DEAD_LETTER, 0, limit - 1
-        )
-        return [json.loads(r) for r in raw]
-    except Exception as e:
-        logger.debug(f"[oom-dead-letter] Get failed: {e}")
-        raise
+_get_dead_letters = _oom_detection_bound[16]
 
 
-async def _refresh_dead_letter_cache() -> int:
-    """Refresh _dead_letter_cache from Redis. Returns count.
-
-    Called by the watchdog every ~30s. /health reads len(_dead_letter_cache)
-    so the sync handler doesn't have to await Redis.
-
-    On a SUCCESSFUL refresh we also stamp ``_dead_letter_cache_refresh_ts``
-    so /health and the websocket payload can compute cache_age_seconds
-    without issuing a synchronous Redis call. On failure the timestamp is
-    NOT advanced — operators can then see the data is stale.
-    """
-    global _dead_letter_cache, _dead_letter_cache_refresh_ts
-    try:
-        rows = await _get_dead_letters(limit=_OOM_DEAD_LETTER_CAP)
-    except Exception as e:
-        logger.debug(f"[oom-dead-letter] Cache refresh failed: {e}")
-        return len(_dead_letter_cache)
-    _dead_letter_cache = rows
-    _dead_letter_cache_refresh_ts = time.time()
-    return len(_dead_letter_cache)
+_refresh_dead_letter_cache = _oom_detection_bound[17]
 
 
 # ── Plan 05: OOM dead-letter classification + atomic retry contract ──
@@ -6641,515 +3677,15 @@ return {'submitted', ARGV[2], stream_id}
 """
 
 
-def _oom_retry_lua_script() -> str:
-    """Return the Lua source for the atomic-retry EVAL.
-
-    Wrapped so tests can monkeypatch a different body (the FakeRedis
-    stand-in already has its own reference implementation, but the
-    test suite still pins the text of the production script so a
-    silent regression in the production body fails fast).
-    """
-    return _OOM_RETRY_LUA
-
-
-def _normalize_dead_letter_entry(entry: dict) -> dict:
-    """Return a sanitized copy of a dead-letter entry.
-
-    Defensive against partial / malformed records so the rest of
-    the retry path can rely on the shape. Plan 05 #1 says historical
-    evidence is never rewritten, but reading / classifying a
-    malformed entry is not a write — and the classifier is the only
-    thing that decides what is even attemptable.
-    """
-    if not isinstance(entry, dict):
-        return {"job_id": "", "gpu_id": ""}
-    out = dict(entry)
-    out["job_id"] = str(out.get("job_id", "") or "").strip()
-    out["gpu_id"] = str(out.get("gpu_id", "") or "").strip()
-    out["reason"] = str(out.get("reason", "") or "").strip()
-    out["last_state"] = str(out.get("last_state", "") or "").strip()
-    return out
-
-
-async def _oom_retry_check_redis_state(entries: list[dict]) -> list[dict]:
-    """For each dead-letter entry, decide retry eligibility.
-
-    Returns the input list annotated with ``classification``,
-    ``classification_reason``, and a flag indicating which Redis
-    surfaces were observed. NEVER rewrites the input entries or any
-    Redis state. Plan 05 #2 + #6 say missing tracker / payload /
-    stream metadata is a terminal refusal; that is exactly what
-    this function reports.
-
-    The four signals it requires before declaring ``eligible``:
-
-      1. A live tracker hash at ``job:{job_id}`` carrying a
-         terminal status (``completed``/``failed``/``cancelled``/
-         ``oom_terminal``). Plan 05 #1 says the 32 retained records
-         have NO surviving trackers; they all fall out here as
-         ``missing_tracker``.
-      2. Payload / artifact reference material that can be replayed.
-         Encoded as a non-empty ``payload_hash`` on the tracker, or
-         an artifact reference list with at least one entry. Plan
-         05 #4 says payload/artifact reconstruction is required.
-      3. A non-replayed destination stream entry — i.e. no
-         ``retry_id`` already recorded against the original
-         ``oom:retry:stream:{orig_job_id}`` correlation set, AND
-         no active job with ``retry_of == orig_job_id`` still
-         queued or running. Plan 05 #4 + #5.
-      4. The attempt budget is not exhausted, tracked via the
-         audit-set count. Plan 05 #3.
-
-    Any single missing signal downgrades the classification.
-    ``dry_run`` callers see the same answer; there is no
-    differential path that would let a dry-run report ``eligible``
-    while a real run would refuse.
-    """
-    if not entries:
-        return []
-    if _oom_redis_pool is None:
-        # Fail closed: when Redis is unavailable we cannot verify
-        # any of the four signals. The plan is explicit that
-        # missing state fails closed; an unreachable store is
-        # also missing state.
-        return [
-            dict(
-                _normalize_dead_letter_entry(e),
-                classification=_OOM_RETRY_CLASS_NO_TRACKER,
-                classification_reason="redis_unavailable",
-                has_tracker=False,
-                has_payload_artifact=False,
-                has_stream_correlation=False,
-                attempt_count=0,
-            )
-            for e in entries
-        ]
-
-    out: list[dict] = []
-    for raw in entries:
-        e = _normalize_dead_letter_entry(raw)
-        job_id = e["job_id"]
-        gpu_id = e["gpu_id"]
-        if not job_id:
-            out.append(
-                dict(
-                    e,
-                    classification=_OOM_RETRY_CLASS_NOT_FOUND,
-                    classification_reason="blank_job_id",
-                    has_tracker=False,
-                    has_payload_artifact=False,
-                    has_stream_correlation=False,
-                    attempt_count=0,
-                )
-            )
-            continue
-
-        observed = {
-            "has_tracker": False,
-            "has_payload_artifact": False,
-            "tracker_status": None,
-            "tracker_payload_hash": None,
-            "tracker_artifact_refs": None,
-            "tracker_service_name": None,
-            "tracker_routing_group": None,
-            "has_stream_correlation": False,
-            "has_active_retry": False,
-            "attempt_count": 0,
-        }
-
-        # (1) tracker existence + payload / artifact material.
-        try:
-            tracker = await asyncio.to_thread(
-                _oom_redis_pool.hgetall, f"job:{job_id}"
-            )
-        except Exception as exc:
-            logger.debug(
-                f"[oom-retry] tracker read failed for {job_id}: {exc}"
-            )
-            tracker = None
-        if tracker:
-            observed["has_tracker"] = True
-            observed["tracker_status"] = str(
-                tracker.get("status", "") or ""
-            ).strip() or None
-            ph = str(tracker.get("payload_hash", "") or "").strip()
-            ar = str(tracker.get("artifact_refs", "") or "").strip()
-            observed["tracker_payload_hash"] = ph or None
-            observed["tracker_artifact_refs"] = ar or None
-            observed["tracker_service_name"] = str(
-                tracker.get("service_name", "") or ""
-            ).strip() or None
-            observed["tracker_routing_group"] = str(
-                tracker.get("routing_group", "") or ""
-            ).strip() or None
-            observed["has_payload_artifact"] = bool(ph) or bool(ar)
-
-        # (3a) correlation set: any prior retries against this orig?
-        try:
-            members = await asyncio.to_thread(
-                _oom_redis_pool.smembers,
-                f"{_OOM_RETRY_STREAM_CORRELATION_PREFIX}{job_id}",
-            )
-        except Exception as exc:
-            logger.debug(
-                f"[oom-retry] correlation read failed for {job_id}: {exc}"
-            )
-            members = set()
-        observed["attempt_count"] = len(members or set())
-        observed["has_stream_correlation"] = bool(members)
-
-        # (3b) any active retry still in flight? Scan retry audit
-        # hashes for status=queued/running against this orig.
-        if members:
-            for retry_id in members:
-                try:
-                    audit = await asyncio.to_thread(
-                        _oom_redis_pool.hgetall,
-                        f"{_OOM_RETRY_AUDIT_PREFIX}{retry_id}",
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        f"[oom-retry] audit read failed for {retry_id}: {exc}"
-                    )
-                    audit = None
-                if not audit:
-                    continue
-                new_job_id = str(audit.get("new_job_id", "") or "").strip()
-                if not new_job_id:
-                    continue
-                try:
-                    new_tracker = await asyncio.to_thread(
-                        _oom_redis_pool.hgetall, f"job:{new_job_id}"
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        f"[oom-retry] new tracker read failed: {exc}"
-                    )
-                    new_tracker = None
-                status = (
-                    str((new_tracker or {}).get("status", "") or "").strip()
-                    if new_tracker
-                    else ""
-                )
-                if status in ("queued", "running", "in_flight"):
-                    observed["has_active_retry"] = True
-                    break
-
-        # (4) attempt budget gate.
-        if observed["attempt_count"] >= _OOM_RETRY_DEFAULT_ATTEMPT_LIMIT:
-            classification = _OOM_RETRY_CLASS_BUDGET_EXCEEDED
-            reason = f"attempt_count={observed['attempt_count']}>=limit={_OOM_RETRY_DEFAULT_ATTEMPT_LIMIT}"
-        elif observed["has_active_retry"]:
-            classification = _OOM_RETRY_CLASS_REPLAYED
-            reason = "active_retry_in_flight"
-        elif not observed["has_tracker"]:
-            classification = _OOM_RETRY_CLASS_NO_TRACKER
-            reason = "no_live_tracker_at_job_key"
-        elif observed["tracker_status"] not in (
-            "completed",
-            "failed",
-            "cancelled",
-            "oom_terminal",
-        ):
-            classification = _OOM_RETRY_CLASS_REPLAYED
-            reason = f"non_terminal_tracker_status={observed['tracker_status']!r}"
-        elif not observed["has_payload_artifact"]:
-            classification = _OOM_RETRY_CLASS_NO_PAYLOAD
-            reason = "no_payload_hash_or_artifact_refs"
-        else:
-            classification = _OOM_RETRY_CLASS_ELIGIBLE
-            reason = "all_signals_present"
-
-        out.append(
-            dict(
-                e,
-                gpu_id=gpu_id,
-                classification=classification,
-                classification_reason=reason,
-                has_tracker=observed["has_tracker"],
-                has_payload_artifact=observed["has_payload_artifact"],
-                has_stream_correlation=observed["has_stream_correlation"],
-                has_active_retry=observed["has_active_retry"],
-                attempt_count=observed["attempt_count"],
-                tracker_status=observed["tracker_status"],
-                tracker_payload_hash=observed["tracker_payload_hash"],
-                tracker_artifact_refs=observed["tracker_artifact_refs"],
-                tracker_service_name=observed["tracker_service_name"],
-                tracker_routing_group=observed["tracker_routing_group"],
-            )
-        )
-    return out
-
-
-def _generate_oom_retry_id(orig_job_id: str) -> str:
-    """Build a stable, unique retry id. Pure function — used both
-    by the live path and by the test suite.
-    """
-    suffix = uuid.uuid4().hex[:12]
-    ts_ms = int(time.time() * 1000)
-    safe_orig = re.sub(r"[^A-Za-z0-9_-]", "_", str(orig_job_id))[:48]
-    return f"retry-{safe_orig}-{ts_ms}-{suffix}"
-
-
-def _generate_oom_retry_job_id(retry_id: str) -> str:
-    """New job id derived from a retry_id. Stable mapping so the
-    test suite can derive the expected tracker key without
-    re-implementing the algorithm.
-    """
-    return f"job-retry-{retry_id}"
-
-
-async def _atomic_retry_oom_job(
-    dead_letter: dict,
-    *,
-    actor: str,
-    reason: str,
-    idempotency_key: str,
-    payload_hash: str | None = None,
-    artifact_refs: list[str] | None = None,
-    service_name: str | None = None,
-    routing_group: str | None = None,
-) -> dict:
-    """Run the atomic retry EVAL for one dead-letter entry.
-
-    Caller MUST have classified first and passed only eligible
-    entries; this function does not re-classify, and will refuse
-    anything that is not eligible. The result is a dict with the
-    same shape the test suite pins:
-
-        {
-          "outcome": "submitted" | "replayed" | "budget_exceeded"
-                     | "exec_failed" | "refused",
-          "retry_id": ...,
-          "new_job_id": ...,
-          "stream_entry_id": ...,
-          "orig_job_id": ...,
-          "idempotency_key": ...,
-        }
-
-    The original dead-letter record is NEVER removed or rewritten.
-    """
-    e = _normalize_dead_letter_entry(dead_letter)
-    orig_job_id = e["job_id"]
-    gpu_id = e["gpu_id"]
-    if not orig_job_id:
-        return {
-            "outcome": "refused",
-            "reason": "blank_job_id",
-            "orig_job_id": orig_job_id,
-            "idempotency_key": idempotency_key,
-        }
-    if not idempotency_key or not isinstance(idempotency_key, str):
-        return {
-            "outcome": "refused",
-            "reason": "missing_idempotency_key",
-            "orig_job_id": orig_job_id,
-            "idempotency_key": idempotency_key,
-        }
-    if _oom_redis_pool is None:
-        return {
-            "outcome": "refused",
-            "reason": "redis_unavailable",
-            "orig_job_id": orig_job_id,
-            "idempotency_key": idempotency_key,
-        }
-
-    # Belt-and-suspenders: refuse if classification was not
-    # supplied / says ineligible. Production callers go through
-    # ``_oom_retry_check_redis_state`` first; the live MCP path
-    # is the only thing that should be invoking this helper, and
-    # it always passes a classified entry.
-    classification = str(dead_letter.get("classification", "") or "")
-    if classification and classification != _OOM_RETRY_CLASS_ELIGIBLE:
-        return {
-            "outcome": "refused",
-            "reason": f"ineligible:{classification}",
-            "orig_job_id": orig_job_id,
-            "idempotency_key": idempotency_key,
-        }
-
-    retry_id = _generate_oom_retry_id(orig_job_id)
-    new_job_id = _generate_oom_retry_job_id(retry_id)
-    attempt = int(dead_letter.get("attempt_count", 0) or 0) + 1
-    attempt_limit = _OOM_RETRY_DEFAULT_ATTEMPT_LIMIT
-    service = service_name or e.get("service_name") or ""
-    routing = routing_group or e.get("routing_group") or e.get("last_state") or "default"
-    payload_hash = payload_hash or e.get("payload_hash") or ""
-    artifact_refs = artifact_refs or []
-    artifact_refs_json = json.dumps(list(artifact_refs), sort_keys=True)
-    ts = f"{time.time():.6f}"
-
-    # The original dead-letter member is preserved verbatim; we
-    # only serialize it back as a string for the audit hash so a
-    # later audit can prove the original evidence has not been
-    # touched.
-    try:
-        orig_member_json = json.dumps(
-            e, sort_keys=True, separators=(",", ":")
-        )
-    except (TypeError, ValueError):
-        orig_member_json = json.dumps({"job_id": orig_job_id, "gpu_id": gpu_id})
-
-    # Destination stream key follows the same convention as
-    # RedisQueue.enqueue: queue:{routing_group}.
-    stream_key = f"queue:{routing}"
-
-    keys = [
-        f"{_OOM_RETRY_IDEMPOTENCY_PREFIX}{idempotency_key}",
-        f"{_OOM_RETRY_AUDIT_PREFIX}{retry_id}",
-        f"{_OOM_RETRY_STREAM_CORRELATION_PREFIX}{orig_job_id}",
-        f"job:{new_job_id}",
-        stream_key,
-    ]
-    args = [
-        idempotency_key,
-        retry_id,
-        new_job_id,
-        orig_job_id,
-        orig_member_json,
-        gpu_id,
-        str(attempt),
-        str(attempt_limit),
-        actor or "",
-        reason or "",
-        ts,
-        payload_hash or "",
-        artifact_refs_json,
-        service or "",
-        routing,
-        str(_OOM_RETRY_IDEMPOTENCY_TTL_S),
-        e.get("reason", ""),
-    ]
-
-    try:
-        raw = await asyncio.to_thread(
-            _oom_redis_pool.eval, _oom_retry_lua_script(), len(keys), *keys, *args
-        )
-    except Exception as exc:
-        logger.warning(
-            f"[oom-retry] EVAL failed for {orig_job_id}: {exc}"
-        )
-        return {
-            "outcome": "exec_failed",
-            "reason": str(exc),
-            "retry_id": retry_id,
-            "new_job_id": new_job_id,
-            "orig_job_id": orig_job_id,
-            "idempotency_key": idempotency_key,
-        }
-
-    # Lua always returns a 3-element list.
-    if not isinstance(raw, (list, tuple)) or len(raw) < 1:
-        return {
-            "outcome": "exec_failed",
-            "reason": "malformed_lua_response",
-            "retry_id": retry_id,
-            "new_job_id": new_job_id,
-            "orig_job_id": orig_job_id,
-            "idempotency_key": idempotency_key,
-        }
-    status = raw[0]
-    out = {
-        "retry_id": retry_id,
-        "new_job_id": new_job_id,
-        "orig_job_id": orig_job_id,
-        "idempotency_key": idempotency_key,
-    }
-    if status == "submitted":
-        out["outcome"] = "submitted"
-        out["stream_entry_id"] = raw[2] if len(raw) > 2 else None
-        return out
-    if status == "replayed":
-        replayed_retry_id = raw[1] if len(raw) > 1 else None
-        out["outcome"] = "replayed"
-        out["retry_id"] = replayed_retry_id
-        out["new_job_id"] = (
-            _generate_oom_retry_job_id(replayed_retry_id)
-            if replayed_retry_id
-            else None
-        )
-        out["replayed_retry_id"] = replayed_retry_id
-        return out
-    if status == "budget_exceeded":
-        out["outcome"] = "budget_exceeded"
-        out["attempt"] = raw[1] if len(raw) > 1 else None
-        out["attempt_limit"] = raw[2] if len(raw) > 2 else None
-        return out
-    # exec_failed or anything else: no partial state survived
-    # MULTI/EXEC (the Lua script DELs the idempotency marker on
-    # EXEC failure so a fresh retry is possible). The original
-    # dead-letter member is untouched.
-    out["outcome"] = "exec_failed"
-    out["reason"] = status
-    return out
-
-
-async def _oom_retry_correlation_snapshot(limit: int = 100) -> dict:
-    """Read-only helper: list every retry currently in the audit
-    index, group by ``orig_job_id``, and surface cross-store
-    correlation so operators can see OOM archive + queue DL +
-    retry audit as a unified picture (plan 05 #5 Option A).
-    """
-    if _oom_redis_pool is None:
-        return {
-            "schema_version": 1,
-            "redis_available": False,
-            "by_orig": {},
-            "total_retries": 0,
-        }
-    by_orig: dict[str, list[dict]] = {}
-    total = 0
-    try:
-        cursor = 0
-        # SCAN over oom:retry:audit:* to enumerate retries. The
-        # audit keys are short-lived (no explicit TTL today; the
-        # idempotency marker has the TTL) so a bounded scan is
-        # sufficient and avoids the KEYS hot path.
-        while True:
-            cursor, keys = await asyncio.to_thread(
-                _oom_redis_pool.scan,
-                cursor=cursor,
-                match=f"{_OOM_RETRY_AUDIT_PREFIX}*",
-                count=200,
-            )
-            for k in keys:
-                kk = k.decode() if isinstance(k, bytes) else k
-                if not kk.startswith(_OOM_RETRY_AUDIT_PREFIX):
-                    continue
-                retry_id = kk[len(_OOM_RETRY_AUDIT_PREFIX):]
-                audit = await asyncio.to_thread(
-                    _oom_redis_pool.hgetall, kk
-                )
-                if not audit:
-                    continue
-                orig = str(audit.get("orig_job_id", "") or "").strip()
-                if not orig:
-                    continue
-                by_orig.setdefault(orig, []).append(
-                    {
-                        "retry_id": retry_id,
-                        "new_job_id": audit.get("new_job_id", ""),
-                        "gpu_id": audit.get("gpu_id", ""),
-                        "service_name": audit.get("service_name", ""),
-                        "routing_group": audit.get("routing_group", ""),
-                        "attempt": audit.get("attempt", ""),
-                        "actor": audit.get("actor", ""),
-                        "ts": audit.get("ts", ""),
-                    }
-                )
-                total += 1
-            if cursor == 0:
-                break
-            if total >= limit * 4:
-                break
-    except Exception as exc:
-        logger.debug(f"[oom-retry] correlation scan failed: {exc}")
-    return {
-        "schema_version": 1,
-        "redis_available": True,
-        "by_orig": by_orig,
-        "total_retries": total,
-    }
+(
+    _oom_retry_lua_script,
+    _normalize_dead_letter_entry,
+    _oom_retry_check_redis_state,
+    _generate_oom_retry_id,
+    _generate_oom_retry_job_id,
+    _atomic_retry_oom_job,
+    _oom_retry_correlation_snapshot,
+) = _bind_oom_retry(globals())
 
 
 # ── OOM health section (shared by /health and the WebSocket full-state) ──
@@ -7425,9 +3961,15 @@ def _get_idle_service_for_gpu(gpu_id: str) -> str | None:
     scheduling = config.get("scheduling", {}) or {}
     idle_services = scheduling.get("idle_services", {}) or {}
     name = idle_services.get(gpu_id) or scheduling.get("idle_service")
-    if name and name in (config.get("services", {}) or {}):
-        return name
-    return None
+    services = config.get("services", {}) or {}
+    service = services.get(name, {}) if name else {}
+    # A global CPU idle tenant (for example Gemma CPU P2) is not a GPU
+    # baseline and must never be started on both dGPUs during recovery.
+    if not isinstance(service, dict) or service.get("enabled") is False:
+        return None
+    if service.get("gpu_id") != gpu_id:
+        return None
+    return name
 
 
 def _check_both_gpus_safe_to_recover(failed_gpu_id: str, timeout_s: float = 30.0) -> dict:
@@ -7523,21 +4065,66 @@ def _snapshot_pre_oom_state() -> dict:
           restart it after recovery.
     """
     snapshot: dict[str, str | None] = {}
-    for gpu_id, bs in _gpu_states.items():
-        # Always record what idle service we EXPECT for this GPU.
-        # If the GPU has a bundle loaded (idle displaced), we still
-        # snapshot the expected idle name so _restore_both_idle_llms
-        # can put it back.
-        idle = _get_idle_service_for_gpu(gpu_id)
-        snapshot[gpu_id] = idle
-        # Touching bs ensures the GPU entry exists in the snapshot even
-        # if no idle is configured (the value is None).
+    for gpu_id, bs in _get_all_gpu_states().items():
+        # The target is configuration intent, not a stale loaded GPU Gemma
+        # bundle from before the current CPU-only idle policy was applied.
+        snapshot[gpu_id] = _get_idle_service_for_gpu(gpu_id)
         _ = bs.loaded_bundles
     return snapshot
 
 
+async def _free_comfyui_models_for_oom(service_name: str, timeout_s: float = 10.0) -> dict:
+    """Unload ComfyUI model residency in-process; never stop or restart its unit."""
+    config = _load_services_config()
+    services = config.get("services", {}) or {}
+    comfy_cfg = services.get("comfyui", {})
+    if not isinstance(comfy_cfg, dict) or not comfy_cfg.get("enabled", True):
+        return {"ok": False, "reason": "comfyui_not_configured_or_disabled"}
+    service_cfg = services.get(service_name, {})
+    if service_name != "comfyui" and not (
+        isinstance(service_cfg, dict)
+        and service_cfg.get("backend") == "comfyui"
+    ):
+        return {"ok": False, "reason": "unsupported_or_unknown_backend_owner"}
+
+    base_url = str(comfy_cfg.get("base_url") or comfy_cfg.get("url") or COMFYUI_URL).rstrip("/")
+    if base_url.endswith("/prompt"):
+        base_url = base_url[:-len("/prompt")]
+    import aiohttp
+
+    timeout = ClientTimeout(total=max(0.1, min(float(timeout_s), 15.0)))
+    client = globals().get("session")
+    owns_client = client is None or bool(getattr(client, "closed", False))
+    if owns_client:
+        client = aiohttp.ClientSession(timeout=timeout)
+    if client is None:
+        return {"ok": False, "reason": "http_session_unavailable"}
+    try:
+        async with client.post(
+            f"{base_url}/free",
+            json={"unload_models": True, "free_memory": True},
+            timeout=timeout,
+        ) as response:
+            if not 200 <= response.status < 300:
+                return {
+                    "ok": False,
+                    "reason": "comfyui_free_http_error",
+                    "status": int(response.status),
+                }
+            await response.read()
+        return {"ok": True, "reason": "comfyui_models_unloaded_in_process"}
+    except asyncio.TimeoutError:
+        return {"ok": False, "reason": "comfyui_free_timeout"}
+    except Exception as exc:
+        logger.warning("[oom-recovery] ComfyUI /free failed: %s", type(exc).__name__)
+        return {"ok": False, "reason": "comfyui_free_error", "error": type(exc).__name__}
+    finally:
+        if owns_client:
+            await client.close()
+
+
 async def _restore_both_idle_llms(snapshot: dict | None = None) -> dict:
-    """Restore BOTH GPUs' idle LLMs after OOM recovery.
+    """Restore each GPU's configured idle LLM after OOM recovery.
 
     Per adversarial #3: do NOT use single restore_llm (which targets one
     GPU). This iterates per GPU and starts the idle service via systemd.
@@ -7557,15 +4144,39 @@ async def _restore_both_idle_llms(snapshot: dict | None = None) -> dict:
     already active we probe /health and treat it as restored when
     healthy; otherwise we issue ``try-restart``.
     """
+    results: dict[str, dict] = {}
+    planned_gpus: set[str] = set()
     if not snapshot:
         snapshot = {}
-        for gpu_id in _gpu_states:
-            snapshot[gpu_id] = _get_idle_service_for_gpu(gpu_id)
+        _plan = _IDLE_PLANNER.plan(_services_config or {}, time.time())
+        # Every GPU with a configured idle service is a restore target even if
+        # no code path has materialized its state yet (e.g. after a restart);
+        # iterating only the already-created states silently skipped a GPU.
+        try:
+            _known_gpus = set(_get_all_gpu_states())
+        except Exception:
+            _known_gpus = set(_gpu_states)
+        _configured_idle = ((_services_config or {}).get("scheduling") or {}).get("idle_services") or {}
+        _known_gpus.update(str(g) for g in _configured_idle)
+        for gpu_id in sorted(_known_gpus):
+            entry = _plan.get(gpu_id)
+            if entry is None:
+                snapshot[gpu_id] = _get_idle_service_for_gpu(gpu_id)
+                continue
+            planned_gpus.add(gpu_id)
+            if not entry["service"]:
+                results[gpu_id] = {"restored": False, "reason": "idle_target_unavailable"}
+            elif not entry["ready"]:
+                results[gpu_id] = {"restored": False, "reason": "idle_target_backoff"}
+            else:
+                snapshot[gpu_id] = entry["service"]
 
-    results: dict[str, dict] = {}
     for gpu_id, idle_service_name in snapshot.items():
         if not idle_service_name:
-            results[gpu_id] = {"restored": False, "reason": "no_idle_service"}
+            results[gpu_id] = {
+                "restored": True,
+                "reason": "configured_policy_has_no_gpu_idle_service",
+            }
             continue
         try:
             services = _services_config.get("services", {}) if isinstance(_services_config, dict) else {}
@@ -7579,9 +4190,9 @@ async def _restore_both_idle_llms(snapshot: dict | None = None) -> dict:
             # intent and is a violation of the disabled service contract.
             if svc.get("enabled") is False:
                 results[gpu_id] = {
-                    "restored": False,
+                    "restored": True,
                     "unit": unit,
-                    "reason": "disabled_service_untouched",
+                    "reason": "configured_idle_service_disabled_by_operator",
                 }
                 logger.info(
                     "[oom-recovery] %s is disabled in services config; "
@@ -7609,6 +4220,23 @@ async def _restore_both_idle_llms(snapshot: dict | None = None) -> dict:
                         idle_service_name,
                         gpu_id,
                     )
+                    continue
+                # Admission evicts the GPU's resident bundles before loading, so
+                # a baseline that is already resident and serving must not be
+                # re-admitted: that would stop and reload it on every call.
+                _gs_now = _gpu_states.get(gpu_id)
+                _resident = {str(b).removeprefix("llm:") for b in (
+                    list(getattr(_gs_now, "loaded_bundles", None) or [])
+                    + [getattr(_gs_now, "loaded_bundle", None)]) if b}
+                if bundle_name in _resident and await _probe_health_inline(
+                    svc.get("port"), health_path=svc.get("health_path") or "/health"
+                ):
+                    results[gpu_id] = {
+                        "restored": True,
+                        "unit": unit,
+                        "bundle": bundle_name,
+                        "reason": "already_loaded_healthy",
+                    }
                     continue
                 admitted, _ = await _admit_bundle_backed_llm_service(
                     idle_service_name,
@@ -7687,6 +4315,12 @@ async def _restore_both_idle_llms(snapshot: dict | None = None) -> dict:
                         f"[oom-recovery] {unit} already active+healthy on {gpu_id}; skipping start"
                     )
                     continue
+                # B6: a broker pool member is never restarted under its
+                # in-flight jobs; the broker drains it on failed probes.
+                if _combined_gemma_broker_owns_service(idle_service_name, svc):
+                    results[gpu_id] = {"restored": False, "unit": unit,
+                                       "reason": "broker_member_unhealthy_left_to_broker"}
+                    continue
                 # Active but unhealthy — try-restart to nudge it
                 proc = await asyncio.create_subprocess_exec(
                     "systemctl", "try-restart", unit,
@@ -7739,6 +4373,11 @@ async def _restore_both_idle_llms(snapshot: dict | None = None) -> dict:
                 )
                 continue
             results[gpu_id] = {"restored": rc == 0, "unit": unit, "rc": rc}
+            if rc == 0 and _combined_gemma_broker_owns_service(idle_service_name, svc):
+                # B6: a started pool member serves only after the fenced rejoin
+                rejoined = await _rejoin_combined_gemma_member_after_start(
+                    idle_service_name, timeout=min(DRAIN_TIMEOUT, 30.0))
+                results[gpu_id].update(restored=bool(rejoined), rejoined=bool(rejoined))
             if rc == 0:
                 logger.info(
                     f"[oom-recovery] Restored {idle_service_name} on {gpu_id} via {unit}"
@@ -7753,6 +4392,11 @@ async def _restore_both_idle_llms(snapshot: dict | None = None) -> dict:
                 f"[oom-recovery] Failed to restore {idle_service_name} on {gpu_id}: {e}"
             )
 
+    _now = time.time()
+    for gpu_id in planned_gpus:
+        if results.get(gpu_id, {}).get("reason") in {"idle_target_unavailable", "idle_target_backoff"}:
+            continue
+        _IDLE_PLANNER.report_result(gpu_id, bool(results.get(gpu_id, {}).get("restored")), _now)
     return results
 
 
@@ -7859,7 +4503,7 @@ async def _oom_recovery_pipeline(
     # Idempotency: if this GPU is already past 'detected', don't restart
     # the pipeline. The watchdog may fire repeatedly while a recovery is
     # in flight; we want exactly ONE pipeline per OOM.
-    if bs.oom_state in ("recovering", "verifying", "restored", "permanent_failed"):
+    if bs.oom_state in ("recovering", "verifying", "restored", "oom_failed", "permanent_failed"):
         logger.debug(
             f"[oom-recovery] {gpu_id} already in oom_state={bs.oom_state!r}; "
             f"skipping re-entry"
@@ -7881,8 +4525,9 @@ async def _oom_recovery_pipeline(
             )
             return {"state": "skipped", "reason": "lock_timeout"}
         except Exception as e:
-            logger.warning(f"[oom-recovery] Lock acquire error: {e}; proceeding unlocked")
-            lock_acquired = False
+            bs.set_oom_state("oom_failed", source="recovery_lock_error", reason=type(e).__name__)
+            logger.error("[oom-recovery] %s lock acquisition failed (%s); admission remains closed", gpu_id, type(e).__name__)
+            return {"state": "oom_failed", "reason": "recovery_lock_error", "gpu_id": gpu_id}
 
     try:
         # Snapshot pre-OOM state for correct restoration (#7)
@@ -7915,29 +4560,23 @@ async def _oom_recovery_pipeline(
         # Atomic multi-GPU check (per adversarial #1 — corrected)
         check = _check_both_gpus_safe_to_recover(gpu_id)
         if not check.get("safe"):
-            bs.set_oom_state(
-                "permanent_failed",
-                source="recovery_pipeline",
-                reason=f"blocked: {check.get('reason')}",
-            )
+            failure_reason = f"recovery ownership/transition check failed: {check.get('reason')}"
+            bs.set_oom_state("oom_failed", source="recovery_pipeline", reason=failure_reason)
             bs.oom_permanent_failure_count += 1
-            logger.error(
-                f"[oom-recovery] {gpu_id}: BLOCKED - {check.get('reason')!r}"
-            )
-            # Phase 5: record to dead-letter list (best-effort)
+            logger.error("[oom-recovery] %s: %s; admission remains closed; operator intervention required", gpu_id, failure_reason)
             if job_id:
-                try:
-                    await _add_to_dead_letter(
-                        job_id=job_id,
-                        gpu_id=gpu_id,
-                        reason=f"blocked: {check.get('reason')}",
-                        last_state="permanent_failed",
+                if job_tracker is not None:
+                    job_tracker.update_status(
+                        job_id, "failed", error_type="oom", oom_recovery_state="oom_failed",
+                        oom_reason=oom_reason or "oom_detected", oom_recovery_error=failure_reason,
                     )
+                try:
+                    await _add_to_dead_letter(job_id=job_id, gpu_id=gpu_id, reason=failure_reason, last_state="oom_failed")
                 except Exception as _dl_err:
-                    logger.debug(f"[oom-recovery] dead-letter add failed: {_dl_err}")
+                    logger.warning("[oom-recovery] OOM dead-letter write failed for %s: %s", job_id, type(_dl_err).__name__)
             return {
-                "state": "permanent_failed",
-                "reason": check.get("reason"),
+                "state": "oom_failed",
+                "reason": failure_reason,
                 "gpu_id": gpu_id,
             }
 
@@ -7965,84 +4604,105 @@ async def _oom_recovery_pipeline(
                 except Exception as e:
                     logger.debug(f"[oom-recovery] Cancel prompt error: {e}")
 
-        # Stage 2: DRAINING -> VERIFYING
+        # Stage 2: drain the owned prompt, then ask ComfyUI to unload its
+        # own model state. Unknown/non-ComfyUI owners cannot be cleaned up
+        # safely here; do not stop/restart a backend or guess at a PID.
         bs.set_oom_state("verifying", source="recovery_pipeline")
-        logger.info(f"[oom-recovery] {gpu_id}: draining -> verifying")
-
-        # Brief grace period for unload to complete
-        await asyncio.sleep(2.0)
-
-        # Verify VRAM has headroom
-        try:
-            vram = _verify_oom_via_vram(gpu_id)
-        except Exception as e:
-            logger.debug(f"[oom-recovery] vram verify raised: {e}")
-            vram = {"available": False, "error": str(e)}
-        if vram.get("available") and not vram.get("pressure", True):
-            logger.info(
-                f"[oom-recovery] {gpu_id}: VRAM cleared "
-                f"({vram.get('free_mib')} MiB free)"
-            )
-        else:
-            logger.warning(
-                f"[oom-recovery] {gpu_id}: VRAM still pressured "
-                f"(free={vram.get('free_mib', '?')} MiB, "
-                f"pressure={vram.get('pressure')})"
-            )
-
-        # Stage 3: VERIFYING -> RECOVERING
-        bs.set_oom_state("recovering", source="recovery_pipeline")
-        logger.info(f"[oom-recovery] {gpu_id}: verifying -> recovering")
-
-        # Force-evict the failed bundle with reentrancy protection (#5).
-        # If service_name was 'unknown' (e.g. dmesg-killed PID), we still
-        # want to mark recovered; we just skip the force-recover step.
-        if service_name and service_name != "unknown":
-            lock = _get_force_recover_lock(service_name)
-            async with lock:
+        service_cfg = (_load_services_config().get("services", {}) or {}).get(service_name, {})
+        comfyui_owned = service_name == "comfyui" or (
+            isinstance(service_cfg, dict) and service_cfg.get("backend") == "comfyui"
+        )
+        cleanup = {"ok": False, "reason": "unknown_or_unsupported_backend_owner"}
+        if comfyui_owned:
+            try:
+                cleanup = await asyncio.wait_for(
+                    _free_comfyui_models_for_oom(service_name, timeout_s=10.0),
+                    timeout=12.0,
+                )
+            except Exception as exc:
+                cleanup = {"ok": False, "reason": "comfyui_free_exception", "error": type(exc).__name__}
+        if not cleanup.get("ok"):
+            failure_reason = str(cleanup.get("reason", "comfyui_cleanup_failed"))
+            bs.set_oom_state("oom_failed", source="recovery_pipeline", reason=failure_reason)
+            logger.error("[oom-recovery] %s cleanup unresolved (%s); admission closed; manual intervention required", gpu_id, failure_reason)
+            if job_id:
+                if job_tracker is not None:
+                    job_tracker.update_status(
+                        job_id, "failed", error_type="oom", oom_recovery_state="oom_failed",
+                        oom_reason=oom_reason or "oom_detected", oom_recovery_error=failure_reason,
+                        oom_diagnostics=json.dumps({"gpu_id": gpu_id, "service": service_name, "cleanup": cleanup})[:2000],
+                    )
                 try:
-                    fr = globals().get("_force_recover_failed_service")
-                    if fr is not None and inspect.iscoroutinefunction(fr):
-                        await asyncio.wait_for(
-                            fr(service_name, job_id or "", oom_reason or "oom"),
-                            timeout=OOM_RECOVERY_TIMEOUT_S,
-                        )
-                    elif fr is not None:
-                        # Sync function — call directly (no timeout wrapping)
-                        fr(service_name, job_id or "", oom_reason or "oom")
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"[oom-recovery] _force_recover timeout for {service_name}"
+                    await _add_to_dead_letter(job_id=job_id, gpu_id=gpu_id, reason=failure_reason, last_state="oom_failed")
+                except Exception as _dl_err:
+                    logger.warning("[oom-recovery] OOM dead-letter write failed for %s: %s", job_id, type(_dl_err).__name__)
+            return {"state": "oom_failed", "reason": failure_reason, "gpu_id": gpu_id, "cleanup": cleanup}
+
+        # Retained VRAM is an unresolved owner, not a successful recovery.
+        bs.set_oom_state("recovering", source="recovery_pipeline")
+        vram = {"available": False}
+        for _ in range(12):
+            try:
+                vram = _verify_oom_via_vram(gpu_id)
+            except Exception as exc:
+                vram = {"available": False, "error": type(exc).__name__}
+            if vram.get("available") and not vram.get("pressure", True):
+                break
+            await asyncio.sleep(1.0)
+        if not (vram.get("available") and not vram.get("pressure", True)):
+            failure_reason = "vram_retained_or_unverifiable_after_comfyui_free"
+            bs.set_oom_state("oom_failed", source="recovery_pipeline", reason=failure_reason)
+            logger.error("[oom-recovery] %s VRAM not safely restored (%s); admission closed; manual intervention required", gpu_id, vram)
+            if job_id:
+                if job_tracker is not None:
+                    job_tracker.update_status(
+                        job_id, "failed", error_type="oom", oom_recovery_state="oom_failed",
+                        oom_reason=oom_reason or "oom_detected", oom_recovery_error=failure_reason,
+                        oom_diagnostics=json.dumps({"gpu_id": gpu_id, "service": service_name, "vram": vram})[:2000],
                     )
-                except Exception as e:
-                    logger.error(
-                        f"[oom-recovery] _force_recover failed for {service_name}: {e}"
-                    )
-        else:
-            logger.info(
-                f"[oom-recovery] {gpu_id}: skipping force_recover "
-                f"(service_name={service_name!r})"
+                try:
+                    await _add_to_dead_letter(job_id=job_id, gpu_id=gpu_id, reason=failure_reason, last_state="oom_failed")
+                except Exception as _dl_err:
+                    logger.warning("[oom-recovery] OOM dead-letter write failed for %s: %s", job_id, type(_dl_err).__name__)
+            return {"state": "oom_failed", "reason": failure_reason, "gpu_id": gpu_id, "vram": vram}
+
+        # Restore only the GPU-local configured idle policy (CPU-only global
+        # tenants are deliberately not started on either dGPU).
+        try:
+            restore_results = await asyncio.wait_for(
+                _restore_both_idle_llms(pre_oom_snapshot),
+                timeout=OOM_RECOVERY_TIMEOUT_S,
             )
+        except Exception as exc:
+            restore_results = {"error": {"restored": False, "reason": type(exc).__name__}}
+        if not isinstance(restore_results, dict) or not all(
+            isinstance(item, dict) and item.get("restored") is True
+            for item in restore_results.values()
+        ):
+            failure_reason = "configured_gpu_idle_restore_failed"
+            bs.set_oom_state("oom_failed", source="recovery_pipeline", reason=failure_reason)
+            logger.error("[oom-recovery] %s idle restore failed (%s); admission closed; manual intervention required", gpu_id, restore_results)
+            if job_id:
+                if job_tracker is not None:
+                    job_tracker.update_status(
+                        job_id, "failed", error_type="oom", oom_recovery_state="oom_failed",
+                        oom_reason=oom_reason or "oom_detected", oom_recovery_error=failure_reason,
+                        oom_diagnostics=json.dumps({"gpu_id": gpu_id, "service": service_name, "restore": restore_results})[:2000],
+                    )
+                try:
+                    await _add_to_dead_letter(job_id=job_id, gpu_id=gpu_id, reason=failure_reason, last_state="oom_failed")
+                except Exception as _dl_err:
+                    logger.warning("[oom-recovery] OOM dead-letter write failed for %s: %s", job_id, type(_dl_err).__name__)
+            return {"state": "oom_failed", "reason": failure_reason, "gpu_id": gpu_id, "restore_results": restore_results}
 
         bs.oom_recovery_count += 1
 
-        # First-OOM auto-retry marker (#2). The actual retry is handled
-        # by the worker when it sees oom_retry_attempted=True on the
-        # failed job — here we just set the flag.
-        if not bs.oom_retry_attempted and oom_reason:
-            bs.oom_retry_attempted = True
-            logger.info(
-                f"[oom-recovery] {gpu_id}: first-OOM retry flag set "
-                f"(worker will retry with dim*{OOM_RETRY_DIM_SCALE}, "
-                f"batch//{OOM_RETRY_BATCH_DIVISOR})"
-            )
-
-        # Stage 4: RECOVERING -> RESTORED
+        # Recovery is complete only after cleanup, VRAM verification, and
+        # configured GPU-local idle restoration have all succeeded.
         bs.set_oom_state("restored", source="recovery_pipeline")
         logger.info(f"[oom-recovery] {gpu_id}: recovering -> restored")
 
         # Restore BOTH GPUs' idle LLMs (#3) using the pre-OOM snapshot (#7).
-        restore_results = await _restore_both_idle_llms(pre_oom_snapshot)
         logger.info(
             f"[oom-recovery] Restore results: {restore_results}"
         )
@@ -8094,6 +4754,19 @@ async def _oom_recovery_pipeline(
             "gpu_id": gpu_id,
             "restore_results": restore_results,
         }
+    except Exception as exc:
+        reason = f"recovery_exception:{type(exc).__name__}"
+        bs.set_oom_state("oom_failed", source="recovery_pipeline_exception", reason=reason)
+        if job_id and job_tracker is not None:
+            try:
+                job_tracker.update_status(
+                    job_id, "failed", error_type="oom", oom_recovery_state="oom_failed",
+                    oom_recovery_error=reason,
+                )
+            except Exception:
+                pass
+        logger.exception("[oom-recovery] %s recovery failed; admission remains closed; manual intervention required", gpu_id)
+        return {"state": "oom_failed", "reason": reason, "gpu_id": gpu_id}
     finally:
         _oom_recovery_in_progress.pop(gpu_id, None)
         if lock_acquired and _oom_lock is not None:
@@ -8220,41 +4893,6 @@ async def _check_port_healthy(port: int | str | None) -> bool:
         return False
 
 
-async def _normalise_pcie(addr: str | None) -> str:
-    """Canonicalise a PCI Express BDF address from operator-owned input.
-
-    Driver and sysfs sources may emit the same slot in different case,
-    prefix, or short-form representations. This normaliser produces a single
-    canonical form
-    ``dddd:bb:dd.f`` (4-hex domain, 2-hex bus, 2-hex device, 1-hex
-    function) so equality comparisons across these forms succeed.
-
-    Returns the empty string for empty / unparseable input.
-    """
-    if not addr:
-        return ""
-    s = str(addr).strip()
-    if not s:
-        return ""
-    # Find the first substring of the form hex:hex:hex(.hex)?.
-    # The string may contain extra text (sysfs path, etc.); we
-    # search the whole string for the first BDF-like sequence.
-    import re as _re
-    m = _re.search(
-        r"([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2})(?:\.([0-9a-fA-F]))?",
-        s,
-    )
-    if not m:
-        return ""
-    domain_s, bus_s, dev_s, fn_s = m.groups()
-    try:
-        domain = int(domain_s, 16)
-        bus = int(bus_s, 16)
-        dev = int(dev_s, 16)
-        func = int(fn_s, 16) if fn_s else 0
-    except ValueError:
-        return ""
-    return f"{domain:04x}:{bus:02x}:{dev:02x}.{func:x}"
 
 
 # Module-level precompiled regexes (avoids recompiling on every call).
@@ -8273,235 +4911,18 @@ _vulkan_rn_map_cache: dict = {"data": None, "ts": 0.0}
 _VULKAN_RN_MAP_TTL = 1.0
 
 
-def _scan_render_node_fdinfo_cached() -> dict:
-    """Cached wrapper around _scan_render_node_fdinfo (1s TTL)."""
-    import time as _time
-    now = _time.monotonic()
-    if _vulkan_scan_cache["data"] is not None and (now - _vulkan_scan_cache["ts"]) < _VULKAN_SCAN_TTL:
-        return _vulkan_scan_cache["data"]
-    data = _scan_render_node_fdinfo()
-    _vulkan_scan_cache["data"] = data
-    _vulkan_scan_cache["ts"] = now
-    return data
 
 
-def _build_render_node_to_gpu_map_cached(gpu_devices: dict) -> dict:
-    """Cached wrapper around _build_render_node_to_gpu_map (1s TTL)."""
-    import time as _time
-    now = _time.monotonic()
-    if _vulkan_rn_map_cache["data"] is not None and (now - _vulkan_rn_map_cache["ts"]) < _VULKAN_RN_MAP_TTL:
-        return _vulkan_rn_map_cache["data"]
-    data = _build_render_node_to_gpu_map(gpu_devices)
-    _vulkan_rn_map_cache["data"] = data
-    _vulkan_rn_map_cache["ts"] = now
-    return data
 
 
-def _read_proc_name(pid: int) -> str:
-    """Read the process name from /proc/<pid>/comm. Returns '' on error."""
-    try:
-        with open(f"/proc/{pid}/comm", "rb") as f:
-            return f.read().decode("utf-8", errors="replace").strip()
-    except (OSError, IOError):
-        return ""
 
 
-def _scan_render_node_fdinfo() -> dict:
-    """Walk /proc/*/fd/ and return per-pid per-rendernode drm-vm + amdgpu VRAM usage.
-
-    The drm-vm-size line in /proc/<pid>/fdinfo/<fd> is per GEM-object fd,
-    regardless of whether the user-space driver is ROCm (KFD), Vulkan
-    (RADV/amdvlk), OpenGL, or any other GEM-using API. This means a Vulkan
-    process holding render-node GEM fds will be visible here even though
-    amdgpu_top's per-process fdinfo only attributes to the KFD-visible
-    allocation.
-
-    Returns: { pid: { render_node_path: { drm_vm_bytes,
-                                         amdgpu_vram_bytes, fd_count } } }
-    No sudo required — /proc/<pid>/fdinfo/* is world-readable.
-    """
-    import os as _os
-    result: dict = {}
-    try:
-        for entry in _os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            pid = int(entry)
-            fd_dir = f"/proc/{entry}/fd"
-            try:
-                fd_names = _os.listdir(fd_dir)
-            except (OSError, IOError):
-                continue
-            for fd_name in fd_names:
-                try:
-                    target = _os.readlink(f"{fd_dir}/{fd_name}")
-                except (OSError, IOError):
-                    continue
-                if not _RENDER_NODE_RE.match(target):
-                    continue
-                try:
-                    with open(f"{fd_dir}/fdinfo/{fd_name}", "rb") as f:
-                        info = f.read().decode("utf-8", errors="replace")
-                except (OSError, IOError):
-                    continue
-                drm_vm = 0
-                amdgpu_vram = 0
-                for line in info.splitlines():
-                    if line.startswith("drm-vm-size:"):
-                        try:
-                            drm_vm += int(line.split(":", 1)[1].strip())
-                        except (ValueError, IndexError):
-                            pass
-                    elif line.startswith("amdgpu-memory-vram:"):
-                        try:
-                            amdgpu_vram += int(line.split(":", 1)[1].strip())
-                        except (ValueError, IndexError):
-                            pass
-                if drm_vm == 0 and amdgpu_vram == 0:
-                    continue
-                result.setdefault(pid, {}).setdefault(target, {
-                    "drm_vm_bytes": 0,
-                    "amdgpu_vram_bytes": 0,
-                    "fd_count": 0,
-                })
-                result[pid][target]["drm_vm_bytes"] += drm_vm
-                result[pid][target]["amdgpu_vram_bytes"] += amdgpu_vram
-                result[pid][target]["fd_count"] += 1
-    except OSError:
-        pass
-    return result
 
 
-def _render_node_to_gpu_id(render_node: str, gpu_devices: dict) -> str | None:
-    """Map an operator-owned render-node path to a configured logical GPU via PCI metadata."""
-    import os as _os
-    try:
-        device_link = _os.readlink(f"/sys/class/drm/{_os.path.basename(render_node)}/device")
-    except OSError:
-        return None
-    m = _PCI_BDF_RE.search(device_link)
-    if not m:
-        return None
-    target_pci = m.group(1)
-    for gid, cfg in gpu_devices.items():
-        if cfg.get("pci") == target_pci:
-            return gid
-    return None
 
 
-def _build_render_node_to_gpu_map(gpu_devices: dict) -> dict:
-    """Build /dev/dri/renderD* -> gpu_id map for all known render nodes."""
-    import os as _os
-    result: dict = {}
-    try:
-        for entry in _os.listdir("/sys/class/drm"):
-            if not entry.startswith("renderD"):
-                continue
-            gid = _render_node_to_gpu_id(f"/dev/dri/{entry}", gpu_devices)
-            if gid:
-                result[f"/dev/dri/{entry}"] = gid
-    except OSError:
-        pass
-    return result
 
 
-async def _gpu_has_active_generation_tenant(gpu_id: str | None) -> tuple[bool, str]:
-    """Return (is_blocked, reason) — True if a generation backend is using this GPU.
-    Checks: (a) any generation_backend with matching gpu_id has active systemd unit,
-    (b) total VRAM used on the GPU > 2 GiB,
-    (c) Vulkan/OpenGL/CL tenant holding GEM fds (drm-vm > 512 MiB)."""
-    if not gpu_id:
-        return False, ""
-    config = _load_services_config()
-    services = config.get("services", {})
-    for name, svc in services.items():
-        if svc.get("type") != "generation_backend":
-            continue
-        if svc.get("gpu_id") != gpu_id:
-            continue
-        unit = svc.get("systemd_unit", "")
-        if not unit:
-            continue
-        proc = await asyncio.create_subprocess_exec(
-            "systemctl", "is-active", unit,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await proc.communicate()
-        if stdout.decode().strip() == "active":
-            return True, f"generation backend '{name}' ({unit}) is active on GPU {gpu_id}"
-    # VRAM threshold check
-    # B3 BUGFIX: build a normalized lookup from gpu_devices config so we
-    # match by pcie address (or card name) from the vram poll, NOT by a
-    # fragile substring match on a free-form gpu_name.  PR10 also
-    # routes every comparison through ``_normalise_pcie()`` so that
-    # the various BDF encodings (lspci -D, sysfs, sysfs path,
-    # short-form) all collapse to a single canonical form before
-    # comparison.
-    try:
-        gpu_devices = config.get("gpu_devices", {}) or {}
-        # target_pcie: set of normalised pcie addresses.
-        target_pcie: set[str] = set()
-        # card -> gpu_id (fallback match for hosts where the
-        # gpu_devices config has no ``pci`` field).
-        target_card: dict[str, str] = {}
-        for dev_id, dev_cfg in gpu_devices.items():
-            raw_pci = dev_cfg.get("pci") or dev_cfg.get("pcie") or ""
-            n_pci = await _normalise_pcie(raw_pci)
-            if n_pci:
-                target_pcie.add(n_pci)
-            card = dev_cfg.get("card") or ""
-            if card:
-                target_card[card] = dev_id
-
-        # Direct match: gpu_id itself is a normalised pcie address.
-        gpu_id_norm = await _normalise_pcie(gpu_id)
-        vram_data = await _poll_vram()
-        # Find the GPU entry that matches the caller's gpu_id, either
-        # by pcie address or by card name.
-        target_gpu = None
-        for gpu in vram_data.get("gpus", []):
-            gpu_pci = await _normalise_pcie(gpu.get("pci_address") or "")
-            gpu_card = gpu.get("card") or ""
-            if gpu_id_norm and gpu_pci and gpu_pci == gpu_id_norm:
-                target_gpu = gpu
-                break
-            if gpu_card and gpu_card in target_card and target_card[gpu_card] == gpu_id:
-                target_gpu = gpu
-                break
-        if target_gpu is not None:
-            used = target_gpu.get("vram_used_mib", 0) or 0
-            if used > 2048:
-                return True, f"GPU {gpu_id} VRAM {used} MiB > 2 GiB threshold"
-    except Exception as e:
-        logger.debug(f"B3 gate: VRAM threshold check failed: {e}")
-    # Vulkan-tenant check: walk render-node fdinfo to find processes
-    # holding GEM fds on the target GPU. ROCm processes won't show up
-    # here (they use KFD, not GEM fds), but Vulkan/OpenGL/CL processes
-    # will. This catches cases like a multi-GPU Vulkan backend where
-    # the user-space allocation is ~8 GB of Vulkan and invisible to
-    # amdgpu_top's KFD fdinfo path.
-    try:
-        config_v = _load_services_config()
-        gpu_devices_v = config_v.get("gpu_devices", {}) or {}
-        rn_map = _build_render_node_to_gpu_map_cached(gpu_devices_v)
-        if gpu_id in rn_map.values():
-            scan = await asyncio.get_event_loop().run_in_executor(
-                None, _scan_render_node_fdinfo_cached
-            )
-            for pid, rn_data in scan.items():
-                for rn, info in rn_data.items():
-                    if rn_map.get(rn) != gpu_id:
-                        continue
-                    drm_vm_mib = info["drm_vm_bytes"] // (1024 * 1024)
-                    if drm_vm_mib > 512:
-                        name = _read_proc_name(pid) or f"pid={pid}"
-                        return True, (
-                            f"Vulkan tenant {name} (pid={pid}, "
-                            f"{drm_vm_mib} MiB GEM-fd) on GPU {gpu_id}"
-                        )
-    except Exception as e:
-        logger.debug(f"B3 gate: Vulkan tenant check failed: {e}")
-    return False, ""
 
 
 def enqueue_bundle_request(
@@ -8589,112 +5010,18 @@ def enqueue_bundle_request(
     return bundle_future
 
 
-class BundleRequestQueue:
-    """Pending HTTP request queue for a single bundle.
-
-    When a request arrives for a bundle that isn't loaded, the request
-    is held here as a Future.  When the bundle loads successfully all
-    futures are resolved with True; on failure they resolve with False
-    and the caller returns 503.
-
-    Each pending entry carries:
-      - ``future``: asyncio.Future[bool] that the handler awaits
-      - ``enqueued_at``: timestamp for timeout checks
-      - ``request_info``: dict with method/path/remote for logging
-
-    Configurable per-bundle timeout (``bundle_config.get('timeout', 60)``).
-    """
-
-    def __init__(self, bundle_name: str, timeout: float = 60.0):
-        self.bundle_name = bundle_name
-        self.timeout = timeout
-        # List of pending Future[bool] — True=loaded, False=failed
-        self._pending: list[dict] = []
-        self._lock = asyncio.Lock()
-
-    # ── Public API ──────────────────────────────────────────────────
-
-    async def wait_for_load(self, request_info: dict | None = None) -> bool:
-        """Block until the bundle is ready, fails, or times out.
-
-        Returns True when the bundle loaded successfully, False on
-        failure or timeout.  *request_info* is an optional dict
-        (method, path, remote) used for logging.
-        """
-        fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
-        entry = {
-            "future": fut,
-            "enqueued_at": time.time(),
-            "request_info": request_info or {},
-        }
-        async with self._lock:
-            self._pending.append(entry)
-
-        tag = request_info.get("path", "") if request_info else ""
-        logger.info(
-            f"BundleQueue[{self.bundle_name}]: request queued "
-            f"(pending={len(self._pending)}) {tag}"
-        )
-
-        try:
-            result = await asyncio.wait_for(fut, timeout=self.timeout)
-            return result
-        except asyncio.TimeoutError:
-            # Remove ourselves from the pending list
-            async with self._lock:
-                self._pending = [e for e in self._pending if e["future"] is not fut]
-            logger.warning(
-                f"BundleQueue[{self.bundle_name}]: request timed out "
-                f"after {self.timeout}s"
-            )
-            return False
-
-    async def resolve_all(self, success: bool) -> int:
-        """Resolve every pending future and return the count resolved."""
-        async with self._lock:
-            entries = self._pending[:]
-            self._pending.clear()
-
-        for entry in entries:
-            fut = entry["future"]
-            if not fut.done():
-                fut.set_result(success)
-
-        status = "loaded" if success else "failed"
-        logger.info(
-            f"BundleQueue[{self.bundle_name}]: resolved {len(entries)} "
-            f"pending request(s) as {status}"
-        )
-        return len(entries)
-
-    def pending_count(self) -> int:
-        return len(self._pending)
-
-    def to_dict(self) -> dict:
-        return {
-            "bundle_name": self.bundle_name,
-            "timeout": self.timeout,
-            "pending_count": len(self._pending),
-            "pending_requests": [
-                {
-                    "enqueued_at": e["enqueued_at"],
-                    "elapsed": round(time.time() - e["enqueued_at"], 1),
-                    "info": e.get("request_info", {}),
-                }
-                for e in self._pending
-            ],
-        }
+BUNDLE_PROXY_WAIT_TIMEOUT = 300  # seconds a queued request waits for bundle load
+# Canonical queue classes/functions resolve collaborators from facade globals.
+( BundleRequestQueue, _get_bundle_request_queue, PriorityTier, PortProxy,
+  _start_all_port_proxies, _stop_all_port_proxies, _BundleRequestQueue,
+  _get_bundle_queue, _check_bundle_services_healthy, priority_to_tier
+) = _bind_bundle_queue(globals())
 
 
 # Global registry: bundle_name → BundleRequestQueue
 _bundle_request_queues: dict[str, BundleRequestQueue] = {}
 
 
-def _get_bundle_request_queue(bundle_name: str, timeout: float = 60.0) -> BundleRequestQueue:
-    """Get or create the request queue for a bundle."""
-    if bundle_name not in _bundle_request_queues:
-        _bundle_request_queues[bundle_name] = BundleRequestQueue(bundle_name, timeout)
-    return _bundle_request_queues[bundle_name]
 
 
 def _should_evict(
@@ -8727,10 +5054,6 @@ def _should_evict(
 
 # ── Priority Tiers ──────────────────────────────────────────────────
 
-class PriorityTier(Enum):
-    HIGH = 1       # Interactive requests - guaranteed 1 slot
-    MEDIUM = 2     # Normal batch work
-    LOW = 3        # Background/preemptible work
 
 
 PRIORITY_TIER_MAP = {
@@ -8742,100 +5065,14 @@ PRIORITY_TIER_MAP = {
 
 # ── Port Forwarding Proxy ────────────────────────────────────────────
 
-class PortProxy:
-    """TCP port forwarding proxy that bridges external connections to internal services."""
-
-    def __init__(self, name: str, listen_port: int, target_host: str, target_port: int, logger: logging.Logger):
-        self.name = name
-        self.listen_port = listen_port
-        self.target_host = target_host
-        self.target_port = target_port
-        self.logger = logger
-        self._server = None
-
-    async def start(self):
-        """Start the TCP proxy server."""
-        async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-            peername = writer.get_extra_info('peername')
-            self.logger.info(f"PortProxy[{self.name}]: connection from {peername}")
-            backend_writer = None
-            try:
-                backend_reader, backend_writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.target_host, self.target_port),
-                    timeout=10
-                )
-            except Exception as e:
-                self.logger.warning(f"PortProxy[{self.name}]: backend connect failed: {e}")
-                try:
-                    writer.close()
-                except Exception:
-                    pass
-                return
-
-            async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, direction: str):
-                try:
-                    while True:
-                        data = await src.read(65536)
-                        if not data:
-                            break
-                        dst.write(data)
-                        await dst.drain()
-                except Exception as e:
-                    self.logger.debug(f"PortProxy[{self.name}]: pipe {direction} closed: {e}")
-                finally:
-                    try:
-                        if direction == "upload":
-                            backend_writer.close()
-                        else:
-                            writer.close()
-                    except Exception:
-                        pass
-
-            try:
-                await asyncio.gather(
-                    pipe(reader, backend_writer, "upload"),
-                    pipe(backend_reader, writer, "download"),
-                )
-            except Exception:
-                pass
-            self.logger.info(f"PortProxy[{self.name}]: connection closed {peername}")
-
-        self._server = await asyncio.start_server(
-            handle_client, '0.0.0.0', self.listen_port
-        )
-        self.logger.info(f"PortProxy[{self.name}]: listening on 0.0.0.0:{self.listen_port} → {self.target_host}:{self.target_port}")
-
-    async def stop(self):
-        """Stop the TCP proxy server."""
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-            self.logger.info(f"PortProxy[{self.name}]: stopped")
-            self._server = None
-
-    @property
-    def is_running(self) -> bool:
-        return self._server is not None and self._server.is_serving()
 
 
 # Global port proxy registry
 _port_proxies: dict[str, PortProxy] = {}
 
 
-async def _start_all_port_proxies(config: dict):
-    """Port proxies disabled — nginx handles all proxy routing.
-    See nginx-manager.sh and _regenerate_nginx_config()."""
-    pass
 
 
-async def _stop_all_port_proxies():
-    """Stop all running port proxies."""
-    for name in list(_port_proxies.keys()):
-        try:
-            await _port_proxies[name].stop()
-        except Exception as e:
-            logger.error(f"PortProxy[{name}]: stop failed: {e}")
-    _port_proxies.clear()
 
 
 # ── Bundle Proxy (Phase 3) ────────────────────────────────────────
@@ -8845,133 +5082,18 @@ async def _stop_all_port_proxies():
 # services are loaded and healthy) or queues them and triggers a load.
 # Linked bundles are loaded simultaneously.
 
-BUNDLE_PROXY_WAIT_TIMEOUT = 300  # seconds a queued request waits for bundle load
 
 
-class _BundleRequestQueue:
-    """Manages queued HTTP requests for a single bundle.
-
-    When the bundle is not loaded, incoming requests are held here.
-    ``signal_ready()`` unblocks all waiters; ``signal_failed(err)``
-    returns 503 to all queued requests.
-    """
-
-    def __init__(self, bundle_name: str):
-        self.bundle_name = bundle_name
-        self._ready_event = asyncio.Event()
-        self._failed: bool = False
-        self._fail_reason: str = ""
-        self._queued_count: int = 0
-        self._total_queued: int = 0
-        self._total_served: int = 0
-
-    @property
-    def is_ready(self) -> bool:
-        return self._ready_event.is_set() and not self._failed
-
-    @property
-    def is_failed(self) -> bool:
-        return self._failed
-
-    @property
-    def queued_count(self) -> int:
-        return self._queued_count
-
-    def mark_loading(self) -> None:
-        """Reset state for a new load attempt."""
-        self._ready_event.clear()
-        self._failed = False
-        self._fail_reason = ""
-
-    def signal_ready(self) -> None:
-        """Bundle is healthy — unblock all queued requests."""
-        self._failed = False
-        self._ready_event.set()
-
-    def signal_failed(self, reason: str = "bundle load failed") -> None:
-        """Bundle failed to load — queued requests get 503."""
-        self._failed = True
-        self._fail_reason = reason
-        self._ready_event.set()
-
-    async def wait_for_ready(self, timeout: float = BUNDLE_PROXY_WAIT_TIMEOUT) -> bool:
-        """Block until bundle is ready or timeout/failure. Returns True if ready."""
-        self._queued_count += 1
-        self._total_queued += 1
-        try:
-            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
-            return self.is_ready
-        except asyncio.TimeoutError:
-            return False
-        finally:
-            self._queued_count -= 1
-
-    def mark_served(self) -> None:
-        self._total_served += 1
-
-    def to_dict(self) -> dict:
-        return {
-            "bundle_name": self.bundle_name,
-            "ready": self.is_ready,
-            "failed": self._failed,
-            "fail_reason": self._fail_reason,
-            "queued": self._queued_count,
-            "total_queued": self._total_queued,
-            "total_served": self._total_served,
-        }
-
-    def reset(self) -> None:
-        """Reset counters (e.g. after bundle reload)."""
-        self._ready_event.clear()
-        self._failed = False
-        self._fail_reason = ""
-        self._queued_count = 0
-        self._total_queued = 0
-        self._total_served = 0
 
 
 # Global registry: bundle_name -> _BundleRequestQueue
 _bundle_proxy_queues: dict[str, _BundleRequestQueue] = {}
 
 
-def _get_bundle_queue(bundle_name: str) -> _BundleRequestQueue:
-    """Get or create the request queue for a bundle."""
-    if bundle_name not in _bundle_proxy_queues:
-        _bundle_proxy_queues[bundle_name] = _BundleRequestQueue(bundle_name)
-    return _bundle_proxy_queues[bundle_name]
 
 
-def _check_bundle_services_healthy(bundle: dict) -> bool:
-    """Check if ALL services in a bundle are running and port-responding.
-
-    Uses a quick TCP connect to the service port to verify liveness.
-    """
-    services_cfg = _services_config.get("services", {})
-    for svc_name in bundle.get("services", []):
-        svc = services_cfg.get(svc_name, {})
-        port = svc.get("port")
-        if not port:
-            continue
-        try:
-            import socket as _sock
-            with _sock.create_connection(("localhost", int(port)), timeout=2) as s:
-                pass  # port is open
-        except (OSError, TimeoutError):
-            return False
-    return True
 
 
-def priority_to_tier(priority: int) -> PriorityTier:
-    """Map generation priority through the shared named-priority contract."""
-    priority_class = priority_envelope(
-        priority,
-        convention=PriorityConvention.GENERATION_HIGHER_IS_URGENT,
-    ).priority_class.value
-    return {
-        "interactive": PriorityTier.HIGH,
-        "normal": PriorityTier.MEDIUM,
-        "background": PriorityTier.LOW,
-    }[priority_class]
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -9015,197 +5137,7 @@ def extract_model_fingerprint(workflow: dict) -> str:
 
 # ── Job Data ───────────────────────────────────────────────────────
 
-class Job:
-    """A queued ComfyUI workflow submission."""
-    def __init__(self, workflow: dict, callback_url: str | None = None,
-                 priority: int = 0, metadata: dict | None = None):
-        self.id = str(uuid.uuid4())[:8]
-        self.backend = "comfyui"
-        self.workflow = workflow
-        self.model_key = extract_model_key(workflow)
-        self.fingerprint = extract_model_fingerprint(workflow)
-        self.callback_url = callback_url
-        self.priority = priority
-        self.metadata = metadata or {}
-        self.created_at = time.time()
-        self.started_at: float | None = None
-        self.finished_at: float | None = None
-        self.status: str = "queued"  # queued | running | completed | failed | cancelled
-        self.result: dict | None = None
-        self.comfyui_prompt_id: str | None = None
-        self.preempted: bool = False  # flag for preempted-re-queued jobs
-
-    @property
-    def priority_tier(self) -> PriorityTier:
-        return priority_to_tier(self.priority)
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "backend": self.backend,
-            "model_key": self.model_key,
-            "fingerprint": self.fingerprint,
-            "status": self.status,
-            "priority": self.priority,
-            "priority_tier": self.priority_tier.value,
-            "created_at": self.created_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "comfyui_prompt_id": self.comfyui_prompt_id,
-            "metadata": self.metadata,
-            "result": self.result,
-            "preempted": self.preempted,
-        }
-
-
-class AceStepJob:
-    """A queued ACE-Step music generation job."""
-    def __init__(self, payload: dict, callback_url: str | None = None,
-                 priority: int = 0, metadata: dict | None = None,
-                 service_name: str = "acestep", bundle_name: str | None = None,
-                 job_id: str | None = None):
-        service = _resolve_acestep_service(service_name)
-        self.id = job_id or str(uuid.uuid4())[:8]
-        self.backend = "acestep"
-        self.payload = payload
-        self.callback_url = callback_url
-        self.priority = priority
-        self.metadata = metadata or {}
-        self.created_at = time.time()
-        self.started_at: float | None = None
-        self.finished_at: float | None = None
-        self.status: str = "queued"  # queued | running | completed | failed | cancelled
-        self.result: dict | None = None
-        self.acestep_task_id: str | None = None
-        self.preempted: bool = False  # flag for preempted-re-queued jobs
-        self.service_name = service["service_name"]
-        self.endpoint = service["endpoint"]
-        self.audio_dir = service["audio_dir"]
-        self.bundle_name = bundle_name or service.get("bundle_name")
-
-    @property
-    def priority_tier(self) -> PriorityTier:
-        return priority_to_tier(self.priority)
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "backend": self.backend,
-            "status": self.status,
-            "priority": self.priority,
-            "priority_tier": self.priority_tier.value,
-            "created_at": self.created_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "acestep_task_id": self.acestep_task_id,
-            "service_name": self.service_name,
-            "endpoint": self.endpoint,
-            "bundle_name": self.bundle_name,
-            "metadata": self.metadata,
-            "preempted": self.preempted,
-            "result": {k: v for k, v in (self.result or {}).items()
-                       if k != "lyrics"},  # Don't include lyrics in status
-        }
-
-
-# ── Core Services ──────────────────────────────────────────────────
-
-class LLMProxy:
-    """Lightweight proxy with health monitoring and request queueing."""
-
-    def __init__(self):
-        self.active_requests = 0
-        self.queued_requests = 0
-        self.total_requests = 0
-        self.total_served = 0
-        self.total_queued = 0
-        self.total_timeouts = 0
-        # Explicit process-scoped accounting. Legacy total_* fields remain for
-        # compatibility but no longer obscure wait/queue/forward semantics.
-        self.wait_attempts = 0
-        self.wait_timeouts = 0
-        self.durable_queue_admissions = 0
-        self.forward_attempts = 0
-        self.backend_responses = 0
-        self.backend_successes = 0
-        self.backend_failures = 0
-        self._llm_healthy = False
-        self.session: ClientSession | None = None
-        self.logger = logging.getLogger("gpu-manager")
-        self._llm_ready_event = asyncio.Event()
-        self._llm_ready_event.set()
-
-    async def check_health(self) -> bool:
-        target = _configured_llm_health_target()
-        if target is None:
-            self.logger.debug("LLM health check skipped: no configured registry idle service")
-            return False
-        if self.session is None or self.session.closed:
-            self.logger.debug("LLM health check skipped: HTTP session unavailable")
-            return False
-        url, service_name = target
-        try:
-            async with self.session.get(
-                url,
-                timeout=ClientTimeout(total=5, connect=3),
-            ) as resp:
-                ok = resp.status == 200
-                if ok:
-                    body = await resp.json()
-                    ok = body.get("status") == "ok"
-                self.logger.debug(
-                    "LLM health check service=%s status=%s ok=%s",
-                    service_name,
-                    resp.status,
-                    ok,
-                )
-                return ok
-        except Exception as e:
-            self.logger.warning(f"LLM health check failed: {e}")
-            return False
-
-    async def wait_for_llm(self, timeout: float = LLM_WAIT_TIMEOUT) -> bool:
-        if self._llm_healthy:
-            return True
-        try:
-            await asyncio.wait_for(self._llm_ready_event.wait(), timeout=timeout)
-            return self._llm_healthy
-        except asyncio.TimeoutError:
-            return False
-
-    def update_health(self, healthy: bool):
-        prev = self._llm_healthy
-        self._llm_healthy = healthy
-        if healthy and not prev:
-            if self.queued_requests > 0:
-                self.logger.info(f"LLM healthy — waking {self.queued_requests} queued request(s)")
-            self._llm_ready_event.set()
-        elif not healthy and prev:
-            self.logger.info("LLM offline — future requests will queue")
-            self._llm_ready_event.clear()
-
-    def status(self) -> dict:
-        return {
-            "llm_healthy": self._llm_healthy,
-            "active_requests": self.active_requests,
-            "queued_requests": self.queued_requests,
-            "total_requests": self.total_requests,
-            "total_served": self.total_served,
-            "total_queued": self.total_queued,
-            "total_timeouts": self.total_timeouts,
-            "request_metrics": {
-                "scope": "process_memory",
-                "resets_on_restart": True,
-                "requests_received": self.total_requests,
-                "wait_attempts": self.wait_attempts,
-                "wait_timeouts": self.wait_timeouts,
-                "durable_queue_admissions": self.durable_queue_admissions,
-                "forward_attempts": self.forward_attempts,
-                "backend_responses": self.backend_responses,
-                "backend_successes": self.backend_successes,
-                "backend_failures": self.backend_failures,
-            },
-        }
+Job, AceStepJob, LLMProxy = _bind_job_models(globals())
 
 
 # ── Unified GPU Scheduler ──────────────────────────────────────────
@@ -9252,6 +5184,9 @@ class GPUScheduler:
         self._idle_service_last_started: dict[str, float] = {}  # Per-service last-start time (cooldown guard)
         self._idle_recovery_states: dict[str, RecoveryState] = {}  # Shared recovery reducer state
         self._idle_check_event: asyncio.Event = asyncio.Event()  # Signal to trigger immediate idle check
+        self._generation_absence_started_at: float | None = None
+        self._generation_stage_active = False
+        self._generation_terminal_at: float | None = None
 
         # ── Phase 2: Per-GPU priority queue management ──────────────
         self._gpu_queues: dict[str, list] = defaultdict(list)  # gpu_id → list of Job/AceStepJob
@@ -9278,6 +5213,13 @@ class GPUScheduler:
         self.total_preemptions = 0
         self._pinned_service: str | None = None  # Queue override: only this service's backend runs
         self._pinned_service_since: float | None = None  # Phase 5.2.53 Fix B: timestamp when pin was set, for stale-pin auto-clear
+        try:
+            from placement_orchestrator import PlacementOrchestrator
+            self._placement_orchestrator = PlacementOrchestrator(
+                hardware_registry=getattr(self, "_hardware_registry", {})
+            )
+        except Exception:
+            self._placement_orchestrator = None
         # Phase 5.2.66: manual coexistence mode — SRE pause of auto-restoration.
         # When True, _ensure_idle_service skips auto-restore AND crash-recovery so
         # SREs can perform clean maintenance (e.g. swap LLM weights, evict for a
@@ -9332,6 +5274,7 @@ class GPUScheduler:
 
     def _lifecycle_begin(self, transition_type: str, target_service: str, template_key: str, from_state: str = None, to_state: str = None):
         """Start a lifecycle transition. Call before a swap/start/stop/restore."""
+        previous_state = self._lifecycle.get("state", "unknown")
         self._lifecycle["state"] = "transitioning"
         self._lifecycle["type"] = transition_type
         self._lifecycle["target_service"] = target_service
@@ -9344,6 +5287,10 @@ class GPUScheduler:
         # Clone the step template
         import copy
         self._lifecycle["steps"] = copy.deepcopy(TRANSITION_STEPS.get(template_key, []))
+        _record_transition_event(
+            "gpu_lifecycle", target_service, previous_state, "transitioning",
+            transition=transition_type,
+        )
         asyncio.create_task(_broadcast_lifecycle())
 
     def _lifecycle_step_begin(self, step_id: str):
@@ -9382,17 +5329,31 @@ class GPUScheduler:
 
     def _lifecycle_complete(self):
         """Mark transition as complete, return to idle."""
+        previous_state = self._lifecycle.get("state", "unknown")
+        target_service = self._lifecycle.get("target_service") or ""
+        transition_type = self._lifecycle.get("type")
         self._lifecycle["state"] = "idle"
         self._lifecycle["progress_pct"] = 100
         self._lifecycle["message"] = "Complete"
         self._lifecycle["current_step"] = -1
+        _record_transition_event(
+            "gpu_lifecycle", target_service, previous_state, "idle",
+            transition=transition_type,
+        )
         asyncio.create_task(_broadcast_lifecycle())
 
     def _lifecycle_error(self, msg: str):
         """Mark transition as failed."""
+        previous_state = self._lifecycle.get("state", "unknown")
+        target_service = self._lifecycle.get("target_service") or ""
+        transition_type = self._lifecycle.get("type")
         self._lifecycle["state"] = "error"
         self._lifecycle["error"] = msg
         self._lifecycle["message"] = f"Error: {msg}"
+        _record_transition_event(
+            "gpu_lifecycle", target_service, previous_state, "error",
+            transition=transition_type,
+        )
         asyncio.create_task(_broadcast_lifecycle())
 
     def _calc_progress(self, completed_steps: int, sub_progress: float) -> int:
@@ -9468,16 +5429,9 @@ class GPUScheduler:
         from comfyui_workflow_sanitize import sanitize_comfyui_workflow
         workflow = sanitize_comfyui_workflow(workflow, source="submit_comfyui")
 
-        # Auto-start ComfyUI if it was stopped (idle timeout or manual).
-        # Fire-and-forget to avoid blocking the API — the scheduler loop
-        # has _ensure_comfyui_running() as a secondary guard.
-        if vram._comfyui_auto_stopped:
-            self.logger.info("ComfyUI auto-stopped — triggering async restart for new job")
-            vram._comfyui_auto_stopped = False
-            asyncio.create_task(vram._start_comfyui_async())
-        elif vram._comfyui_stopped:
-            self.logger.info("ComfyUI stopped — triggering async restart for new job")
-            asyncio.create_task(vram._start_comfyui_async())
+        # Submission never starts/restarts ComfyUI. Operators use the
+        # authenticated controller start route before dispatching to a cold
+        # backend; this keeps OOM/manual-stop recovery out of the request path.
 
         job = Job(workflow, callback_url, priority, metadata)
         self.comfyui_jobs[job.id] = job
@@ -9535,6 +5489,32 @@ class GPUScheduler:
     def get_job(self, job_id: str) -> Job | AceStepJob | None:
         """Get a job by ID (ComfyUI or ACE-Step)."""
         return self.comfyui_jobs.get(job_id) or self.acestep_jobs.get(job_id)
+
+    # ── Idle holds delegation ──────────────────────────────────────
+
+    def acquire_idle_hold(self, hold_id: str, gpu_id: str, *, ttl_seconds: float = 60.0, reason: str = "scheduler_hold"):
+        if self._placement_orchestrator is None:
+            from placement_orchestrator import PlacementOrchestrator
+            self._placement_orchestrator = PlacementOrchestrator(
+                hardware_registry=getattr(self, "_hardware_registry", {})
+            )
+        return self._placement_orchestrator.acquire_idle_hold(
+            hold_id=hold_id,
+            gpu_id=gpu_id,
+            owner="gpu-scheduler",
+            reason=reason,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def release_idle_hold(self, hold_id: str) -> bool:
+        if self._placement_orchestrator is None:
+            return False
+        return self._placement_orchestrator.release_idle_hold(hold_id)
+
+    def is_idle_held(self, gpu_id: str) -> bool:
+        if self._placement_orchestrator is None:
+            return False
+        return self._placement_orchestrator.is_idle_held(gpu_id)
 
     def get_queue_status(self) -> dict:
         comfyui_queued = [j for j in self._comfyui_queue if j.status == "queued"]
@@ -9968,7 +5948,9 @@ class GPUScheduler:
                         f"GPU[{gpu_id}]: drain-before-swap check: "
                         f"{drain_decision['action']} — {drain_decision['reason']}"
                     )
-                    if drain_decision["action"] == "wait":
+                    # No-interrupt rule: "interrupt" is never a force-evict of a
+                    # running load/job. It is handled exactly like "wait".
+                    if drain_decision["action"] in ("wait", "interrupt"):
                         # Let the current work finish — re-enqueue and wait
                         new_request_data = dict(request_data)
                         new_request_data["retry_count"] = request_data.get("retry_count", 0) + 1
@@ -9982,13 +5964,6 @@ class GPUScheduler:
                             scheduler._idle_check_event.set()
                         gpu.request_finished()
                         return False  # Re-enqueued, will be processed after current load
-                    elif drain_decision["action"] == "interrupt":
-                        self.logger.warning(
-                            f"GPU[{gpu_id}]: interrupting current load for "
-                            f"higher-priority LLM (queue depth: {drain_decision['queue_depth']})"
-                        )
-                        # Force stop whatever is currently loading
-                        await self._force_evict_gpu(gpu_id)
                     # "proceed" — fall through to start the service
 
                 # Start the service (enforce mutex if configured)
@@ -10171,6 +6146,16 @@ class GPUScheduler:
                     )
                     await bundle_coordinator.complete_job(bundle_job_id, success=False)
                 return success
+            except BundleAdmissionDeferred as wait:
+                # shortcut: retries ride the queue loop cadence, capped at 30 like the readiness wait
+                if retry_count >= 30:
+                    self.logger.error(f"GPU[{gpu_id}]: bundle '{bundle_name}' still deferred ({wait}) - giving up")
+                    await bundle_coordinator.complete_job(bundle_job_id, success=False)
+                    return False
+                gpu.enqueue(bundle_name=bundle_name, priority=priority,
+                            request_data={**request_data, "retry_count": retry_count + 1})
+                self.logger.info(f"GPU[{gpu_id}]: bundle '{bundle_name}' waits ({wait}); re-enqueued")
+                return False
             except Exception as e:
                 self.logger.error(
                     f"GPU[{gpu_id}]: bundle load error: {e}", exc_info=True
@@ -10524,10 +6509,16 @@ class GPUScheduler:
                     vram.gpu_state = GpuState.DRAINING
                     drained = await vram.drain_llm(timeout=DRAIN_TIMEOUT)
                     if not drained:
+                        # No-interrupt rule: never evict over in-flight LLM
+                        # requests. The LLM keeps serving, GPU work stays
+                        # queued, and the switch is retried on a later tick.
                         self.logger.warning(
-                            f"Drain timeout ({DRAIN_TIMEOUT}s) — force evicting LLM "
-                            f"({llm.active_requests} still active)"
+                            f"Drain not complete after {DRAIN_TIMEOUT}s "
+                            f"({llm.active_requests} still active) — deferring GPU switch until LLM is idle"
                         )
+                        vram.gpu_state = GpuState.LLM_LOADED
+                        await asyncio.sleep(2)
+                        continue
                     # A bundle-owned ACE job supplies its own physical-GPU
                     # admission transaction in _run_acestep_job.  Do not apply
                     # the legacy RX-only eviction here: a dual-GPU candidate
@@ -10537,7 +6528,18 @@ class GPUScheduler:
                         (job for job in a_pending if job.bundle_name), None
                     )
                     if bundle_owned_acestep is None:
-                        await vram.evict_llm(reason="gpu_work_start")
+                        evicted = await _evict_llm_unless_protected_busy(vram, reason="gpu_work_start")
+                        if not evicted and not _maintenance_mode_enabled(
+                            _load_services_config().get("scheduling", {})
+                        ):
+                            # Eviction refused (e.g. durable leases remain):
+                            # the LLM is still resident, so GPU work must not start.
+                            self.logger.warning(
+                                "LLM eviction refused — deferring GPU switch until it succeeds"
+                            )
+                            vram.gpu_state = GpuState.LLM_LOADED
+                            await asyncio.sleep(2)
+                            continue
                     else:
                         self.logger.info(
                             "GPU work pending for bundle-owned ACE job %s; "
@@ -10707,43 +6709,52 @@ class GPUScheduler:
         self._lifecycle_begin("restore", _get_idle_service_name(), "restore")
 
         try:
-            self._lifecycle_step_begin("restart_comfyui")
-            # Restart ComfyUI to release PyTorch VRAM caches
-            await vram._restart_comfyui_for_restore()
-            self._lifecycle_step_done("restart_comfyui")
+            self._lifecycle_step_begin("unload_comfyui_models")
+            cleanup = await vram._unload_comfyui_models_for_restore()
+            if not cleanup:
+                vram.mark_llm_evicted(True, source="comfyui_free_failed")
+                self._lifecycle_error("ComfyUI /free failed; admission remains closed")
+                return
+            self._lifecycle_step_done("unload_comfyui_models")
 
-            self._lifecycle_step_begin("restart_acestep")
-            # Restart ACE-Step if running to release GPU resources
-            await vram._restart_acestep_for_restore()
-            self._lifecycle_step_done("restart_acestep")
-
-            # Wait for VRAM to actually clear
-            self._lifecycle_step_begin("wait_vram_free")
-            for _ in range(20):  # up to 20s
-                vram_data = await _poll_vram()
-                if vram_data.get("used_vram_mib", 9999) < 500:
+            comfy_cfg = (_load_services_config().get("services", {}) or {}).get("comfyui", {})
+            comfy_gpu_id = (comfy_cfg or {}).get("gpu_id") or "gpu_primary"
+            vram_released = False
+            for _ in range(12):
+                await _poll_vram()
+                snapshot = _verify_oom_via_vram(comfy_gpu_id)
+                if snapshot.get("available") and int(snapshot.get("free_mib", 0)) >= OOM_VRAM_PRESSURE_THRESHOLD_MIB:
+                    vram_released = True
                     break
                 await asyncio.sleep(1)
-            else:
-                self.logger.warning("VRAM: still used after ComfyUI+ACE-Step restart")
-            self._lifecycle_step_done("wait_vram_free")
-
-            # Transition to RESTORING then restore LLM
-            vram.gpu_state = GpuState.RESTORING
-
-            self._lifecycle_step_begin("restore_llm")
-            healthy = await vram.restore_llm(reason="all_gpu_work_done")
-            if not healthy:
-                self._lifecycle_error("LLM not healthy after restore")
-                self.logger.error("Restore: LLM not healthy after restore")
+            if not vram_released:
+                failed_state = _get_gpu_state(comfy_gpu_id)
+                failed_state.state = "restoring"
+                vram.mark_llm_evicted(True, source="comfyui_vram_retained")
+                self._lifecycle_error("ComfyUI retained VRAM after bounded /free; admission remains closed")
+                logger.error("VRAM: ComfyUI /free did not restore configured GPU headroom on %s", comfy_gpu_id)
                 return
-            self._lifecycle_step_done("restore_llm")
+            self._lifecycle_step_begin("restore_configured_idle")
+            restore_results = await asyncio.wait_for(
+                _restore_both_idle_llms(_snapshot_pre_oom_state()),
+                timeout=OOM_RECOVERY_TIMEOUT_S,
+            )
+            if not all(item.get("restored") for item in restore_results.values()):
+                for failed_gpu_id, item in restore_results.items():
+                    if not item.get("restored"):
+                        _get_gpu_state(failed_gpu_id).state = "restoring"
+                vram.mark_llm_evicted(True, source="idle_restore_failed")
+                self._lifecycle_error("configured idle restoration failed; admission remains closed")
+                logger.error("VRAM: configured idle restoration failed: %s", restore_results)
+                return
+            self._lifecycle_step_done("restore_configured_idle")
 
-            # Clear evicted flag and set final state
+            # No GPU idle LLM is assumed: the configured idle map is the
+            # authority, so CPU Gemma P2 is not replaced by an obsolete GPU model.
             vram.mark_llm_evicted(False, source="restore_after_gpu_work")
             vram.gpu_state = GpuState.LLM_LOADED
             self._lifecycle_complete()
-            self.logger.info("Restore complete: LLM loaded and healthy")
+            self.logger.info("Restore complete: configured GPU idle policy is healthy")
 
         except Exception as e:
             self._lifecycle_error(str(e))
@@ -10784,10 +6795,9 @@ class GPUScheduler:
             vram.gpu_state = GpuState.LLM_RELIEF
             self._lifecycle_step_begin("restore_temp")
 
-            # Temporarily set _llm_evicted=False so restore_llm() proceeds
-            # (restore_llm checks _llm_evicted before doing anything)
+            # restore_llm() reloads only while _llm_evicted is True; forcing it
+            # False here (pre 11-13) turned every relief into a no-op.
             was_evicted = vram._llm_evicted
-            vram.mark_llm_evicted(False, source="llm_relief_force")
 
             healthy = await vram.restore_llm(reason="llm_relief")
             if not healthy:
@@ -10803,27 +6813,45 @@ class GPUScheduler:
             start = time.time()
             while llm.queued_requests > 0:
                 if time.time() - start > LLM_RELIEF_DRAIN_TIMEOUT:
-                    self.logger.warning(
-                        f"LLM relief drain timed out after {LLM_RELIEF_DRAIN_TIMEOUT}s "
-                        f"({llm.queued_requests} still queued)"
-                    )
                     break
                 # Sub-progress: report how many are left
                 sub_p = 1.0 - (llm.queued_requests / max(llm.queued_requests, 1))
                 self._lifecycle_step_begin("drain_requests")  # no-op but updates sub_progress
                 await asyncio.sleep(2)
-
-            vram.mark_llm_evicted(True, source="llm_relief_reevict")
             self._lifecycle_step_done("drain_requests")
+
+            # No-interrupt rule: re-evict only when nothing is queued or in
+            # flight. Otherwise the LLM stays resident (requests keep being
+            # served) and GPU work is retried on a later scheduler tick.
+            if llm.queued_requests > 0:
+                self.logger.warning(
+                    f"LLM relief drain timed out after {LLM_RELIEF_DRAIN_TIMEOUT}s "
+                    f"({llm.queued_requests} still queued) — LLM stays resident, deferring GPU switch"
+                )
+                vram.mark_llm_evicted(False, source="llm_relief_deferred")
+                vram.gpu_state = GpuState.LLM_LOADED
+                self._lifecycle_complete()
+                return
 
             # Step 3: Re-evict LLM to free GPU for work to resume
             self._lifecycle_step_begin("evict_again")
             vram.gpu_state = GpuState.DRAINING
-            await vram.drain_llm(timeout=DRAIN_TIMEOUT)
-            success = await vram.evict_llm(reason="relief_complete")
+            drained = await vram.drain_llm(timeout=DRAIN_TIMEOUT)
+            if not drained:
+                self.logger.warning(
+                    f"LLM relief re-drain incomplete ({llm.active_requests} still active) "
+                    "— LLM stays resident, deferring GPU switch"
+                )
+                vram.mark_llm_evicted(False, source="llm_relief_deferred")
+                vram.gpu_state = GpuState.LLM_LOADED
+                self._lifecycle_complete()
+                return
+            vram.mark_llm_evicted(True, source="llm_relief_reevict")
+            success = await _evict_llm_unless_protected_busy(vram, reason="relief_complete")
             if not success:
                 self._lifecycle_error("LLM re-evict failed after relief")
-                vram.gpu_state = GpuState.GPU_WORK
+                vram.mark_llm_evicted(False, source="llm_relief_reevict_failed")
+                vram.gpu_state = GpuState.LLM_LOADED
                 return
             self._lifecycle_step_done("evict_again")
 
@@ -10864,6 +6892,109 @@ class GPUScheduler:
                     self._cached_threshold = 30.0
             self._cached_threshold_at = now
         return self._cached_threshold
+
+    def _gpu_idle_held_fail_closed(self, gpu_id: str) -> bool:
+        """True when an explicit idle hold is active; unknown state counts as held."""
+        try:
+            return bool(self.is_idle_held(gpu_id))
+        except Exception:
+            self.logger.warning(
+                "Auto-evict: idle-hold state unknown for %s; not releasing",
+                gpu_id, exc_info=True,
+            )
+            return True
+
+    def _auto_evict_revalidate(
+        self, gpu_id: str, bundle_name: str, bundles: dict, identity: tuple
+    ) -> str | None:
+        """Return a veto reason if the release must not proceed, else None."""
+        try:
+            state = _get_all_gpu_states().get(gpu_id)
+            if state is None:
+                return "gpu_state_unknown"
+            loaded = str(state.loaded_bundle or "")
+            if loaded.startswith("llm:"):
+                loaded = loaded[len("llm:"):]
+            if loaded != bundle_name:
+                return "bundle_changed"
+            if (
+                float(getattr(state, "bundle_loaded_at", 0.0) or 0.0) != identity[1]
+                or float(getattr(state, "last_activity_at", 0.0) or 0.0)
+                    not in (identity[2], 0.0)
+            ):
+                return "new_activity_or_generation"
+            if state.pending_requests > 0 or state.loading or state.draining:
+                return "work_arrived"
+            if any(j.status in ("queued", "running") for j in self._comfyui_queue):
+                return "queued_work"
+            if any(j.status in ("queued", "running") for j in self._acestep_queue):
+                return "queued_work"
+            if self._current_backend:
+                return "backend_active"
+            if _bundle_worker_in_flight(bundle_name, bundles) > 0:
+                return "worker_in_flight"
+            if _auto_evict_bundle_blockers(bundle_name, bundles=bundles):
+                return "blocked"
+            if self._gpu_idle_held_fail_closed(gpu_id):
+                return "idle_hold"
+        except Exception as exc:
+            return f"revalidation_error:{type(exc).__name__}"
+        return None
+
+    async def _restore_all_idle_baselines(self, released_gpu: str, bundle_name: str) -> dict:
+        """Restore every GPU's configured idle baseline after a release.
+
+        Partial failure is reported explicitly (log + ``_last_idle_restore_report``);
+        the scheduler's idle reducer keeps retrying whatever is still missing.
+        """
+        report: dict = {"released_gpu": released_gpu, "bundle": bundle_name}
+        try:
+            results = await _restore_both_idle_llms()
+        except Exception as exc:
+            results = {}
+            report["error"] = f"{type(exc).__name__}: {exc}"
+        failed = sorted(g for g, r in results.items() if not r.get("restored"))
+        report.update(
+            results=results,
+            failed_gpus=failed,
+            partial=bool(failed or "error" in report),
+        )
+        restored_at = time.time()
+        absence_started_at = getattr(self, "_generation_absence_started_at", None)
+        terminal_at = getattr(self, "_generation_terminal_at", None)
+        if absence_started_at is not None:
+            report["total_generation_absence_seconds"] = max(
+                0.0, restored_at - absence_started_at
+            )
+        if terminal_at is not None:
+            report["post_terminal_restore_seconds"] = max(
+                0.0, restored_at - terminal_at
+            )
+            report["post_terminal_budget_seconds"] = 300.0
+            report["post_terminal_budget_exceeded"] = (
+                report["post_terminal_restore_seconds"] > 300.0
+            )
+            if report["post_terminal_budget_exceeded"]:
+                self.logger.warning(
+                    "Idle baseline restore exceeded five-minute post-terminal budget: %.1fs",
+                    report["post_terminal_restore_seconds"],
+                )
+        self._last_idle_restore_report = report
+        if failed or "error" in report:
+            self.logger.warning(
+                "Auto-evict: idle baseline restore after '%s' partial: failed=%s %s",
+                bundle_name, failed, report.get("error", ""),
+            )
+        else:
+            self.logger.info(
+                "Auto-evict: idle baselines restored on %s after '%s'",
+                sorted(results), bundle_name,
+            )
+        if not failed and "error" not in report:
+            self._generation_absence_started_at = None
+            self._generation_stage_active = False
+            self._generation_terminal_at = None
+        return report
 
     async def _auto_evict_idle_bundles(self) -> None:
         """Unload generation bundles that have been idle beyond the configured threshold.
@@ -10965,6 +7096,38 @@ class GPUScheduler:
             if _bundle_worker_in_flight(bundle_name, bundles) > 0:
                 continue
 
+            # Durable twin of the counter above: a job the tracker still shows
+            # in_flight (e.g. waiting in the readiness gate) pins the bundle
+            # until it is terminal. Unknown tracker state fails closed.
+            try:
+                _tracked = await asyncio.to_thread(
+                    _bundle_tracker_in_flight_jobs, bundle_name, bundles
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Auto-evict: tracker in_flight check failed for '%s' (%s); not releasing",
+                    bundle_name, type(exc).__name__,
+                )
+                continue
+            if _tracked:
+                if getattr(self, "_generation_absence_started_at", None) is None:
+                    self._generation_absence_started_at = float(
+                        getattr(gpu_state, "bundle_loaded_at", 0.0) or now
+                    )
+                self._generation_stage_active = True
+                self._generation_terminal_at = None
+                self.logger.info(
+                    "Auto-evict: skipping '%s' on %s (tracker in_flight jobs: %s)",
+                    bundle_name, gpu_id, ",".join(_tracked[:5]),
+                )
+                continue
+            if getattr(self, "_generation_stage_active", False):
+                _terminal_activity = float(
+                    getattr(gpu_state, "last_activity_at", 0.0) or 0.0
+                )
+                self._generation_terminal_at = _terminal_activity or now
+                self._generation_stage_active = False
+
             # A bundle loaded by startup reconciliation may not have served a
             # request yet, so last_activity_at remains zero forever.  Its
             # completed load time is then the only safe inactivity anchor.
@@ -10972,8 +7135,19 @@ class GPUScheduler:
             last_activity = float(getattr(gpu_state, "last_activity_at", 0.0) or 0.0)
             if last_activity <= 0.0:
                 last_activity = float(getattr(gpu_state, "bundle_loaded_at", 0.0) or 0.0)
-            if last_activity <= 0.0 or (now - last_activity) < threshold:
+            # Per-bundle idle TTL (bounded) overrides the global threshold so a
+            # generation bundle with no work is released after its own hold.
+            bundle_ttl = _bundle_idle_ttl_seconds(bundle, scheduling, threshold)
+            if last_activity <= 0.0 or (now - last_activity) < bundle_ttl:
                 continue
+            # An explicit unexpired placement hold on this GPU wins over the TTL.
+            if self._gpu_idle_held_fail_closed(gpu_id):
+                continue
+            _gen_identity = (
+                bundle_name,
+                float(getattr(gpu_state, "bundle_loaded_at", 0.0) or 0.0),
+                last_activity,
+            )
 
             member_names = bundle.get("services", [])
             # No in-flight jobs on bundle services
@@ -10984,6 +7158,9 @@ class GPUScheduler:
                 )
                 if active_total > 0:
                     continue
+            # Plan 4.7: an evict_only_when_idle bundle is unloaded only while idle.
+            if _bundle_evict_only_when_idle(bundle) and await _bundle_busy(bundle_name, bundles):
+                continue
 
             # No pending jobs in routing groups served by this bundle
             routing_groups = set()
@@ -11084,7 +7261,29 @@ class GPUScheduler:
                 )
                 continue
 
+            _revalidation_veto: list[str] = []
+
             async def _unload_candidate_graph() -> bool:
+                # Re-check under the transition fence, immediately before the
+                # destructive step: new work, a hold, or a different bundle
+                # generation cancels the pending release (fail closed).
+                _veto = self._auto_evict_revalidate(
+                    gpu_id, bundle_name, bundles, _gen_identity
+                )
+                if _veto:
+                    _revalidation_veto.append(_veto)
+                    return False
+                try:
+                    if await asyncio.to_thread(
+                        _bundle_tracker_in_flight_jobs, bundle_name, bundles
+                    ):
+                        _revalidation_veto.append("tracker_in_flight")
+                        return False
+                except Exception as exc:
+                    _revalidation_veto.append(
+                        f"tracker_check_error:{type(exc).__name__}"
+                    )
+                    return False
                 for linked_name in linked:
                     if not await _unload_bundle(linked_name):
                         return False
@@ -11095,11 +7294,23 @@ class GPUScheduler:
                 _unload_candidate_graph,
                 reason=f"auto-evict:{bundle_name}",
             )
+            if _revalidation_veto:
+                gpu_state.last_evict_attempt_at = 0.0
+                self.logger.info(
+                    "Auto-evict: release of '%s' on %s cancelled (%s)",
+                    bundle_name, gpu_id, _revalidation_veto[0],
+                )
+                continue
             if not unloaded:
                 self.logger.warning(
                     f"Auto-evict: failed to unload bundle group rooted at '{bundle_name}'"
                 )
                 continue
+
+            if getattr(self, "_generation_absence_started_at", None) is None:
+                self._generation_absence_started_at = float(
+                    getattr(gpu_state, "bundle_loaded_at", 0.0) or now
+                )
 
             self.logger.info(
                 f"Auto-evict: unloaded idle bundle '{bundle_name}' on {gpu_id} "
@@ -11107,6 +7318,7 @@ class GPUScheduler:
             )
             # Signal the scheduler to restore the idle LLM next tick.
             vram.mark_llm_evicted(True, source="auto_evict_idle_bundles")
+            await self._restore_all_idle_baselines(gpu_id, bundle_name)
 
     # ── Phase 5.2.69: Orphan reaper ─────────────────────────────────
     # Catches the "orphaned ComfyUI python PID 2547085" class of bug:
@@ -11159,10 +7371,11 @@ class GPUScheduler:
             try:
                 config = _load_services_config()
                 services_cfg = config.get("services", {})
-                for svc_name, svc in services_cfg.items():
-                    if not isinstance(svc, dict):
-                        continue
-                    unit = svc.get("systemd_unit")
+                units = [svc.get("systemd_unit") for svc in services_cfg.values() if isinstance(svc, dict)]
+                # foreign residents (Breccia) are never orphans either
+                units += [u for g in (config.get("gpu_devices") or {}).values()
+                          if isinstance(g, dict) for u in g.get("resident_units") or []]
+                for unit in units:
                     if not unit:
                         continue
                     main_pid = await self._get_service_main_pid(unit)
@@ -11191,11 +7404,11 @@ class GPUScheduler:
                     if ts >= cutoff
                 }
 
-            # 2. Gather per-process VRAM attribution via _poll_vram.
+            # 2. Gather per-process VRAM attribution via the shared idle cache.
             #    It already does the KFD fdinfo scan and reports
             #    {pid, name, vram_mib} per process on each GPU.
             try:
-                vram_data = await _poll_vram()
+                vram_data = await _poll_vram_background(ORPHAN_REAPER_INTERVAL_S)
             except Exception as e:
                 self.logger.debug(f"[orphan-reaper] _poll_vram failed: {e}")
                 return
@@ -11560,6 +7773,14 @@ class GPUScheduler:
                     )
                     continue
 
+            # Check idle hold: active idle hold prevents auto-restoring idle LLM
+            _placement_orch = getattr(self, "_placement_orchestrator", None)
+            if _placement_orch is not None and gpu_id and _placement_orch.is_idle_held(gpu_id):
+                self.logger.debug(
+                    f"Idle: skipping GPU {gpu_id} idle check — held by active idle hold"
+                )
+                continue
+
             # BUGFIX: If a bundle is currently being loaded on this GPU, don't
             # re-load the idle LLM — the watchdog would race the load and
             # cause OOM. The loading state is set by _load_bundle.
@@ -11593,6 +7814,15 @@ class GPUScheduler:
                 self.logger.debug(
                     f"Idle: skipping auto-restore on GPU {gpu_id} — "
                     + ",".join(_idle_restore_blockers)
+                )
+                continue
+
+            # Plan 4.7: an evict_only_when_idle bundle (strata-rx) owns this
+            # GPU until its idle TTL expires; idle restore never replaces it.
+            if gpu_id and _protected_bundles_on_gpu(gpu_id, _resolve_bundles()):
+                self.logger.debug(
+                    f"Idle: skipping auto-restore on GPU {gpu_id} — "
+                    "evict_only_when_idle bundle loaded"
                 )
                 continue
 
@@ -11864,8 +8094,8 @@ class GPUScheduler:
                     if not load_ok:
                         healthy = False
                     else:
-                        healthy = await vram._wait_for_llm_healthy(
-                            timeout=LLM_RESTORE_TIMEOUT
+                        healthy = await _wait_for_idle_service_healthy(
+                            gpu_id, timeout=LLM_RESTORE_TIMEOUT
                         )
                     self._lifecycle_step_done("wait_healthy")
                     return healthy
@@ -11956,8 +8186,8 @@ class GPUScheduler:
                         if not load_ok:
                             healthy = False
                         else:
-                            healthy = await vram._wait_for_llm_healthy(
-                                timeout=LLM_RESTORE_TIMEOUT
+                            healthy = await _wait_for_idle_service_healthy(
+                                gpu_id, timeout=LLM_RESTORE_TIMEOUT
                             )
                         self._lifecycle_step_done("wait_healthy")
                         return healthy
@@ -12028,9 +8258,9 @@ class GPUScheduler:
         if not pending:
             return
 
-        # Ensure ComfyUI is running (may have been auto-stopped during idle)
+        # A stopped ComfyUI defers the batch until an explicit controller
+        # start; the VRAM helper owns the rate-limited notice.
         if not await vram._ensure_comfyui_running():
-            self.logger.error("ComfyUI failed to start — cannot run batch")
             return
 
         # Group by fingerprint
@@ -12385,9 +8615,14 @@ class GPUScheduler:
 
         self._current_backend = job.service_name
         if job.bundle_name:
-            admitted = await _evict_then_load_bundle(
-                job.bundle_name, reason="acestep_job"
-            )
+            try:
+                admitted = await _evict_then_load_bundle(
+                    job.bundle_name, reason="acestep_job"
+                )
+            except BundleAdmissionDeferred as wait:
+                self.logger.info(f"ACE-Step job {job.id}: waits for {job.bundle_name} ({wait})")
+                self._current_backend = None
+                return  # stays queued; the scheduler loop retries after its 1 s sleep
             if not admitted:
                 job.status = "failed"
                 job.result = {"error": f"ACE-Step bundle admission failed: {job.bundle_name}"}
@@ -12810,1398 +9045,9 @@ class GPUScheduler:
 
 # ── VRAM Lifecycle Manager ──────────────────────────────────────────
 
-class VRAMLifecycleManager:
-    """Manages the GPU state machine and default LLM tenant lifecycle.
-
-    GPU state machine:
-      LLM_LOADED → DRAINING → GPU_WORK → RESTORING → LLM_LOADED
-      GPU_WORK → LLM_RELIEF → DRAINING → GPU_WORK
-
-    Qwen3.6 is the default GPU tenant. ComfyUI and ACE-Step evict it
-    when they need the GPU, and it's restored when they're done.
-    """
-
-    def __init__(self, session: ClientSession, logger: logging.Logger):
-        self.session = session
-        self.logger = logger
-        self.gpu_state = GpuState.LLM_LOADED
-        self._llm_evicted = False
-        # C3 BUGFIX: per-GPU eviction flag — eviction is per-GPU,
-        # not global. A second call to evict a different GPU must
-        # not short-circuit because GPU A was already evicted.
-        self._gpu_evicted: dict[str, bool] = {}
-        self._comfyui_stopped = False
-        # ComfyUI idle auto-stop (VRAM conservation)
-        self._comfyui_idle_since: float | None = None
-        self._comfyui_auto_stopped: bool = False
-        self._evict_lock = asyncio.Lock()
-
-    def mark_llm_evicted(self, value: bool, source: str = "unknown") -> None:
-        """Single-source setter for self._llm_evicted.
-
-        No-op when value is unchanged (avoids spurious event noise).
-        """
-        value = bool(value)
-        if value == self._llm_evicted:
-            return
-        old = self._llm_evicted
-        self._llm_evicted = value
-        if self.logger:
-            self.logger.info(
-                f"VRAM: _llm_evicted {old} -> {self._llm_evicted} (source={source})"
-            )
-
-    def status(self) -> dict:
-        runtime = _get_loaded_runtime_snapshot()
-        configured_idle_service = _get_idle_service_name()
-        return {
-            "gpu_state": self.gpu_state.value,
-            "llm_evicted": self._llm_evicted,
-            # Legacy alias: this is the configured/default idle service unit,
-            # not proof that the unit is currently loaded.
-            "llm_service": configured_idle_service,
-            "configured_idle_service": configured_idle_service,
-            "loaded_runtime_services": runtime["services"],
-            "loaded_runtime_bundles": runtime["bundles"],
-            "llm_service_semantics": "configured_idle_service_legacy_alias",
-            "comfyui_stopped": self._comfyui_stopped,
-            "comfyui_auto_stopped": self._comfyui_auto_stopped,
-            "comfyui_idle_seconds": (
-                time.time() - self._comfyui_idle_since
-                if self._comfyui_idle_since else 0
-            ),
-        }
-
-    # ── Drain before evict ─────────────────────────────────────────
-
-    async def drain_llm(self, timeout: float = DRAIN_TIMEOUT) -> bool:
-        """Wait for active LLM requests to finish before evicting.
-
-        Returns True if all requests drained, False if timeout.
-        New LLM requests are already queued (not forwarded) because
-        the proxy checks _llm_healthy which is set to False during drain.
-        """
-        if llm.active_requests == 0:
-            self.logger.info("Drain: no active LLM requests — immediate")
-            # Mark unhealthy so new requests queue instead of forwarding
-            llm.update_health(False)
-            return True
-
-        self.logger.info(
-            f"Drain: waiting for {llm.active_requests} active LLM request(s) "
-            f"(timeout={timeout}s)"
-        )
-        # Mark unhealthy so new requests queue instead of forwarding
-        llm.update_health(False)
-
-        start = time.time()
-        while time.time() - start < timeout:
-            if llm.active_requests == 0:
-                self.logger.info(
-                    f"Drain: all requests finished in {time.time() - start:.1f}s"
-                )
-                return True
-            self.logger.debug(f"Drain: {llm.active_requests} still active")
-            await asyncio.sleep(2)
-
-        self.logger.warning(
-            f"Drain: timeout after {timeout}s — {llm.active_requests} still active"
-        )
-        return False
-
-    # ── LLM evict/restore ──────────────────────────────────────────
-
-    async def evict_llm(self, reason: str = "gpu_work_start", target_gpu: str = None,
-                        skip_bundle_name: str | None = None,
-                        admission_authorized: bool = False) -> bool:
-        """Stop ALL GPU-using LLM services to free VRAM.
-
-        BUGFIX (2026-05-20):
-        1. Previously only stopped the idle_service (gemma, CPU-only).
-           Now stops ALL services with HIP_VISIBLE_DEVICES=0 to free VRAM.
-        2. systemctl stop sometimes leaves orphan processes (PyTorch cache).
-           Force-kill by port if systemctl doesn't free the port.
-        3. Restart acestep-api after eviction to clear PyTorch VRAM cache.
-
-        MAINTENANCE MODE: Skips eviction entirely — LLM stays loaded.
-        """
-        if bundle_lifecycle_controller is None:
-            # A direct or queue-owned eviction must never fall through to the
-            # legacy systemd implementation when the lifecycle owner is gone.
-            # Queue admission still passes the explicit authorization flag,
-            # but controller availability remains a hard prerequisite here.
-            self.logger.error(
-                "VRAM: refusing LLM eviction without lifecycle controller (%s)",
-                reason,
-            )
-            return False
-        if not admission_authorized:
-            return await _run_standalone_llm_eviction(
-                self,
-                reason=reason,
-                target_gpu=target_gpu,
-                skip_bundle_name=skip_bundle_name,
-            )
-        config = _load_services_config()
-        if _maintenance_mode_enabled(config.get("scheduling", {})):
-            self.logger.info(f"VRAM: Maintenance mode — skipping LLM eviction ({reason})")
-            return False
-
-        # ── Phase 2: Per-GPU priority-based eviction ─────────────────
-        # If target_gpu is specified, check if the GPU's current tenant
-        # has pending work or is higher priority than idle.
-        if target_gpu and target_gpu in scheduler._gpu_state:
-            gpu_st = scheduler._gpu_state[target_gpu]
-            idle_bundle = _get_idle_bundle(target_gpu)
-            idle_priority = idle_bundle.get("priority", 0) if idle_bundle else 0
-
-            # If the GPU is already draining, wait for it to finish
-            if gpu_st.get("draining"):
-                self.logger.info(
-                    f"VRAM: GPU {target_gpu} already draining — waiting for drain to complete"
-                )
-                gpu_bundle_state = _get_gpu_state(target_gpu)
-                await gpu_bundle_state.wait_drain(timeout=DRAIN_TIMEOUT)
-                gpu_st["draining"] = False
-
-            # Direct callers preserve the conservative priority fence.  The
-            # linked-bundle admission transaction has already fenced every
-            # target GPU, drained the relevant logical group, and selected a
-            # real durable head job; it must not re-interpret an idle/static
-            # priority as permanent residency.
-            if not admission_authorized and gpu_st.get("current_priority", 0) > idle_priority:
-                pending = scheduler._get_pending_for_gpu(target_gpu)
-                higher = [j for j in pending if j.priority > gpu_st["current_priority"]]
-                if not higher:
-                    # Current work is higher priority — don't evict, just return
-                    self.logger.info(
-                        f"VRAM: GPU {target_gpu} has higher-priority bundle "
-                        f"(priority={gpu_st['current_priority']}) — not evicting"
-                    )
-                    return False
-
-        async with self._evict_lock:
-            # C3 BUGFIX: resolve work_gpu BEFORE the early-return so we can
-            # check the per-GPU eviction flag, not the global one. (Eviction
-            # is per-GPU: evicting GPU A must not block eviction of GPU B.)
-            work_gpu = (
-                target_gpu
-                or (getattr(self, "_evicted_gpu_id", None) or None)
-            )
-            # BUGFIX: _current_backend lives on GPUScheduler, not on
-            # VRAMLifecycleManager. Use getattr() to be defensive.
-            if not work_gpu and getattr(self, '_current_backend', None):
-                # Try to infer from the active backend's service config.
-                _cfg = _load_services_config()
-                _svc_map = _cfg.get("services", {})
-                _cur = self._current_backend
-                _prefix = _cur.split("-")[0] if "-" in _cur else _cur
-                for _sk, _sc in _svc_map.items():
-                    if (
-                        _sc.get("type") == "generation_backend"
-                        and _sc.get("systemd_unit", "").startswith(_prefix)
-                    ):
-                        work_gpu = _sc.get("gpu_id")
-                        break
-            if not work_gpu:
-                # Fallback: assume work is on the primary GPU (gpu_primary)
-                work_gpu = "gpu_primary"
-
-            if self._gpu_evicted.get(work_gpu):
-                # Phase 5.2.50: stale-flag fix. Verify against actual VRAM
-                # before short-circuiting. The flag can be set during a prior
-                # crash-detection cycle that didn't actually free VRAM.
-                # If GPU is still occupied, clear the stale flag and proceed
-                # with real eviction.
-                try:
-                    vram_data = await _poll_vram()
-                    matched = _get_vram_entry_for_gpu(vram_data, work_gpu)
-                    if matched and matched.get("vram_used_mib", 0) > 2048:
-                        self.logger.warning(
-                            f"VRAM: stale _gpu_evicted[{work_gpu}]=True "
-                            f"but {work_gpu} still using "
-                            f"{matched.get('vram_used_mib')} MiB — "
-                            f"clearing flag and proceeding with eviction"
-                        )
-                        self._gpu_evicted[work_gpu] = False
-                except Exception as e:
-                    self.logger.debug(f"evict_llm stale-flag check failed: {e}")
-
-                if self._gpu_evicted.get(work_gpu):
-                    self.logger.info(
-                        f"VRAM: LLM already evicted on GPU {work_gpu} ({reason})"
-                    )
-                    return True
-
-            self.logger.info(f"VRAM: Evicting GPU LLM services on {work_gpu or 'unknown'} ({reason})")
-            self._evicted_gpu_id = work_gpu  # Track for targeted restore
-
-            # BUGFIX (2026-05-20b): Dynamic service discovery.
-            # Previous code hardcoded specific service names
-            # and missed gemma-e4b-pi (port 8101, 7.3 GB VRAM!) → OOM.
-            # Now we stop ALL services with priority < 10 (LLMs/assistants).
-            config = _load_services_config()
-            svc_map = config.get("services", {})
-            gpu_services = []  # (unit_name, port, svc_key)
-            for svc_key, svc_cfg in svc_map.items():
-                if not svc_cfg.get("enabled", True):
-                    continue
-                if svc_cfg.get("priority", 99) >= 10:
-                    continue  # Skip GPU work backends (ComfyUI=10, ACE-Step=20)
-                if svc_key == "gpu-manager":
-                    continue  # NEVER stop ourselves!
-                if svc_cfg.get("cpu_only"):
-                    continue  # Skip CPU-only services (gemma-vision)
-                # MULTI-GPU FIX: Only stop services on the same GPU as the work
-                svc_gpu = svc_cfg.get("gpu_id", "gpu_primary")  # Default to primary GPU
-                if svc_gpu and work_gpu and svc_gpu != work_gpu:
-                    self.logger.info(f"VRAM: Skipping {svc_key} (on {svc_gpu}, work on {work_gpu})")
-                    continue
-                unit = svc_cfg.get("systemd_unit", f"{svc_key}.service")
-                port = svc_cfg.get("port", 0)
-                gpu_services.append((unit, port, svc_key))
-
-            # Phase 3: Use _unload_bundle to stop bundles on the target GPU
-            bundles = _resolve_bundles()
-            gpu_bundles = [
-                (name, b) for name, b in bundles.items()
-                if b.get("gpu_id") == work_gpu
-            ]
-            # Phase 5.1.6: skip the bundle we're about to (re)load.
-            # Without this, _evict_then_load_bundle races itself:
-            # unload stops the service, then _load_bundle starts it,
-            # and the start can be killed by a queued stop from the
-            # unload path. The bundle load then times out waiting for
-            # a port that keeps getting killed.
-            if skip_bundle_name is not None:
-                before = len(gpu_bundles)
-                gpu_bundles = [
-                    (n, b) for n, b in gpu_bundles if n != skip_bundle_name
-                ]
-                if before != len(gpu_bundles):
-                    self.logger.info(
-                        f"VRAM: skip_bundle_name={skip_bundle_name!r} "
-                        f"({before} -> {len(gpu_bundles)} bundles to unload)"
-                    )
-            if gpu_bundles:
-                self.logger.info(
-                    f"VRAM: Unloading {len(gpu_bundles)} bundle(s) on GPU {work_gpu}: "
-                    f"{[n for n, _ in gpu_bundles]}"
-                )
-                for bundle_name, _bundle in gpu_bundles:
-                    await _unload_bundle(bundle_name)
-            else:
-                # Fallback: no bundles defined — stop services directly
-                self.logger.info(
-                    f"VRAM: No bundles for GPU {work_gpu}, "
-                    f"stopping {len(gpu_services)} service(s) directly"
-                )
-                for unit, port, svc_key in gpu_services:
-                    try:
-                        if not await _drain_combined_gemma_member_before_stop(svc_key):
-                            return False
-                        # Phase 5.1.5: this stop is intentional (we are
-                        # evicting the LLM to free VRAM). Stamp it so the
-                        # Supervisor doesn't tear down an unrelated pool
-                        # whose service briefly looked unhealthy during
-                        # the cascade.
-                        if event_bus is not None:
-                            event_bus.mark_planned_stop(svc_key)
-                        result = await asyncio.create_subprocess_exec(
-                            "sudo", "systemctl", "stop", unit,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await result.wait()
-                        self.logger.info(f"VRAM: systemctl stop {unit}")
-                    except Exception as e:
-                        self.logger.warning(f"VRAM: Failed to stop {unit}: {e}")
-                    finally:
-                        # Phase 5.2.6: caller-side clear. Once the
-                        # stop returns (success or failure), release
-                        # the supervisor's deferral so a real crash
-                        # is not silently swallowed.
-                        if event_bus is not None:
-                            event_bus.clear_planned_stop(svc_key)
-
-            # Wait for ports to free, force-kill if needed
-            # (Still needed for services not managed by bundles, or stubborn processes)
-            for unit, port_num, svc_name in gpu_services:
-                if not port_num:
-                    continue
-                freed = await self._wait_for_port_free(timeout=15, port=port_num)
-                if freed:
-                    self.logger.info(f"VRAM: {svc_name} port {port_num} freed")
-                else:
-                    # BUGFIX (2026-05-20c): Must use sudo to kill system service processes.
-                    # gpu-manager runs as operator, service processes run as root.
-                    # Sequence: stop → kill → stop (to block Restart=on-failure) → reset-failed.
-                    # Without the second stop, Restart=on-failure (default 100ms) would restart
-                    # the service before we can reset-failed.
-                    self.logger.warning(f"VRAM: Force-killing {svc_name} (unit={unit}, port {port_num})")
-                    try:
-                        # Step 1: SIGKILL the process through systemd
-                        kill_result = await asyncio.create_subprocess_exec(
-                            "sudo", "systemctl", "kill", unit,
-                            "--signal=SIGKILL",
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await kill_result.wait()
-                        # Step 2: Immediately issue 'stop' to block Restart=on-failure trigger.
-                        # systemd won't restart a stopped service even if Restart= is set.
-                        stop_result = await asyncio.create_subprocess_exec(
-                            "sudo", "systemctl", "stop", unit,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await stop_result.wait()
-                        await asyncio.sleep(1)
-                        # Step 3: Clear the failed state so future starts work cleanly
-                        reset_result = await asyncio.create_subprocess_exec(
-                            "sudo", "systemctl", "reset-failed", unit,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await reset_result.wait()
-                        self.logger.info(f"VRAM: {svc_name} killed and blocked from restart")
-                    except Exception:
-                        pass
-
-            # BUGFIX (2026-05-20c): Wait for VRAM to actually free before starting ACE-Step.
-            # Even after fuser -k, the GPU driver takes a few seconds to reclaim VRAM.
-            # ACE-Step needs ~10 GB, so we need VRAM used to drop below ~4 GB.
-            self.logger.info("VRAM: Waiting for GPU VRAM to free after service stops...")
-            vram_freed = await self._wait_for_vram_below(
-                target_mib=4096, timeout=30, gpu_id=work_gpu
-            )
-            if not vram_freed:
-                self.logger.warning("VRAM: GPU VRAM did not free within timeout — proceeding anyway")
-
-            # Cache ownership belongs to the drained runtime. Never start a
-            # retired ACE engine as a side effect of switching other services.
-
-            self.mark_llm_evicted(True, source="evict_llm")
-            # C3 BUGFIX: also mark this GPU as evicted per-GPU so the
-            # early-return check in evict_llm knows about it, and so a
-            # future call for a DIFFERENT GPU isn't short-circuited.
-            if work_gpu:
-                self._gpu_evicted[work_gpu] = True
-            llm.update_health(False)
-            # Phase 2/Phase 0: Update per-GPU state after eviction.
-            # GpuBundleState is the single source of truth — setters sync to
-            # the legacy scheduler._gpu_state dict automatically.
-            if work_gpu:
-                bundle_state = _get_gpu_state(work_gpu)
-                bundle_state.loaded_bundle = None
-                bundle_state.bundle_priority = 0
-                bundle_state.set_evicting(True, source="evict_llm")
-                bundle_state.set_draining(False, source="evict_llm")
-                bundle_state.set_loaded_bundles([], source="evict_llm")
-                bundle_state.set_current_priority(0, source="evict_llm")
-            self.logger.info(f"VRAM: LLM evicted ({reason}) — GPU {work_gpu} cleared")
-            return True
-
-
-    async def restore_llm(self, reason: str = "gpu_work_done") -> bool:
-        """Restart ALL GPU LLM services after GPU work completes."""
-        async with _RestoreAdmissionGuard(self):
-            if not self._llm_evicted:
-                self.logger.info(f"VRAM: LLM not evicted, skip restore ({reason})")
-                return True
-
-            self.logger.info(f"VRAM: Restoring all GPU LLM services ({reason})")
-
-            # This call is made by the scheduler-owned restoration
-            # transaction. Its own guard must not deadlock the nested VRAM
-            # restore, while all real generation/admission blockers remain
-            # authoritative.
-            release_blockers = _generation_release_blockers(
-                ignore_scheduler_restoring=True
-            )
-            if release_blockers:
-                self.logger.info(
-                    "VRAM: restore deferred until generation release: %s",
-                    ",".join(release_blockers),
-                )
-                return False
-
-            # The generic release fence above established that no generation
-            # owner remains. Do not wait on a hard-coded backend port here:
-            # an unrelated stopped service would otherwise add a full timeout
-            # to every idle restore.
-            await asyncio.sleep(2)
-
-            # MULTI-GPU FIX: restore every configured per-GPU idle bundle,
-            # not only the most recently evicted GPU.  Dual-GPU generation
-            # paths (Krea2 = comfyui on gpu_primary + encoder reservation on
-            # gpu_secondary) call evict_llm once per target GPU; _evicted_gpu_id is a
-            # scalar and can only remember one of them.  Restoring only that
-            # GPU left the other idle service to crash-recovery, producing a
-            # long unhealthy window and stale scheduler state.  The user's
-            # intended post-generation state is the combined Gemma endpoint,
-            # so bring all configured idle GPU services back atomically here.
-            config = _load_services_config()
-            svc_map = config.get("services", {})
-            restored_gpus: set[str] = set()
-            restored_names: list[str] = []
-            restored_member_names: list[str] = []
-            healthy = True
-
-            idle_entries = _get_all_idle_services()
-            if idle_entries:
-                for idle_entry in idle_entries:
-                    idle_gpu = idle_entry.get("gpu_id")
-                    idle_svc_name = idle_entry.get("service_name")
-                    idle_bundle = _get_idle_bundle(idle_gpu) if idle_gpu else None
-                    if idle_bundle:
-                        idle_name = idle_bundle.get("bundle_name", idle_svc_name or "idle")
-                        self.logger.info(
-                            f"VRAM: Restoring idle bundle '{idle_name}' on GPU {idle_gpu}"
-                        )
-                        load_ok = await _run_bundle_transition(
-                            idle_name,
-                            lambda: _load_bundle(
-                                idle_name, timeout=LLM_RESTORE_TIMEOUT
-                            ),
-                            desired_state=BundleDesiredState.RUNNING,
-                            reason=f"restore-llm:{reason}",
-                        )
-                        if load_ok:
-                            self.logger.info(
-                                f"VRAM: Idle bundle '{idle_name}' restored and healthy"
-                            )
-                            if idle_gpu:
-                                restored_gpus.add(idle_gpu)
-                            restored_names.append(idle_name)
-                            if idle_svc_name:
-                                restored_member_names.append(idle_svc_name)
-                                if not await _rejoin_combined_gemma_member_after_start(
-                                    idle_svc_name, timeout=LLM_RESTORE_TIMEOUT
-                                ):
-                                    healthy = False
-                        else:
-                            healthy = False
-                            self.logger.warning(
-                                f"VRAM: Idle bundle '{idle_name}' not healthy "
-                                f"after {LLM_RESTORE_TIMEOUT}s"
-                            )
-                    else:
-                        # Fallback: no idle bundle declared for this entry;
-                        # start its unit directly and probe its configured port.
-                        unit = idle_entry.get("systemd_unit") or ""
-                        port = idle_entry.get("port") or 0
-                        if not unit:
-                            healthy = False
-                            self.logger.warning(
-                                f"VRAM: No idle bundle/unit for GPU {idle_gpu} "
-                                f"service {idle_svc_name}"
-                            )
-                            continue
-                        try:
-                            result = await asyncio.create_subprocess_exec(
-                                "systemctl", "start", unit,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                            )
-                            await result.wait()
-                            self.logger.info(f"VRAM: Started {unit}")
-                            probe_ok = await _probe_health_inline(
-                                port, health_path=(svc_map.get(idle_svc_name, {}) or {}).get("health_path") or "/health",
-                                timeout=2.0,
-                            )
-                            if probe_ok:
-                                if idle_gpu:
-                                    restored_gpus.add(idle_gpu)
-                                restored_names.append(idle_svc_name or unit)
-                                if idle_svc_name:
-                                    restored_member_names.append(idle_svc_name)
-                                    if not await _rejoin_combined_gemma_member_after_start(
-                                        idle_svc_name, timeout=LLM_RESTORE_TIMEOUT
-                                    ):
-                                        healthy = False
-                            else:
-                                healthy = False
-                        except Exception as e:
-                            healthy = False
-                            self.logger.warning(f"VRAM: Failed to start {unit}: {e}")
-            else:
-                # Last-resort legacy fallback if scheduling.idle_services is
-                # missing: preserve the previous dynamic service discovery.
-                gpu_services = []
-                for svc_key, svc_cfg in svc_map.items():
-                    if not svc_cfg.get("enabled", True):
-                        continue
-                    if svc_cfg.get("priority", 99) >= 10:
-                        continue
-                    if svc_key == "gpu-manager" or svc_cfg.get("cpu_only"):
-                        continue
-                    unit = svc_cfg.get("systemd_unit", f"{svc_key}.service")
-                    port = svc_cfg.get("port", 0)
-                    gpu_services.append((unit, port, svc_key))
-                self.logger.info(
-                    f"VRAM: No idle_services map, starting {len(gpu_services)} legacy service(s) directly"
-                )
-                for svc, svc_port, svc_key in gpu_services:
-                    if _combined_gemma_broker_owns_service(
-                        svc_key, svc_map.get(svc_key, {}) or {}
-                    ):
-                        restored_member_names.append(svc_key)
-                    try:
-                        result = await asyncio.create_subprocess_exec(
-                            "systemctl", "start", svc,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await result.wait()
-                        self.logger.info(f"VRAM: Started {svc}")
-                    except Exception as e:
-                        healthy = False
-                        self.logger.warning(f"VRAM: Failed to start {svc}: {e}")
-                healthy = healthy and await self._wait_for_llm_healthy(timeout=LLM_RESTORE_TIMEOUT)
-                if healthy:
-                    for member_name in restored_member_names:
-                        if not await _rejoin_combined_gemma_member_after_start(
-                            member_name, timeout=LLM_RESTORE_TIMEOUT
-                        ):
-                            healthy = False
-
-            self.mark_llm_evicted(False, source="restore_llm")
-            # Clear every per-GPU eviction flag we restored.  Older code only
-            # cleared the scalar _evicted_gpu_id, which left the other GPU in a
-            # dual-GPU generation path looking evicted/stale until a later
-            # watchdog pass.
-            for restored_gpu in restored_gpus:
-                self._gpu_evicted.pop(restored_gpu, None)
-
-            # Phase 2/Phase 0: Update per-GPU state after restore. _load_bundle
-            # already stamps most of this, but doing it explicitly here keeps
-            # vram.restore_llm() as a complete state transition and repairs
-            # stale state from reservation-only bundles like krea2-encoder.
-            for restored_gpu in restored_gpus:
-                idle_bundle = _get_idle_bundle(restored_gpu)
-                idle_name = idle_bundle.get("bundle_name", "idle") if idle_bundle else "idle"
-                idle_priority = idle_bundle.get("priority", 1) if idle_bundle else 1
-                bundle_state = _get_gpu_state(restored_gpu)
-                bundle_state.loaded_bundle = idle_name
-                bundle_state.bundle_priority = idle_priority
-                bundle_state.state = "loaded"
-                bundle_state.set_evicting(False, source="restore_llm")
-                bundle_state.set_draining(False, source="restore_llm")
-                bundle_state.set_loaded_bundles([idle_name], source="restore_llm")
-                bundle_state.set_current_priority(idle_priority, source="restore_llm")
-                self.logger.info(
-                    f"VRAM: GPU {restored_gpu} restored with idle bundle "
-                    f"'{idle_name}' (priority={idle_priority})"
-                )
-            self.logger.info(
-                f"VRAM: Restored idle bundle set: {restored_names}"
-            )
-            return healthy
-
-    async def _comfyui_systemd_state(self) -> dict:
-        """Return the authoritative systemd state per ComfyUI systemd unit.
-
-        Slice B: previously this returned a single string naming only the
-        generic ``comfyui.service``. That allowed the scheduler to
-        conclude "ComfyUI is stopped" while ``comfyui-qwen.service``
-        was still active — the Krea/Qwen serialization bug. The helper
-        now reports BOTH the Krea and Qwen units so reconciliation and
-        the running-state commit can distinguish "both off" from
-        "qwen active, krea inactive".
-
-        Returns a dict like::
-
-            {
-                "comfyui.service": "inactive" | "active" | ...,
-                "comfyui-qwen.service": "inactive" | "active" | ...,
-            }
-        """
-        config = _load_services_config() or {}
-        services = config.get("services") or {}
-        krea_unit = str(
-            (services.get("comfyui") or {}).get("systemd_unit")
-            or "comfyui.service"
-        )
-        qwen_unit = str(
-            (services.get("comfyui-qwen") or {}).get("systemd_unit")
-            or "comfyui-qwen.service"
-        )
-        units = tuple(dict.fromkeys((krea_unit, qwen_unit)))
-        states: dict[str, str] = {}
-        for unit in units:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "systemctl", "is-active", unit,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                state = stdout.decode(errors="replace").strip().lower()
-                states[unit] = state or "unknown"
-            except Exception as exc:
-                self.logger.warning(
-                    f"VRAM: unable to read ComfyUI systemd state for {unit}: {exc}"
-                )
-                states[unit] = "unknown"
-        # Keep canonical legacy keys as read-only aliases for older status
-        # consumers; lifecycle authority remains the resolved registry unit.
-        states.setdefault("comfyui.service", states.get(krea_unit, "unknown"))
-        states.setdefault("comfyui-qwen.service", states.get(qwen_unit, "unknown"))
-        return states
-
-    @staticmethod
-    def _checked_comfyui_runtime_configured() -> bool:
-        """Return whether ComfyUI is bound to a checked host runtime."""
-        config = _load_services_config() or {}
-        bundles = config.get("bundles") or {}
-        for name in ("comfyui", "qwen-edit-dualgpu"):
-            bundle = bundles.get(name) if isinstance(bundles, dict) else None
-            if isinstance(bundle, dict) and bundle.get("runtime_instance") and bundle.get(
-                "runtime_profile"
-            ):
-                return True
-        return False
-
-    @staticmethod
-    def _configured_comfyui_unit(service_name: str) -> str:
-        config = _load_services_config() or {}
-        services = config.get("services") or {}
-        fallback = {
-            "comfyui": "comfyui.service",
-            "comfyui-qwen": "comfyui-qwen.service",
-        }.get(service_name, f"{service_name}.service")
-        return str((services.get(service_name) or {}).get("systemd_unit") or fallback)
-
-    @staticmethod
-    def _comfyui_unit_state(states: dict[str, str], unit: str) -> str:
-        """Return one exact ComfyUI unit state from an authoritative snapshot.
-
-        A string is accepted only as legacy Krea input for older internal test
-        doubles; live probes always return the per-unit mapping.
-        """
-        if isinstance(states, str):
-            return states.lower() if unit == "comfyui.service" else "unknown"
-        if not isinstance(states, dict):
-            return "unknown"
-        return str(states.get(unit, "unknown") or "unknown").lower()
-
-    @classmethod
-    def _all_comfyui_units_stopped(cls, states: dict[str, str]) -> bool:
-        """Return True only when both Krea and Qwen are authoritatively off."""
-        stopped = {"inactive", "failed"}
-        return all(
-            cls._comfyui_unit_state(states, unit) in stopped
-            for unit in ("comfyui.service", "comfyui-qwen.service")
-        )
-
-    @classmethod
-    def _any_comfyui_unit_active(cls, states: dict[str, str]) -> bool:
-        """Return True when either exact ComfyUI unit is active."""
-        return any(
-            cls._comfyui_unit_state(states, unit) == "active"
-            for unit in ("comfyui.service", "comfyui-qwen.service")
-        )
-
-    async def mark_comfyui_running_after_commit(self, unit: str = "comfyui.service") -> bool:
-        """Clear stopped caches only after systemd confirms committed ownership.
-
-        Slice B: takes the unit name explicitly so callers can commit the
-        running state of either Krea (``comfyui.service``) or Qwen
-        (``comfyui-qwen.service``). The previous single-unit implementation
-        would silently accept a Qwen-only active state as a Krea-active
-        commit, leading to false "Krea running" claims.
-        """
-        states = await self._comfyui_systemd_state()
-        state = self._comfyui_unit_state(states, unit)
-        if state != "active":
-            self.logger.error(
-                "VRAM: refusing running-state commit; %s systemd state=%r (all=%r)",
-                unit, state, states,
-            )
-            return False
-        self._comfyui_stopped = False
-        self._comfyui_auto_stopped = False
-        self._comfyui_idle_since = time.time()
-        self.logger.info(
-            "VRAM: ComfyUI running-state committed after authoritative bundle commit (unit=%s)",
-            unit,
-        )
-        return True
-
-    async def _restart_comfyui_for_restore(self):
-        """Stop ComfyUI and restart it to force-release PyTorch VRAM cache.
-
-        The ComfyUI /free API only unloads models — PyTorch's ROCm allocator
-        retains the freed VRAM until the process exits. A full restart is the
-        only way to return VRAM to the OS.
-
-        BUGFIX (2026-05-20): Skip restart if ComfyUI was auto-stopped due to
-        idle timeout. Only restart ComfyUI when it was actively used during
-        GPU work — don't undo the idle auto-stop optimization.
-        """
-        # Checked host runtimes own process start/stop and model residency.
-        # The legacy helper used to relaunch ``comfyui.service`` after a
-        # checked Krea/Qwen transition, creating a second owner whose marker
-        # blocked the next Qwen admission.  A checked bundle transition is
-        # the only authority in that mode.
-        if self._checked_comfyui_runtime_configured():
-            try:
-                unit_states = await self._comfyui_systemd_state()
-                self._comfyui_stopped = self._all_comfyui_units_stopped(unit_states)
-                self._comfyui_auto_stopped = self._comfyui_stopped
-                if self._comfyui_stopped:
-                    self._comfyui_idle_since = time.time()
-            except Exception as exc:
-                self.logger.debug(
-                    "VRAM: checked ComfyUI state sync during restore failed: %s",
-                    exc,
-                )
-            self.logger.info(
-                "VRAM: checked ComfyUI runtime configured; skipping legacy restore restart"
-            )
-            return
-
-        if self._comfyui_auto_stopped:
-            unit_states = await self._comfyui_systemd_state()
-            krea_state = self._comfyui_unit_state(
-                unit_states, "comfyui.service"
-            )
-            if krea_state in {"inactive", "failed"}:
-                self._comfyui_stopped = not self._any_comfyui_unit_active(
-                    unit_states
-                )
-                self.logger.info(
-                    "ComfyUI auto-stopped — authoritative Krea unit is inactive; "
-                    "skipping restart during restore"
-                )
-                return
-
-            self.logger.warning(
-                "ComfyUI auto-stop cache disagrees with authoritative Krea unit "
-                f"state={krea_state!r} (all={unit_states!r}); reconciling stop "
-                "before restore"
-            )
-            self._comfyui_stopped = False
-            if await self.stop_comfyui(reason="auto_stop_restore_reconcile"):
-                return
-            self.logger.warning(
-                "ComfyUI authoritative stop reconciliation failed; "
-                "continuing with normal restore sequence"
-            )
-            self._comfyui_auto_stopped = False
-
-        config = _load_services_config()
-        comfy_cfg = config.get("services", {}).get("comfyui", {})
-        if not comfy_cfg.get("enabled", True):
-            return
-
-        # Stop ComfyUI if running
-        if not self._comfyui_stopped:
-            await self.stop_comfyui(reason="restore_prep")
-            await self._wait_for_comfyui_port_free(timeout=30)
-            await asyncio.sleep(2)
-
-        # Restart ComfyUI directly via systemctl — bypass the _comfyui_stopped
-        # guard in start_comfyui() since we explicitly want it running again
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "sudo", "systemctl", "start", self._configured_comfyui_unit("comfyui"),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
-                self.logger.warning(f"ComfyUI restart failed: {stderr.decode().strip()}")
-            else:
-                self.logger.info("ComfyUI restarted for VRAM clear")
-        except Exception as e:
-            self.logger.warning(f"ComfyUI restart error: {e}")
-
-        # Phase 5.2.9: re-stamp grace after systemctl start. The systemctl
-        # call above bypasses `_load_bundle`, so bundle_loaded_at and
-        # bundle_post_load_grace_at retain their old timestamps. Without
-        # this, the new ComfyUI process is unready (ComfyRegistry fetch
-        # in progress) but the next grace check sees "now > old_grace_at"
-        # and lets traffic through. The worker's first POST would hit an
-        # unready backend again — same class of bug as 5.2.1/5.2.2.
-        # Re-stamping gives the new process its own grace window.
-        try:
-            _grace_s = int(comfy_cfg.get("post_load_grace_seconds", 0) or 0)
-            if _grace_s > 0:
-                _gs = _get_gpu_state("gpu_primary")  # comfyui is always on gpu_primary
-                _gs.bundle_loaded_at = time.time()
-                _gs.bundle_post_load_grace_at = _gs.bundle_loaded_at + _grace_s
-        except Exception:
-            pass
-
-        # Reset stopped flags so the scheduler sees ComfyUI as available
-        self._comfyui_stopped = False
-        self._comfyui_auto_stopped = False
-
-        # Wait for ComfyUI to be ready
-        await self._wait_for_comfyui_ready(timeout=120)
-
-    async def _restart_acestep_for_restore(self):
-        """Compatibility hook: ACE is retired; checked unload owns release."""
-        self.logger.debug("Retired ACE restore hook skipped")
-
-    # ── ComfyUI lifecycle (for pipeline LLM speed boost) ──────────
-
-    async def stop_comfyui(self, reason: str = "pipeline_llm") -> bool:
-        """Stop Krea ComfyUI and update the shared cache from both exact units."""
-        if self._checked_comfyui_runtime_configured():
-            try:
-                unit_states = await self._comfyui_systemd_state()
-                self._comfyui_stopped = self._all_comfyui_units_stopped(unit_states)
-                self._comfyui_auto_stopped = self._comfyui_stopped
-                if self._comfyui_stopped:
-                    self._comfyui_idle_since = time.time()
-            except Exception as exc:
-                self.logger.debug(
-                    "VRAM: checked ComfyUI state sync during stop skipped: %s",
-                    exc,
-                )
-            self.logger.info(
-                "VRAM: checked ComfyUI lifecycle is controller-owned; "
-                "legacy stop helper deferred (%s)", reason
-            )
-            return True
-        unit_states = await self._comfyui_systemd_state()
-        krea_state = self._comfyui_unit_state(
-            unit_states, "comfyui.service"
-        )
-        if krea_state in {"inactive", "failed"}:
-            self._comfyui_stopped = not self._any_comfyui_unit_active(unit_states)
-            self.logger.info(
-                "VRAM: Krea ComfyUI already stopped "
-                f"({reason}, state={krea_state}, all={unit_states!r})"
-            )
-            return True
-
-        if self._comfyui_stopped:
-            self.logger.warning(
-                "VRAM: cached ComfyUI stopped state disagrees with Krea systemd "
-                f"state={krea_state!r} (all={unit_states!r}); issuing "
-                "authoritative stop"
-            )
-            self._comfyui_stopped = False
-
-        self.logger.info(f"VRAM: Stopping ComfyUI for LLM speed ({reason})")
-        await self._free_comfyui()
-        await asyncio.sleep(2)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "sudo", "systemctl", "stop", "comfyui.service",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
-                self.logger.error(f"VRAM: ComfyUI stop failed: {stderr.decode().strip()}")
-                return False
-            if event_bus:
-                event_bus.emit("comfyui", "unhealthy")
-        except Exception as e:
-            self.logger.error(f"VRAM: ComfyUI stop error: {e}")
-            return False
-
-        freed = await self._wait_for_comfyui_port_free(timeout=30)
-        if not freed:
-            self.logger.warning("VRAM: ComfyUI port still in use after 30s")
-
-        unit_states = await self._comfyui_systemd_state()
-        krea_state = self._comfyui_unit_state(
-            unit_states, "comfyui.service"
-        )
-        if krea_state not in {"inactive", "failed"}:
-            self.logger.error(
-                "VRAM: Krea ComfyUI stop command returned but authoritative "
-                f"unit state is {krea_state!r} (all={unit_states!r}); refusing "
-                "stopped-state commit"
-            )
-            self._comfyui_stopped = False
-            return False
-
-        self._comfyui_stopped = not self._any_comfyui_unit_active(unit_states)
-        self.logger.info(
-            "VRAM: Krea ComfyUI service authoritatively stopped, ~9.8GB VRAM "
-            "freed for LLM"
-        )
-        return True
-
-    async def start_comfyui(self, reason: str = "pipeline_gpu") -> bool:
-        """Start ComfyUI service after LLM is done."""
-        if self._checked_comfyui_runtime_configured():
-            self.logger.info(
-                "VRAM: checked ComfyUI lifecycle is controller-owned; "
-                "legacy start helper deferred (%s)", reason
-            )
-            return True
-        # Phase 5.2.50: VRAM pre-flight check. If cuda:0 already has > 10 GiB
-        # used (likely by LLM-Primary idle LLM at ~13 GiB), refuse to start
-        # ComfyUI — would OOM during first inference. The bundle priority
-        # should evict the LLM first, but the stale _gpu_evicted flag can
-        # short-circuit that. This defensive check prevents the OOM at source.
-        try:
-            vram_data = await _poll_vram()
-            matched = _get_vram_entry_for_gpu(vram_data, "gpu_primary")
-            if matched:
-                used_mib = matched.get("vram_used_mib", 0)
-                if used_mib > 10000:
-                    self.logger.error(
-                        f"start_comfyui: REFUSING to start — gpu_primary has "
-                        f"{used_mib} MiB used (likely LLM-Primary idle LLM). "
-                        f"Evict LLM first to avoid CUDA OOM."
-                    )
-                    return False
-        except Exception as e:
-            self.logger.debug(f"start_comfyui pre-flight VRAM check failed: {e}")
-
-        if not self._comfyui_stopped:
-            self.logger.info(f"VRAM: ComfyUI not stopped, skip start ({reason})")
-            return True
-
-        self.logger.info(f"VRAM: Starting ComfyUI ({reason})")
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "sudo", "systemctl", "start", "comfyui.service",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
-                self.logger.error(f"VRAM: ComfyUI start failed: {stderr.decode().strip()}")
-                return False
-            if event_bus:
-                event_bus.emit("comfyui", "healthy")
-            self.logger.info("VRAM: ComfyUI service started")
-        except Exception as e:
-            self.logger.error(f"VRAM: ComfyUI start error: {e}")
-            return False
-
-        ready = await self._wait_for_comfyui_ready(timeout=120)
-        if ready:
-            self.logger.info("VRAM: ComfyUI ready")
-        else:
-            self.logger.warning("VRAM: ComfyUI not ready after 120s")
-
-        self._comfyui_stopped = False
-        self._comfyui_auto_stopped = False
-        # Start idle timer if no pending ComfyUI jobs — ComfyUI will
-        # be auto-stopped after COMFYUI_IDLE_COOLDOWN if nothing uses it.
-        pending = [j for j in self._comfyui_queue if j.status == "queued"]
-        self._comfyui_idle_since = None if pending else time.time()
-        return True
-
-    async def _ensure_comfyui_running(self):
-        """Ensure ComfyUI is running before dispatching jobs.
-
-        Called when the scheduler needs ComfyUI for work but it may have
-        been auto-stopped. Blocks until ComfyUI is ready or times out.
-        Returns True if ComfyUI is confirmed running.
-        """
-        if not self._comfyui_stopped and not self._comfyui_auto_stopped:
-            return True  # Already running
-
-        self.logger.info("ComfyUI not running — starting for GPU work")
-        return await self.start_comfyui(reason="gpu_work_needed")
-
-    async def _start_comfyui_async(self):
-        """Async task: start ComfyUI in background (for pre-warming on job submit)."""
-        try:
-            await self.start_comfyui(reason="job_submitted")
-        except Exception as e:
-            self.logger.error(f"Async ComfyUI start failed: {e}")
-
-    # ── Internal helpers ───────────────────────────────────────────
-
-    async def _check_service_active(self, service_name: str = None) -> bool:
-        name = service_name or _get_idle_service_name()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "systemctl", "is-active", "--quiet", name,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            return proc.returncode == 0
-        except Exception as e:
-            self.logger.error(f"VRAM: systemctl check failed: {e}")
-            return False
-
-    async def _systemctl(self, action: str, service_name: str = None) -> bool:
-        name = service_name or _get_idle_service_name()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "sudo", "systemctl", action, name,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
-                self.logger.error(
-                    f"VRAM: systemctl {action} failed (rc={proc.returncode}): "
-                    f"{stderr.decode().strip()}"
-                )
-                return False
-            self.logger.info(f"VRAM: systemctl {action} {name} succeeded")
-            return True
-        except asyncio.TimeoutError:
-            self.logger.error(f"VRAM: systemctl {action} timed out")
-            return False
-        except Exception as e:
-            self.logger.error(f"VRAM: systemctl {action} error: {e}")
-            return False
-
-    async def _wait_for_port_free(self, timeout: float = 30, port: int = None) -> bool:
-        if port is None:
-            port = _get_idle_service_port()
-        url = f"http://localhost:{port}/health"
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                async with self.session.get(
-                    url,
-                    timeout=ClientTimeout(total=2, connect=1),
-                ) as resp:
-                    pass
-            except Exception:
-                return True
-            await asyncio.sleep(2)
-        return False
-
-    async def _wait_for_vram_below(self, target_mib: int = 4096, timeout: float = 30,
-                                  *, gpu_id: str | None = None) -> bool:
-        """Wait on the evicted GPU; other GPUs may still serve live work."""
-        start = time.time()
-        while time.time() - start < timeout:
-            vram_data = await _poll_vram()
-            if gpu_id:
-                entry = _get_vram_entry_for_gpu(vram_data, gpu_id) or {}
-                used = entry.get("vram_used_mib", entry.get("used_mib", 999999))
-            else:
-                used = vram_data.get("used_vram_mib", 999999)
-            if not isinstance(used, (int, float)) or used < 0:
-                used = 999999
-            if used < target_mib:
-                self.logger.info(f"VRAM: Freed — {used} MiB < {target_mib} MiB threshold")
-                return True
-            self.logger.info(f"VRAM: Still used {used} MiB, waiting... (target <{target_mib})")
-            await asyncio.sleep(3)
-        return False
-
-    async def wait_for_free_mib(self, gpu_id: str, target_mib: int,
-                                timeout_s: float = 5.0,
-                                poll_interval_s: float = 0.25) -> bool:
-        """Phase 5.2.19: block until `gpu_id` has `target_mib` free VRAM.
-
-        Used after `systemctl start` of a new bundle, before HTTP probe,
-        to close the TOCTOU window between process-exit and PyTorch CUDA
-        allocator release (verified ~1s in llama.cpp + PyTorch per
-        RESEARCH_PHASE_5_2_19_EVIDENCE.md).
-
-        Returns True if target reached within timeout, False otherwise.
-        Caller should log on False but NOT fail the load — the OOM
-        watchdog will catch real failure (5.2.11 bug pattern).
-
-        Backend dispatch via _detect_backend():
-        - rocm:    read _vram_cache["gpus"] by matching card/pci
-        - cuda:    nvidia-smi --query-gpu=memory.free (not implemented
-                   yet — falls back to True)
-        - vulkan:  GEM-fd scan (not implemented — falls back to True)
-        - cpu:     always True (no VRAM)
-
-        Per-GPU lookup key (P0-2 from PHASE5.2.19_ADVERSARIAL): services
-        gpu_ids are logical names ("gpu_primary", "gpu_secondary"). _poll_vram()
-        returns cards by "card" name ("card0", "card1") or pci_address.
-        We resolve gpu_id → pci via services.json gpu_devices, then
-        match on pci_address.
-        """
-        deadline = time.monotonic() + timeout_s
-        backend = self._detect_backend_for_gpu(gpu_id)
-        # CPU-only services (gemma-vision, no gpu_id): always free.
-        if backend == "cpu" or not gpu_id:
-            return True
-        # Resolve gpu_id → pci for matching
-        pci = self._pci_for_gpu(gpu_id)
-        last_free = 0
-        while time.monotonic() < deadline:
-            free_mib = await self._free_mib_for_async(gpu_id, pci, backend)
-            last_free = free_mib
-            if free_mib >= target_mib:
-                return True
-            await asyncio.sleep(poll_interval_s)
-        self.logger.warning(
-            f"wait_for_free_mib({gpu_id}): target {target_mib} MiB not "
-            f"reached in {timeout_s:.1f}s (last seen: {last_free} MiB)"
-        )
-        return False
-
-    def _detect_backend_for_gpu(self, gpu_id: str | None) -> str:
-        """One of 'rocm' | 'cuda' | 'vulkan' | 'cpu'."""
-        if gpu_id in (None, "", "cpu", "cpu_only"):
-            return "cpu"
-        config = _load_services_config()
-        gpu_devices = config.get("gpu_devices", {}) or {}
-        dev = gpu_devices.get(gpu_id, {})
-        if dev.get("cpu_only"):
-            return "cpu"
-        # Heuristic: try rocm-smi, then nvidia-smi, then vulkaninfo
-        import shutil
-        if shutil.which("rocm-smi"):
-            return "rocm"
-        if shutil.which("nvidia-smi"):
-            return "cuda"
-        if shutil.which("vulkaninfo"):
-            return "vulkan"
-        return "cpu"
-
-    def _pci_for_gpu(self, gpu_id: str) -> str | None:
-        config = _load_services_config()
-        gpu_devices = config.get("gpu_devices", {}) or {}
-        return gpu_devices.get(gpu_id, {}).get("pci")
-
-    async def _free_mib_for_async(self, gpu_id: str, pci: str | None,
-                                   backend: str) -> int:
-        if backend == "rocm":
-            vram_data = await _poll_vram()
-            gpus = vram_data.get("gpus", []) or []
-            target_pci = _normalize_pci_address(pci)
-            for gpu in gpus:
-                if (
-                    target_pci
-                    and _normalize_pci_address(gpu.get("pci_address")) == target_pci
-                ):
-                    used = gpu.get("vram_used_mib")
-                    total = gpu.get("vram_total_mib") or 16368
-                    if used is None:
-                        return 0
-                    return max(0, total - used)
-            if target_pci:
-                return 0
-            mapped_card = (
-                (_load_services_config().get("gpu_devices", {}) or {})
-                .get(gpu_id, {})
-                .get("card")
-            )
-            for gpu in gpus:
-                card = gpu.get("card", "")
-                if mapped_card and card == mapped_card:
-                    used = gpu.get("vram_used_mib")
-                    total = gpu.get("vram_total_mib") or 16368
-                    return max(0, total - (used or 0))
-            return 0
-        if backend == "cuda":
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "nvidia-smi",
-                    "--query-gpu=memory.free",
-                    "--format=csv,noheader,nounits",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.0)
-                return int(stdout.decode().strip().splitlines()[0])
-            except Exception:
-                return 0
-        # Vulkan + cpu: best-effort return True semantics upstream.
-        return 1 << 30
-
-    async def _wait_for_llm_healthy(self, timeout: float = LLM_RESTORE_TIMEOUT) -> bool:
-        port = _get_idle_service_port()
-        url = f"http://localhost:{port}/health"
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                async with self.session.get(
-                    url,
-                    timeout=ClientTimeout(total=5, connect=3),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("status") == "ok":
-                            llm.update_health(True)
-                            return True
-            except Exception:
-                pass
-            await asyncio.sleep(3)
-        return False
-
-    async def _free_comfyui(self):
-        try:
-            async with self.session.post(
-                f"{COMFYUI_URL}/free",
-                json={"unload_models": True, "free_memory": True},
-                timeout=ClientTimeout(total=30),
-            ) as resp:
-                self.logger.info(f"VRAM: ComfyUI free → status {resp.status}")
-        except Exception as e:
-            self.logger.error(f"VRAM: ComfyUI free failed: {e}")
-
-    async def _wait_for_comfyui_port_free(self, timeout: float = 30) -> bool:
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                async with self.session.get(
-                    f"{COMFYUI_URL}/system_stats",
-                    timeout=ClientTimeout(total=2, connect=1),
-                ) as resp:
-                    pass
-            except Exception:
-                return True
-            await asyncio.sleep(2)
-        return False
-
-    async def _wait_for_comfyui_ready(self, timeout: float = 120) -> bool:
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                async with self.session.get(
-                    f"{COMFYUI_URL}/system_stats",
-                    timeout=ClientTimeout(total=5, connect=3),
-                ) as resp:
-                    if resp.status == 200:
-                        return True
-            except Exception:
-                pass
-            await asyncio.sleep(3)
-        return False
-
-    def get_gpu_services(self) -> list:
-        """Return all GPU-using services sorted by eviction priority (lowest priority = most evictable).
-        Skips cpu_only services (they don't use GPU VRAM)."""
-        global _services_config
-        if _services_config is None:
-            _services_config = _load_services_config()
-        services = _services_config.get("services", {})
-        gpu_svcs = []
-        for name, svc in services.items():
-            if svc.get("cpu_only", False):
-                continue  # CPU-only services don't need VRAM management
-            if svc.get("enabled") and svc.get("systemd_unit"):
-                gpu_svcs.append((name, svc))
-        gpu_svcs.sort(key=lambda x: x[1].get("priority", 0))
-        return gpu_svcs
-
-    async def evict_for_vram(self, needed_mib: int) -> list:
-        """Evict lowest-priority non-protected services until enough VRAM is free.
-
-        Returns list of evicted service names.
-        """
-        global _services_config
-        if _services_config is None:
-            _services_config = _load_services_config()
-
-        evicted = []
-        bundles = _resolve_bundles()
-        candidates = self.get_gpu_services()
-        bundle_candidates = []
-        for candidate_name, candidate_svc in candidates:
-            if candidate_svc.get("protected", False):
-                continue
-            if not candidate_svc.get("systemd_unit"):
-                continue
-            resolved_bundle = _get_bundle_for_service(
-                candidate_name, bundles=bundles
-            )
-            if resolved_bundle is not None:
-                bundle_candidates.append((candidate_name, resolved_bundle))
-
-        # A bundle-backed candidate may never be downgraded to the legacy
-        # per-service systemd path when the durable owner is unavailable.
-        # Preflight the whole candidate set so an unbundled service cannot be
-        # stopped first and leave a partial eviction behind a later refusal.
-        if bundle_candidates and bundle_lifecycle_controller is None:
-            self.logger.error(
-                "VRAM: refusing evict_for_vram without lifecycle controller "
-                "for bundle-backed candidates: %s",
-                [name for name, _ in bundle_candidates],
-            )
-            return []
-
-        handled_bundle_roots: set[str] = set()
-        for name, svc in candidates:
-            if svc.get("protected", False):
-                continue
-            unit = svc.get("systemd_unit")
-            if not unit:
-                continue
-
-            resolved_bundle = _get_bundle_for_service(name, bundles=bundles)
-            if resolved_bundle is not None:
-                bundle_name = resolved_bundle["bundle_name"]
-                if bundle_name in handled_bundle_roots:
-                    continue
-                handled_bundle_roots.add(bundle_name)
-                self.logger.info(
-                    "VRAM: evict_for_vram(%sMiB) — evicting bundle %s "
-                    "for service %s (priority=%s)",
-                    needed_mib,
-                    bundle_name,
-                    name,
-                    svc.get("priority"),
-                )
-                try:
-                    bundle_ok = await _run_bundle_eviction_for_vram(
-                        bundle_name,
-                        reason=f"evict-for-vram:{name}:{needed_mib}",
-                        bundles=bundles,
-                    )
-                except Exception as exc:
-                    bundle_ok = False
-                    self.logger.error(
-                        "VRAM: exception evicting bundle %s for %s: %s",
-                        bundle_name,
-                        name,
-                        exc,
-                    )
-                if bundle_ok:
-                    evicted.append(name)
-                else:
-                    self.logger.warning(
-                        "VRAM: controller refused/failed bundle eviction %s",
-                        bundle_name,
-                    )
-                continue
-
-            # This is the genuinely unbundled compatibility path. It remains
-            # allowed, but it is deliberately unreachable for any service that
-            # resolves through the bundle registry above.
-            self.logger.info(f"VRAM: evict_for_vram({needed_mib}MiB) — evicting {name} (priority={svc.get('priority')})")
-            try:
-                # Phase 5.1.5: stamp this stop as planned (we initiated
-                # it to free VRAM). The Supervisor will defer pool
-                # shutdown for the planned window so a transient
-                # unhealthy probe during the systemd stop cascade does
-                # not get misclassified as a crash.
-                if event_bus is not None:
-                    event_bus.mark_planned_stop(name)
-                proc = await asyncio.create_subprocess_exec(
-                    "sudo", "systemctl", "stop", unit,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                if event_bus:
-                    event_bus.emit(name, "unhealthy")
-                if proc.returncode == 0:
-                    evicted.append(name)
-                    self.logger.info(f"VRAM: evicted {name} for {needed_mib}MiB")
-                else:
-                    self.logger.warning(f"VRAM: failed to evict {name}: {stderr.decode().strip()}")
-            except Exception as e:
-                self.logger.error(f"VRAM: exception evicting {name}: {e}")
-            finally:
-                # Phase 5.2.6: caller-side clear. The stamp's only
-                # purpose was to absorb the systemd stop cascade; once
-                # the stop returns (success or failure), release the
-                # supervisor's deferral so a real crash is not silently
-                # swallowed.
-                if event_bus is not None:
-                    event_bus.clear_planned_stop(name)
-        return evicted
+# The class body lives in gpu_manager/vram_lifecycle.py.  Bound once here so the
+# facade keeps owning the class object, its globals and all five constructor sites.
+VRAMLifecycleManager = _bind_vram_lifecycle(globals())
 
 
 # ── Application State ──────────────────────────────────────────────
@@ -14239,23 +9085,9 @@ _queue_redis = None  # set in create_app after config is loaded
 _PREFER_PRIORITY_DEPTH_THRESHOLD = 2
 
 
-def _queue_depth_for_group(routing_group: str) -> int:
-    """Sum queue depths of all services in the routing group.
+_service_events_bound = _bind_service_events(globals())
+_queue_depth_for_group = _service_events_bound[0]
 
-    Reuses RoutingEngine.get_group_members(), which already populates
-    'queue_depth' per member via _get_queue_depth. Falls back to 0 on
-    any exception (e.g. routing_engine not yet initialised or Redis
-    hiccup).
-    """
-    try:
-        if not routing_engine:
-            return 0
-        members = routing_engine.get_group_members(routing_group)
-        return sum(int(m.get("queue_depth", 0)) for m in members)
-    except Exception:
-        logger.debug("queue_depth_for_group(%s) failed", routing_group,
-                     exc_info=True)
-        return 0
 
 # ── Async Queue Engine (Phase 3: non-blocking Redis) ──────────────
 _async_redis = None  # aioredis.Redis shared connection
@@ -14277,99 +9109,8 @@ _restart_recovery_tasks: set[asyncio.Task] = set()
 # Keep this strong module reference so the supervisor loop is not collected
 # ── Dynamic Worker Pool: Event Bus & Pool Classes ─────────────────
 
-class ServiceEventBus:
-    """In-process event bus for service lifecycle changes.
+ServiceEventBus = _service_events_bound[1]
 
-    Publishers: GPU Manager lifecycle code (service start/stop/swap)
-    Subscribers: WorkerSupervisor (to spawn/kill workers)
-
-    No Redis, no network — pure asyncio.Event primitives.
-    Follows the existing pattern of _idle_check_event, _drain_event, _llm_ready_event.
-    """
-
-    def __init__(self):
-        # Service name → event (set when state changes)
-        self._events: dict[str, asyncio.Event] = {}
-        # Service name → last known state
-        self._states: dict[str, str] = {}  # "healthy" | "unhealthy" | "starting" | "stopping"
-        # Global event — set when ANY service changes (for supervisor wake)
-        self._any_change = asyncio.Event()
-        # Phase 5.1.5: side-table of services we have *intentionally* asked
-        # systemd to stop (via evict_first, evict_llm, _unload_bundle, etc.).
-        # The Supervisor consults this before reacting to "unhealthy" /
-        # "stopping" events so a planned evict does not tear down an
-        # unrelated pool whose service briefly looked unhealthy during the
-        # shutdown cascade. TTL-bound so a missed clear never permanently
-        # freezes the supervisor.
-        self._planned_stops: dict[str, float] = {}
-        self._PLANNED_STOP_GRACE_S: float = 600.0  # 10 min backstop; the periodic re-stamp keeps it alive in practice
-
-    def mark_planned_stop(self, service_name: str) -> None:
-        """Stamp `service_name` as intentionally being stopped.
-
-        Callers SHOULD invoke this immediately before issuing a
-        ``sudo systemctl stop`` they initiated themselves (evict_first,
-        evict_llm, _unload_bundle, evict_for_vram). The Supervisor will
-        then defer pool-shutdown reactions for `_PLANNED_STOP_GRACE_S`
-        seconds — long enough to absorb transient "unhealthy" probes
-        during the shutdown cascade.
-        """
-        import time as _t
-        self._planned_stops[service_name] = _t.time()
-        logger.debug(f"EventBus: marked planned_stop on {service_name}")
-
-    def clear_planned_stop(self, service_name: str) -> None:
-        """Forget a previously-stamped planned stop (idempotent)."""
-        self._planned_stops.pop(service_name, None)
-
-    def is_planned_stop(self, service_name: str) -> bool:
-        """True iff `mark_planned_stop` was called within the grace window.
-
-        Stale entries (>_PLANNED_STOP_GRACE_S seconds old) are dropped
-        on read so the dict cannot grow unboundedly.
-        """
-        import time as _t
-        ts = self._planned_stops.get(service_name)
-        if ts is None:
-            return False
-        if _t.time() - ts > self._PLANNED_STOP_GRACE_S:
-            # Stale — drop and report not-planned so the supervisor can
-            # proceed with a normal reaction if one is pending.
-            self._planned_stops.pop(service_name, None)
-            return False
-        return True
-
-    def emit(self, service_name: str, new_state: str):
-        """Fire a state change event. Called by lifecycle code."""
-        old = self._states.get(service_name)
-        self._states[service_name] = new_state
-
-        if service_name not in self._events:
-            self._events[service_name] = asyncio.Event()
-        self._events[service_name].set()
-        self._any_change.set()
-
-        logger.info(f"EventBus: {service_name} {old or '?'} -> {new_state}")
-
-    async def wait_for_change(self, timeout: float = 5.0):
-        """Wait until any service changes state, or timeout."""
-        try:
-            await asyncio.wait_for(self._any_change.wait(), timeout=timeout)
-            self._any_change.clear()
-        except asyncio.TimeoutError:
-            pass
-
-    def get_changed_services(self) -> list[tuple[str, str]]:
-        """Return (service, state) for all services with pending events."""
-        changed = []
-        for svc, event in self._events.items():
-            if event.is_set():
-                event.clear()
-                changed.append((svc, self._states.get(svc, "unknown")))
-        return changed
-
-    def get_state(self, service_name: str) -> str:
-        return self._states.get(service_name, "unknown")
 
 
 # Global event bus instance
@@ -14384,215 +9125,20 @@ worker_supervisor: 'WorkerSupervisor | None' = None
 _worker_supervisor_task: 'asyncio.Task | None' = None
 
 
-async def _force_recover_failed_service(service_name: str, job_id: str, error: str) -> dict:
-    """Force-evict a service that failed (OOM, crash, 5xx) and reset GPU state.
-
-    Does NOT restart the service. The watchdog will re-load the idle LLM
-    on its next tick. Desktop processes (Xorg, kwin, etc.) are NOT affected
-    because we only target the service's specific systemd_unit.
-
-    Returns a status dict describing what was done.
-    """
-    config = _load_services_config()
-    services = config.get("services", {})
-    svc = services.get(service_name, {})
-    if not svc:
-        return {"ok": False, "error": f"Unknown service: {service_name}"}
-    # Only recover generation_backend services
-    if svc.get("type") != "generation_backend":
-        return {"ok": False, "error": f"Service {service_name} is not a generation backend, skipping recovery"}
-    gpu_id = svc.get("gpu_id")
-    systemd_unit = svc.get("systemd_unit", "")
-    if not systemd_unit:
-        return {"ok": False, "error": f"Service {service_name} has no systemd_unit, cannot recover"}
-    result = {
-        "ok": True,
-        "service": service_name,
-        "gpu_id": gpu_id,
-        "systemd_unit": systemd_unit,
-        "actions": [],
-    }
-    # Find the bundle that contains this service
-    bundles = _resolve_bundles()
-    matching_bundle = None
-    for bname, bcfg in bundles.items():
-        if service_name in (bcfg.get("services") or []):
-            matching_bundle = bname
-            break
-    admission_lock = (
-        _get_bundle_admission_lock(matching_bundle)
-        if matching_bundle else None
-    )
-    if admission_lock is not None:
-        await admission_lock.acquire()
-    recovery_stop_ok = True
-    try:
-        if matching_bundle:
-            result["bundle"] = matching_bundle
-            # Bundle recovery owns one linked-graph mutation under the durable
-            # controller fence. A rejected/stale transition must not clear the
-            # authoritative GPU state behind the still-running bundle.
-            try:
-                unload_ok = await _teardown_bundle_graph(
-                    matching_bundle,
-                    reason=f"failure-recovery:{service_name}:{job_id}",
-                )
-                result["actions"].append(
-                    f"teardown_bundle({matching_bundle}) -> {unload_ok}"
-                )
-                recovery_stop_ok = bool(unload_ok)
-            except Exception as e:
-                recovery_stop_ok = False
-                result["actions"].append(
-                    f"teardown_bundle({matching_bundle}) failed: {e}"
-                )
-        else:
-            # Not in a bundle — just stop the systemd unit directly
-            try:
-                await vram._systemctl("stop", systemd_unit)
-                result["actions"].append(f"systemctl stop {systemd_unit} (no bundle)")
-            except Exception as e:
-                recovery_stop_ok = False
-                result["actions"].append(f"systemctl stop {systemd_unit} failed: {e}")
-
-        if not recovery_stop_ok:
-            result["ok"] = False
-            result["error"] = (
-                f"failed recovery teardown deferred for {service_name}; "
-                "authoritative GPU state retained"
-            )
-
-        # Clear GPU state only after the stop/teardown actually succeeded.
-        if gpu_id and recovery_stop_ok:
-            gs = _get_gpu_state(gpu_id)
-            if gs is not None:
-                old_bundle = gs.loaded_bundle
-                if matching_bundle:
-                    _transition_linked_bundle_state(
-                        matching_bundle, [], source="_force_recover_failed_service"
-                    )
-                else:
-                    gs.loaded_bundle = None
-                    gs.bundle_priority = 0
-                    gs.state = "idle"
-                    gs.set_loaded_bundles([], source="_force_recover_failed_service")
-                    gs.set_current_priority(0, source="_force_recover_failed_service")
-                result["actions"].append(
-                    f"cleared GpuBundleState for {gpu_id} (was {old_bundle})"
-                )
-                if matching_bundle:
-                    result["actions"].append(
-                        f"cleared linked scheduler state for {matching_bundle}"
-                    )
-    finally:
-        if admission_lock is not None and admission_lock.locked():
-            admission_lock.release()
-    logger.warning(
-        f"force_recover: {service_name} (job {job_id}) — {error[:200]}. "
-        f"Actions: {result['actions']}"
-    )
-    return result
+_force_recover_failed_service = _service_events_bound[2]
 
 
-def _persist_audio_cpp_result(job_id: str, response_text: str) -> str:
-    """Persist native audio.cpp PCM and return a bounded artifact receipt JSON.
 
-    audio.cpp returns the completed WAV inline.  Keeping that base64 in the
-    Redis job hash is both wasteful and unusable by the coordinator's bounded
-    leaf contract, so the worker commits the file before terminalising the job.
-    """
-    import base64
-    import wave
-
-    result = json.loads(response_text)
-    if not isinstance(result, dict):
-        raise ValueError("audio.cpp result is not an object")
-    encoded = result.pop("audio", None)
-    if not isinstance(encoded, str) or not encoded:
-        raise ValueError("audio.cpp completed response has no audio")
-    audio = base64.b64decode(encoded, validate=True)
-    output_root = Path(
-        os.environ.get(
-            "GPU_MANAGER_GENERATION_OUTPUT_DIR",
-            str(PROJECT_ROOT / "output" / "gpu-manager"),
-        )
-    ).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
-    path = output_root / f"{job_id}-minimax-music3.wav"
-    tmp = path.with_suffix(".wav.tmp")
-    tmp.write_bytes(audio)
-    with wave.open(str(tmp), "rb") as handle:
-        channels = handle.getnchannels()
-        sample_rate = handle.getframerate()
-        sample_width = handle.getsampwidth()
-        frames = handle.getnframes()
-    if channels < 1 or sample_rate < 8000 or sample_width != 2 or frames <= 0:
-        tmp.unlink(missing_ok=True)
-        raise ValueError("audio.cpp returned an invalid 16-bit PCM WAV")
-    tmp.replace(path)
-    digest = hashlib.sha256(audio).hexdigest()
-    artifact = {
-        "path_or_url": str(path),
-        "sha256": digest,
-        "byte_size": len(audio),
-        "media_type": "audio/wav",
-        "duration_seconds": frames / sample_rate,
-        "channels": channels,
-        "sample_rate": sample_rate,
-    }
-    result["artifact"] = artifact
-    result["audio"] = artifact
-    result.setdefault("generation_receipt", {})
-    if isinstance(result["generation_receipt"], dict):
-        result["generation_receipt"].update({
-            "job_id": job_id,
-            "model_id": result.get("model") or "minimax-music3-audiocpp-q8-bf16",
-            "artifact_sha256": digest,
-        })
-    return json.dumps(result, sort_keys=True, separators=(",", ":"))
+_persist_audio_cpp_result = _service_events_bound[3]
 
 
-def _persist_generated_image(job_id: str, image: Mapping[str, Any], index: int) -> dict:
-    import base64
-    from pathlib import Path
-    from native_task_host import atomic_write
 
-    raw = base64.b64decode(image["data_b64"], validate=True)
-    _verified_image_bytes(raw)
-    root = Path(os.environ.get("GPU_MANAGER_GENERATION_OUTPUT_DIR",
-                              str(PROJECT_ROOT / "output" / "gpu-manager"))).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    suffix = Path(str(image.get("filename") or "image.png")).suffix.lower()
-    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-        raise RuntimeError("unsupported generated image artifact extension")
-    path = root / f"{job_id}-image-{index}{suffix}"
-    atomic_write(path, raw)
-    return {"path_or_url": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
-            "byte_size": len(raw), "produced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+_persist_generated_image = _service_events_bound[4]
 
 
-def _required_native_helper_token_file() -> str:
-    """Resolve the dedicated native-task helper credential before network I/O."""
-    from runtime_host_client import (
-        HELPER_TOKEN_FILE_ENV,
-        NATIVE_TASK_TOKEN_FILE_ENV,
-        resolve_required_service_credential,
-    )
 
-    token_file = os.environ.get(NATIVE_TASK_TOKEN_FILE_ENV)
-    if not token_file:
-        if os.environ.get(HELPER_TOKEN_FILE_ENV):
-            logger.warning(
-                "%s is deprecated and ignored; configure %s for native-task authentication",
-                HELPER_TOKEN_FILE_ENV,
-                NATIVE_TASK_TOKEN_FILE_ENV,
-            )
-        raise RuntimeError("native task helper credential is required")
-    try:
-        resolve_required_service_credential(service_token_file=token_file)
-    except Exception as exc:
-        raise RuntimeError("native task helper credential is unavailable") from exc
-    return token_file
+_required_native_helper_token_file = _service_events_bound[5]
+
 
 
 class WorkerPool:
@@ -15972,9 +10518,9 @@ class WorkerPool:
         # redis jitter. Set True inside any in-body ack site; the finally
         # gates its ack on this flag.
         try:
-            # Queue-first prompt policy: OD is invoked only now, after this
-            # worker owns the Redis entry and linked GPU lease.  The helper
-            # patches the exact server-owned workflow target before /prompt.
+            # Queue-first prompt policy: the admitted raw prompt is verified
+            # against the exact server-owned workflow target after this
+            # worker owns the Redis entry and linked GPU lease.
             if job.get("request_kind") == "comfyui_workflow" and body:
                 source_artifact = job.get("coordinator_source_artifact")
                 if source_artifact:
@@ -16111,6 +10657,8 @@ class WorkerPool:
                 # Any non-2xx backend response is a failed forward.  A 404 body
                 # must never be committed as a successful generation result.
                 _oom_detected = False
+                _oom_info = None
+                _oom_gpu_id = (self.service_config or {}).get("gpu_id", "") or "gpu_primary"
                 if resp.status >= 400:
                     # Treat as a failure - the backend itself reported OOM/error
                     error_msg = f"HTTP {resp.status}: {resp_text[:200]}"
@@ -16148,25 +10696,58 @@ class WorkerPool:
                         # Never let OOM recording break the worker
                         logger.debug(f"Worker-{worker_id}: oom detection hook failed: {_oom_hook_err}")
                     if job_tracker:
-                        job_tracker.update_status(job_id, "failed", error=error_msg)
+                        status_fields = {"error": error_msg}
+                        if _oom_detected:
+                            status_fields.update({
+                                "error_type": "oom",
+                                "oom_reason": str((_oom_info or {}).get("reason", "oom_detected"))[:500],
+                                "oom_details": str((_oom_info or {}).get("details", ""))[:500],
+                                "oom_recovery_state": "detected",
+                            })
+                        job_tracker.update_status(job_id, "failed", **status_fields)
                     if queue_metrics:
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(
                             None, queue_metrics.record_failure, self.service_name, f"HTTP_{resp.status}")
-                    # Force-recover
-                    try:
-                        recovery = (
-                            await _force_recover_failed_service(self.service_name, job_id, error_msg)
-                            if _oom_detected or job.get("request_kind") != "audio_cpp_task"
-                            else {"ok": False, "reason": "terminal_native_task_no_oom"}
-                        )
-                        if recovery.get("ok"):
-                            logger.warning(
-                                f"Worker-{worker_id}: force-recovery after HTTP {resp.status}: "
-                                f"{recovery.get('actions', [])}"
+                    # Only a positively classified OOM enters recovery. Bad
+                    # prompts and ordinary backend 4xx/5xx responses are not
+                    # GPU ownership evidence and must not trigger teardown.
+                    if _oom_detected:
+                        try:
+                            recovery = await asyncio.wait_for(
+                                _oom_recovery_pipeline(
+                                    gpu_id=_oom_gpu_id,
+                                    service_name=self.service_name,
+                                    job_id=job_id,
+                                    oom_reason=str((_oom_info or {}).get("reason", "oom detected")),
+                                    oom_details=str((_oom_info or {}).get("details", ""))[:500],
+                                ),
+                                timeout=75.0,
                             )
-                    except Exception as rec_err:
-                        logger.error(f"Worker-{worker_id}: force-recovery failed: {rec_err}")
+                            if job_tracker:
+                                job_tracker.update_status(
+                                    job_id, "failed", error=error_msg, error_type="oom",
+                                    oom_recovery_state=str(recovery.get("state", "unknown")),
+                                    oom_recovery_error=str(recovery.get("reason", ""))[:500],
+                                    oom_diagnostics=json.dumps(recovery, default=str)[:2000],
+                                )
+                        except Exception as rec_err:
+                            failed_state = _gpu_states.get(_oom_gpu_id)
+                            if failed_state is not None:
+                                failed_state.set_oom_state(
+                                    "oom_failed", source="worker_recovery_timeout_or_exception",
+                                    reason=type(rec_err).__name__,
+                                )
+                            if job_tracker:
+                                job_tracker.update_status(
+                                    job_id, "failed", error=error_msg, error_type="oom",
+                                    oom_recovery_state="oom_failed",
+                                    oom_recovery_error=type(rec_err).__name__,
+                                )
+                            logger.error(
+                                "Worker-%s: OOM recovery for %s failed (%s); admission remains closed; manual intervention required",
+                                worker_id, job_id, type(rec_err).__name__,
+                            )
                     if entry_id and async_queue:
                         if _oom_detected or job.get("request_kind") == "audio_cpp_task":
                             await async_queue.ack(
@@ -16225,10 +10806,7 @@ class WorkerPool:
                             _poll_metadata = json.loads(job.get("metadata") or "{}")
                         except (TypeError, json.JSONDecodeError):
                             _poll_metadata = {}
-                        _workflow_timeout_s = max(
-                            60,
-                            min(7200, int(_poll_metadata.get("workflow_timeout_s", 900))),
-                        )
+                        _workflow_timeout_s = generation_poll_deadline_s(_poll_metadata)
                         poll_deadline = time.time() + _workflow_timeout_s
                         poll_started_at = time.time()  # Phase 5.2.49: for accurate timeout error message
                         poll_interval = 5
@@ -16240,8 +10818,37 @@ class WorkerPool:
                         # re-freeze (auto-free is a one-shot event).
                         _no_images_retries = 0
                         _no_images_max_retries = 3
+                        # A /prompt ACK is not a completion. If ComfyUI forgets
+                        # the prompt or stops answering for the grace window the
+                        # job ends typed (never replayed) instead of holding the
+                        # worker lease until the full poll deadline.
+                        _lost_tracker = LostCompletionTracker(
+                            grace_s=lost_completion_grace_s(_poll_metadata)
+                        )
+                        _lost_reason = None
                         while time.time() < poll_deadline:
                             await asyncio.sleep(poll_interval)
+                            # The supervisor may have durably terminalized this
+                            # accepted job after confirming its unit died. Stop
+                            # polling promptly; the existing finally owns ACK and
+                            # worker-slot/lease release.
+                            if job_tracker:
+                                try:
+                                    _observed = _coordinator_job_dict(
+                                        job_tracker.get_job(job_id)
+                                    ) or {}
+                                    if _observed.get("status") in {
+                                        "failed", "cancelled", "completed", "dead_lettered",
+                                    }:
+                                        logger.info(
+                                            "Worker-%d: ending poll for %s; tracker is terminal (%s)",
+                                            worker_id, job_id, _observed.get("status"),
+                                        )
+                                        return
+                                except Exception:
+                                    # Tracker unavailability is not evidence of
+                                    # terminality; preserve normal polling behavior.
+                                    pass
                             try:
                                 async with self.session.get(
                                     poll_url, timeout=ClientTimeout(total=10)
@@ -16251,6 +10858,12 @@ class WorkerPool:
                                 logger.debug(
                                     f"Worker-{worker_id}: history poll failed: {poll_err}"
                                 )
+                                _lost_tracker.observe(
+                                    PromptLiveness.UNREACHABLE, time.time()
+                                )
+                                _lost_reason = _lost_tracker.lost_reason(time.time())
+                                if _lost_reason:
+                                    break
                                 continue
                             try:
                                 hist_data = json.loads(hist_text)
@@ -16282,8 +10895,39 @@ class WorkerPool:
                                         f"during ComfyUI history polling"
                                     )
                                     return
+                                _lost_tracker.observe(
+                                    await probe_prompt(
+                                        self.session, comfyui_base, prompt_id
+                                    ),
+                                    time.time(),
+                                )
+                                _lost_reason = _lost_tracker.lost_reason(time.time())
+                                if _lost_reason:
+                                    break
                                 continue
+                            _lost_tracker.observe(PromptLiveness.PRESENT, time.time())
                             status = job_entry.get("status", {})
+                            if _comfyui_execution_interrupted(job_entry):
+                                _interrupted_error = (
+                                    f"ComfyUI execution {prompt_id} was interrupted"
+                                )
+                                if job_tracker:
+                                    job_tracker.update_status(
+                                        job_id,
+                                        "failed",
+                                        error=_interrupted_error,
+                                        error_type="execution_interrupted",
+                                        comfyui_prompt_id=prompt_id,
+                                    )
+                                logger.error(
+                                    "Worker-%s: terminal ComfyUI interruption for %s "
+                                    "(prompt_id=%s)",
+                                    worker_id,
+                                    job_id,
+                                    prompt_id,
+                                )
+                                completed = True
+                                break
                             if status.get("completed", False):
                                 # Check for node errors
                                 if job_entry.get("node_errors"):
@@ -16522,6 +11166,14 @@ class WorkerPool:
                                 }
                                 if prompt_id:
                                     _timeout_kwargs["comfyui_prompt_id"] = prompt_id
+                                if _lost_reason:
+                                    _timeout_kwargs["error"] = (
+                                        f"ComfyUI job {prompt_id} lost completion: "
+                                        f"{_lost_reason}"
+                                    )
+                                    _timeout_kwargs["error_type"] = (
+                                        LOST_COMPLETION_ERROR_TYPE
+                                    )
                                 job_tracker.update_status(
                                     job_id, "failed",
                                     **_timeout_kwargs,
@@ -16910,6 +11562,102 @@ class WorkerSupervisor:
             coordinator_admission=self.coordinator_admission,
         )
 
+    async def _backend_failure_facts(self, service_config: dict) -> dict:
+        """Return positive systemd failure evidence without changing lifecycle state."""
+        unit = service_config.get("systemd_unit")
+        if not isinstance(unit, str) or not unit.endswith(".service"):
+            return {"confirmed_failed": False}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "show", "--no-pager",
+                "--property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus",
+                unit,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            if proc.returncode != 0:
+                return {"confirmed_failed": False}
+            facts = {}
+            for line in stdout.decode("utf-8", "replace").splitlines():
+                key, sep, value = line.partition("=")
+                if sep:
+                    facts[key] = value.strip()
+            active_state = facts.get("ActiveState", "")
+            sub_state = facts.get("SubState", "")
+            result = facts.get("Result", "")
+            restart_window_death = (
+                sub_state == "auto-restart"
+                and result in {"signal", "exit-code", "core-dump"}
+            )
+            failed = active_state == "failed" or result == "oom-kill" or restart_window_death
+            return {
+                "confirmed_failed": failed,
+                "active_state": active_state,
+                "sub_state": sub_state,
+                "result": result,
+                "exec_main_code": facts.get("ExecMainCode", ""),
+                "exec_main_status": facts.get("ExecMainStatus", ""),
+                "unit": unit,
+            }
+        except Exception:
+            # A failed probe is not proof of backend death. Keep work owned.
+            return {"confirmed_failed": False}
+
+    async def _terminalize_accepted_backend_jobs(
+        self, service_name: str, service_config: dict, facts: dict
+    ) -> None:
+        """Fail only accepted coordinator children still owned by this service slot."""
+        if not facts.get("confirmed_failed") or not job_tracker or async_slot_manager is None:
+            return
+        unit = str(facts.get("unit") or service_config.get("systemd_unit") or "unknown unit")
+        result = str(facts.get("result") or "failed")
+        detail = (
+            f"Backend {service_name} ({unit}) confirmed failed: "
+            f"systemd result={result}, active_state={facts.get('active_state', 'unknown')}"
+        )[:500]
+        try:
+            slots = await async_slot_manager.get_slots(service_name)
+        except Exception:
+            return
+        owned_ids = {
+            str(slot.get("job_id") or "")
+            for slot in (slots or {}).values()
+            if isinstance(slot, dict) and slot.get("status") == "busy" and slot.get("job_id")
+        }
+        for job_id in owned_ids:
+            try:
+                tracked = _coordinator_job_dict(job_tracker.get_job(job_id)) or {}
+                if (
+                    tracked.get("status") != "in_flight"
+                    or tracked.get("service_name") != service_name
+                    or tracked.get("source") != "pipeline_coordinator_child"
+                ):
+                    continue
+                # Re-read before writing so terminal/cancelled/successor state wins.
+                current = _coordinator_job_dict(job_tracker.get_job(job_id)) or {}
+                if (
+                    current.get("status") != "in_flight"
+                    or current.get("service_name") != service_name
+                    or current.get("source") != "pipeline_coordinator_child"
+                ):
+                    continue
+                job_tracker.update_status(
+                    job_id,
+                    "failed",
+                    error=detail,
+                    error_type="backend_died",
+                    backend_service=service_name,
+                    backend_unit=unit,
+                    backend_systemd_result=result[:100],
+                    backend_active_state=str(facts.get("active_state") or "")[:40],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Supervisor: could not terminalize accepted child %s after %s failure: %s",
+                    job_id, service_name, type(exc).__name__,
+                )
+
     async def run(self):
         """Event-driven pool management with periodic validation."""
         self._running = True
@@ -17132,6 +11880,14 @@ class WorkerSupervisor:
             health_path = svc_cfg.get("health_path") or "/health"
             is_healthy = await self._check_health(port, health_path=health_path)
 
+            if not is_healthy and not (
+                event_bus is not None and event_bus.is_planned_stop(svc_name)
+            ):
+                failure_facts = await self._backend_failure_facts(svc_cfg)
+                await self._terminalize_accepted_backend_jobs(
+                    svc_name, svc_cfg, failure_facts
+                )
+
             if is_healthy:
                 # Phase 5.2.6: clear any leftover planned_stop stamp. The
                 # 5.1.5 design relied on TTL expiry, but the probe-side
@@ -17295,21 +12051,99 @@ class WorkerSupervisor:
                     for rg in routing_groups:
                         pending = await async_queue.get_pending(svc_name, routing_group=rg)
                         pending_max_idle_ms = _pending_reaper_max_idle_ms(svc_cfg)
+                        orphan_ttl_ms = _pending_orphan_ttl_ms(svc_cfg)
                         for p in pending:
-                            # Pending entries must use the same service-specific lease as
-                            # the SlotManager. The 15-minute floor preserves the historical
-                            # protection for ordinary Krea jobs, while long parent-owned
-                            # Krea → QC → Qwen → QC jobs inherit ComfyUI's bounded lease.
+                            # PEL idle proves that the claim stopped being renewed;
+                            # stream ID age proves this is an old submission. Require
+                            # both so a recently claimed/continued job is never requeued.
+                            entry_age_ms = _pending_entry_submission_age_ms(
+                                p.get("entry_id", ""),
+                                submitted_at_ms=p.get("entry_created_ms"),
+                            )
                             if p.get("idle_ms", 0) > pending_max_idle_ms:
                                 entry_id = p.get("entry_id", "")
+                                job_id = str(p.get("job_id") or "")
+                                if not job_id or job_tracker is None:
+                                    logger.info(
+                                        "Reaper: preserving %s on %s/%s; ownership evidence unavailable",
+                                        entry_id, svc_name, rg,
+                                    )
+                                    continue
+                                try:
+                                    tracked_job = await asyncio.to_thread(
+                                        job_tracker.get_job, job_id
+                                    )
+                                    if not tracked_job:
+                                        logger.info(
+                                            "Reaper: preserving %s on %s/%s; tracker unreadable or missing",
+                                            entry_id, svc_name, rg,
+                                        )
+                                        continue
+                                    active_slot = False
+                                    if async_slot_manager is not None:
+                                        slots = await async_slot_manager.get_slots(svc_name)
+                                        active_slot = any(
+                                            isinstance(slot, dict)
+                                            and slot.get("status") == "busy"
+                                            and str(slot.get("job_id") or "") == job_id
+                                            for slot in slots.values()
+                                        )
+                                    recovery_active = job_id in _active_recovery_job_ids()
+                                    if active_slot or recovery_active:
+                                        logger.info(
+                                            "Reaper: preserving %s on %s/%s; active slot/recovery owns job=%s",
+                                            entry_id, svc_name, rg, job_id,
+                                        )
+                                        continue
+                                    if tracked_job.get("status") in {
+                                        "completed", "failed", "cancelled", "dead_lettered",
+                                    }:
+                                        logger.info(
+                                            "Reaper: preserving %s on %s/%s; tracker is terminal (%s)",
+                                            entry_id, svc_name, rg, tracked_job.get("status"),
+                                        )
+                                        continue
+                                    if tracked_job.get("status") != "in_flight":
+                                        logger.info(
+                                            "Reaper: preserving %s on %s/%s; tracker status is not reclaimable (%r)",
+                                            entry_id, svc_name, rg, tracked_job.get("status"),
+                                        )
+                                        continue
+                                except Exception:
+                                    logger.exception(
+                                        "Reaper: preserving %s; ownership inspection failed",
+                                        entry_id,
+                                    )
+                                    continue
                                 logger.warning(
                                     f"Reaper: stuck job {entry_id} on "
                                     f"{svc_name}/{rg} (idle {p['idle_ms']}ms), nacking"
                                 )
-                                await async_queue.nack(
+                                # Recently submitted stuck work keeps its retry
+                                # budget. Once the submission-age TTL expires, do
+                                # not resurrect an orphan that can evict idle baselines.
+                                retry_budget = 1 if entry_age_ms >= orphan_ttl_ms else 4
+                                recovered = await async_queue.nack(
                                     svc_name, entry_id,
-                                    routing_group=rg, max_retries=4,
+                                    routing_group=rg,
+                                    max_retries=retry_budget,
+                                    dead_letter_reason=(
+                                        "stale_orphan_ttl" if retry_budget == 1 else None
+                                    ),
+                                    orphan_tracker_key=(
+                                        job_tracker._key(job_id) if retry_budget == 1 else None
+                                    ),
+                                    orphan_slot_key=(
+                                        async_slot_manager._key(svc_name)
+                                        if retry_budget == 1 and async_slot_manager is not None
+                                        else None
+                                    ),
+                                    minimum_idle_ms=(
+                                        pending_max_idle_ms if retry_budget == 1 else None
+                                    ),
                                 )
+                                if recovered and retry_budget == 1:
+                                    logger.info("Reaper: terminalized expired orphan job=%s", job_id)
                 except Exception:
                     pass
         except Exception as e:
@@ -17450,6 +12284,8 @@ class WorkerSupervisor:
             if svc == dead_service:
                 continue
             svc_cfg_for_health = _services_config.get("services", {}).get(svc, {})
+            if not _MEMBER_REPORTER.probeable(svc, svc_cfg_for_health):
+                continue
             port = svc_cfg_for_health.get("port")
             # PR4 fix: respect per-service health_path.
             health_path = svc_cfg_for_health.get("health_path") or "/health"
@@ -17511,7 +12347,8 @@ class ModelValidator:
         if task_hint and task_hint in self.rules:
             rule = self.rules[task_hint]
 
-            if "require" in rule and model_id != rule["require"]:
+            if ("require" in rule and model_id != rule["require"]
+                    and self._find_model(rule["require"])):
                 return {
                     "ok": False,
                     "action": "upgrade",
@@ -17521,6 +12358,11 @@ class ModelValidator:
 
             if "never_fallback_to" in rule and model_id in rule["never_fallback_to"]:
                 preferred = rule.get("prefer", rule.get("require"))
+                if not (preferred and self._find_model(preferred)):
+                    preferred = None
+            else:
+                preferred = None
+            if preferred:
                 return {
                     "ok": False,
                     "action": "upgrade",
@@ -17545,13 +12387,32 @@ class ModelValidator:
 
         if requirements and requirements.get("min_complexity") == "high":
             if caps.get("min_complexity") == "low":
-                return {
-                    "ok": False, "action": "upgrade",
-                    "reason": f"{model_id} is too small for high-complexity work",
-                    "suggested_model": "qwen-35b"
-                }
+                better = self._eligible_upgrade(model_id, requirements)
+                if better:
+                    return {
+                        "ok": False, "action": "upgrade",
+                        "reason": f"{model_id} is too small for high-complexity work",
+                        "suggested_model": better
+                    }
 
         return {"ok": True, "action": "route"}
+
+    def _eligible_upgrade(self, model_id: str, requirements: dict) -> str | None:
+        """Largest-context local instance in this registry that is not low-complexity."""
+        local = self.providers.get("local", {}).get("instances", {})
+        best = None
+        for name, inst in local.items():
+            caps = inst.get("capabilities", {})
+            if name == model_id or caps.get("min_complexity") == "low":
+                continue
+            if requirements.get("min_context", 0) > inst.get("context_length", 0):
+                continue
+            if requirements.get("require_vision") and not caps.get("vision"):
+                continue
+            key = (-inst.get("context_length", 0), name)
+            if best is None or key < best[0]:
+                best = (key, name)
+        return best[1] if best else None
 
     def _find_model(self, model_id: str) -> dict | None:
         """Find a model across all providers (local + cloud)."""
@@ -17593,6 +12454,353 @@ _model_validator: ModelValidator | None = None
 async def handle_liveness(request: web.Request):
     """GET /health/live — cheap process liveness for container supervision."""
     return web.json_response({"status": "ok"})
+
+
+_OBSERVABILITY_EVENT_LIMIT = 500
+_observability_events = deque(maxlen=_OBSERVABILITY_EVENT_LIMIT)
+_observability_event_lock = Lock()
+_observability_event_sequence = 0
+
+
+def _record_transition_event(
+    event_type: str,
+    resource: str,
+    from_state: str | None,
+    to_state: str | None,
+    *,
+    transition: str | None = None,
+) -> None:
+    """Append a bounded, secret-free structured lifecycle/node event."""
+    global _observability_event_sequence
+    with _observability_event_lock:
+        _observability_event_sequence += 1
+        event = {
+            "event_id": _observability_event_sequence,
+            "timestamp": time.time(),
+            "event_type": str(event_type)[:64],
+            "resource": str(resource or "")[:128],
+            "from_state": str(from_state)[:64] if from_state is not None else None,
+            "to_state": str(to_state)[:64] if to_state is not None else None,
+        }
+        if transition is not None:
+            event["transition"] = str(transition)[:64]
+        _observability_events.append(event)
+    logger.info("gpu_manager_transition %s", json.dumps(event, sort_keys=True, separators=(",", ":")))
+
+
+def _transition_events(limit: int = 100) -> list[dict]:
+    """Return a bounded copy of newest events, oldest first."""
+    bounded = max(1, min(int(limit), _OBSERVABILITY_EVENT_LIMIT))
+    with _observability_event_lock:
+        return [dict(event) for event in list(_observability_events)[-bounded:]]
+
+
+def _safe_counter(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if result >= 0 else None
+
+
+def _gpu_capacity_snapshot(config: Any, telemetry: Any, observed_at: float) -> dict:
+    """Project configured devices beside measured telemetry without inventing zeros."""
+    devices = config.get("gpu_devices", {}) if isinstance(config, Mapping) else {}
+    devices = devices if isinstance(devices, Mapping) else {}
+    telemetry_ok = isinstance(telemetry, list)
+    all_telemetry_rows = [row for row in telemetry if isinstance(row, Mapping)] if telemetry_ok else []
+
+    def is_integrated_gpu(device: Mapping) -> bool:
+        return device.get("gpu_type") == "iGPU" or device.get("integrated") is True
+
+    # Integrated graphics remain in device/identity telemetry for display, but
+    # they do not represent discrete accelerator capacity. Keep the filter
+    # local to this capacity projection rather than changing _detect_gpus().
+    integrated_rows = [row for row in all_telemetry_rows if is_integrated_gpu(row)]
+    telemetry_rows = [row for row in all_telemetry_rows if not is_integrated_gpu(row)]
+    rows: list[dict] = []
+    matched_cards: set[str] = set()
+
+    configured = list(devices.items())
+    if not configured:
+        configured = [
+            (str(row.get("gpu_id") or row.get("card") or f"gpu-{index}"), {})
+            for index, row in enumerate(telemetry_rows)
+        ]
+    else:
+        def matches_integrated(device_id: Any, raw_config: Any) -> bool:
+            config = raw_config if isinstance(raw_config, Mapping) else {}
+            card = str(config.get("card") or "")
+            pci = str(config.get("pci") or "").lower()
+            if is_integrated_gpu(config):
+                return True
+            return any(
+                (card and card == str(row.get("card") or ""))
+                or str(device_id) == str(row.get("gpu_id") or "")
+                or (pci and pci == str(row.get("pci_address") or "").lower())
+                for row in integrated_rows
+            )
+        configured = [
+            (device_id, config) for device_id, config in configured
+            if not matches_integrated(device_id, config)
+        ]
+
+    for device_id, raw_config in configured:
+        device_config = raw_config if isinstance(raw_config, Mapping) else {}
+        card = str(device_config.get("card") or "")
+        pci = str(device_config.get("pci") or "").lower()
+        observed = next((row for row in telemetry_rows
+                         if (card and row.get("card") == card)
+                         or str(row.get("gpu_id") or "") == str(device_id)
+                         or (pci and str(row.get("pci_address") or "").lower() == pci)), None)
+        if observed is None:
+            rows.append({
+                "gpu_id": str(device_id),
+                "status": "missing" if telemetry_ok else "unknown",
+                "capacity_state": "unknown",
+                "reason": "configured_device_not_observed" if telemetry_ok else "gpu_telemetry_unavailable",
+                "vram_total_mib": None,
+                "vram_used_mib": None,
+                "vram_free_mib": None,
+                "observed_at": observed_at if telemetry_ok else None,
+            })
+            continue
+
+        if observed.get("card"):
+            matched_cards.add(str(observed["card"]))
+        total = _safe_counter(observed.get("vram_total_mib"))
+        used = _safe_counter(observed.get("vram_used_mib"))
+        # _detect_gpus retains a legacy vram_free_mib=0 when the used counter
+        # is unreadable. Only derive free capacity when both source readings exist.
+        measured = total is not None and total > 0 and used is not None and used <= total
+        rows.append({
+            "gpu_id": str(device_id),
+            "status": str(observed.get("status") or "observed"),
+            "capacity_state": "measured" if measured else "unknown",
+            "reason": None if measured else "vram_measurement_incomplete",
+            "vram_total_mib": total if total and total > 0 else None,
+            "vram_used_mib": used if measured else None,
+            "vram_free_mib": total - used if measured else None,
+            "observed_at": observed_at,
+        })
+
+    # Include measured devices absent from a partial registry; do not silently
+    # discard runtime hardware merely because configuration is stale.
+    configured_cards = {str((cfg or {}).get("card") or "") for _, cfg in configured if isinstance(cfg, Mapping)}
+    for index, observed in enumerate(telemetry_rows):
+        card = str(observed.get("card") or "")
+        if card and (card in matched_cards or card in configured_cards):
+            continue
+        total = _safe_counter(observed.get("vram_total_mib"))
+        used = _safe_counter(observed.get("vram_used_mib"))
+        measured = total is not None and total > 0 and used is not None and used <= total
+        rows.append({
+            "gpu_id": str(observed.get("gpu_id") or card or f"gpu-{index}"),
+            "status": str(observed.get("status") or "observed"),
+            "capacity_state": "measured" if measured else "unknown",
+            "reason": None if measured else "vram_measurement_incomplete",
+            "vram_total_mib": total if total and total > 0 else None,
+            "vram_used_mib": used if measured else None,
+            "vram_free_mib": total - used if measured else None,
+            "observed_at": observed_at,
+        })
+
+    measured_rows = [row for row in rows if row["capacity_state"] == "measured"]
+    unknown_count = len(rows) - len(measured_rows)
+    if rows and unknown_count == 0:
+        state = "measured"
+    elif measured_rows:
+        state = "partial"
+    else:
+        state = "unknown"
+    known_free = sum(row["vram_free_mib"] for row in measured_rows)
+    return {
+        "status": state,
+        "gpu_count": len(rows),
+        "measured_gpu_count": len(measured_rows),
+        "unknown_gpu_count": unknown_count,
+        "measured_free_vram_mib": known_free,
+        "free_vram_mib": known_free if rows and unknown_count == 0 else None,
+        "gpus": rows,
+        "observed_at": observed_at if telemetry_ok else None,
+    }
+
+
+def _node_lease_snapshot(request: web.Request) -> dict:
+    """Return live node leases without peer endpoints, lease tokens, or host IPs."""
+    api = request.app.get("gpu_manager_node_api")
+    registry = getattr(api, "registry", None)
+    snapshot = getattr(registry, "snapshot", None)
+    if not callable(snapshot):
+        return {"status": "unknown", "reason": "node_registry_unavailable", "nodes": []}
+    try:
+        try:
+            raw_nodes = snapshot(include_expired=True)
+        except TypeError:
+            raw_nodes = snapshot()
+    except Exception:
+        logger.exception("node registry snapshot failed")
+        return {"status": "unknown", "reason": "node_registry_unavailable", "nodes": []}
+    nodes = []
+    for item in raw_nodes if isinstance(raw_nodes, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        caps = item.get("caps") if isinstance(item.get("caps"), Mapping) else {}
+        hardware = item.get("hardware") if isinstance(item.get("hardware"), Mapping) else {}
+        gpus = []
+        for gpu in hardware.get("gpus", []) if isinstance(hardware.get("gpus", []), list) else []:
+            if isinstance(gpu, Mapping):
+                gpus.append({key: gpu[key] for key in ("id", "name", "vram_total_mib") if key in gpu})
+        expires_in = max(0.0, float(item.get("expires_in_seconds") or 0))
+        lease_state = "expired" if expires_in <= 0 else ("draining" if item.get("draining") is True else "active")
+        nodes.append({
+            "node_id": str(item.get("node_id") or ""),
+            "lease_state": lease_state,
+            "expires_in_seconds": expires_in,
+            "sequence": _safe_counter(item.get("sequence")),
+            "caps": {key: _safe_counter(caps.get(key)) for key in ("available_slots", "free_vram_mib", "active_requests")},
+            "hardware": {
+                "models": [str(name)[:128] for name in hardware.get("models", [])[:32]
+                           if isinstance(name, str)] if isinstance(hardware.get("models", []), list) else [],
+                "platform": str(hardware.get("platform") or "")[:128],
+                "gpus": gpus,
+            },
+        })
+    return {
+        "status": "observed",
+        "active_count": sum(node["lease_state"] == "active" for node in nodes),
+        "draining_count": sum(node["lease_state"] == "draining" for node in nodes),
+        "expired_count": sum(node["lease_state"] == "expired" for node in nodes),
+        "nodes": nodes,
+        "observed_at": time.time(),
+    }
+
+
+def _queue_counters_snapshot() -> dict:
+    manager = globals().get("llm")
+    counters = {
+        "active_requests": _safe_counter(getattr(manager, "active_requests", None)) if manager else None,
+        "pending_requests": _safe_counter(getattr(manager, "queued_requests", None)) if manager else None,
+        "total_served": _safe_counter(globals().get("_queue_total_served")),
+    }
+    known = sum(value is not None for value in counters.values())
+    return {"status": "observed" if known else "unknown", **counters}
+
+
+def _oom_counters_snapshot_for_api(now: float | None = None) -> dict:
+    sample_time = time.time() if now is None else float(now)
+    try:
+        events = _recent_oom_events(limit=500)
+        if not isinstance(events, list):
+            raise ValueError("OOM event reader returned non-list")
+        recent = [event for event in events if isinstance(event, Mapping)]
+        unresolved_states = {"detected", "draining", "verifying", "recovering", "oom_failed", "permanent_failed"}
+        states = globals().get("_gpu_states", {})
+        unresolved = sum(
+            str(getattr(state, "oom_state", "idle")) in unresolved_states
+            for state in states.values()
+        ) if isinstance(states, Mapping) else None
+        return {
+            "status": "observed",
+            "recent_event_count": len(recent),
+            "events_last_hour": sum(
+                0 <= sample_time - float(event.get("ts", 0) or 0) < 3600
+                for event in recent
+            ),
+            "unresolved_gpu_count": unresolved,
+        }
+    except Exception:
+        return {"status": "unknown", "recent_event_count": None,
+                "events_last_hour": None, "unresolved_gpu_count": None}
+
+
+def _admission_state_snapshot() -> dict:
+    """Expose the exact OOM states that currently close GPU admission."""
+    states = globals().get("_gpu_states")
+    if not isinstance(states, Mapping):
+        return {"status": "unknown", "closed": None, "closed_gpu_ids": []}
+    closed_states = {"detected", "draining", "verifying", "recovering", "oom_failed", "permanent_failed"}
+    closed_gpu_ids = sorted(
+        str(gpu_id)[:128] for gpu_id, state in states.items()
+        if str(getattr(state, "oom_state", "idle")) in closed_states
+    )
+    return {"status": "observed", "closed": bool(closed_gpu_ids), "closed_gpu_ids": closed_gpu_ids}
+
+
+async def _observability_snapshot(request: web.Request) -> dict:
+    now = time.time()
+    telemetry = None
+    try:
+        sample = await _poll_vram()
+        if isinstance(sample, Mapping) and not sample.get("error") and isinstance(sample.get("gpus"), list):
+            telemetry = sample["gpus"]
+    except Exception:
+        logger.exception("GPU capacity telemetry is unavailable")
+    try:
+        config = _load_services_config()
+    except Exception:
+        config = {}
+    gpu_capacity = _gpu_capacity_snapshot(config, telemetry, now)
+    nodes = _node_lease_snapshot(request)
+    return {
+        "schema_version": 1,
+        "observed_at": now,
+        "gpu_capacity": gpu_capacity,
+        "nodes": nodes,
+        "queue": _queue_counters_snapshot(),
+        "oom": _oom_counters_snapshot_for_api(now),
+        "admission": _admission_state_snapshot(),
+        "transition_event_count": len(_transition_events()),
+    }
+
+
+async def handle_capacity(request: web.Request):
+    """GET /capacity — authenticated measured/unknown GPU and queue capacity."""
+    return web.json_response(await _observability_snapshot(request))
+
+
+async def handle_nodes(request: web.Request):
+    """GET /nodes — authenticated live node lease and drain state."""
+    return web.json_response(_node_lease_snapshot(request))
+
+
+async def handle_transition_events(request: web.Request):
+    """GET /events — bounded authenticated structured lifecycle transitions."""
+    try:
+        limit = int(request.query.get("limit", "100"))
+    except (TypeError, ValueError):
+        return web.json_response({"error": "invalid_limit"}, status=400)
+    if not 1 <= limit <= _OBSERVABILITY_EVENT_LIMIT:
+        return web.json_response({"error": "invalid_limit"}, status=400)
+    events = _transition_events(limit)
+    return web.json_response({"schema_version": 1, "count": len(events), "events": events})
+
+
+async def handle_observability_metrics(request: web.Request):
+    """JSON metrics projection for measured capacity, queue, OOM, and leases."""
+    snapshot = await _observability_snapshot(request)
+    return web.json_response({
+        "schema_version": snapshot["schema_version"],
+        "observed_at": snapshot["observed_at"],
+        "gpu_capacity": snapshot["gpu_capacity"],
+        "nodes": snapshot["nodes"],
+        "queue": snapshot["queue"],
+        "oom": snapshot["oom"],
+        "admission": snapshot["admission"],
+        "transition_event_count": snapshot["transition_event_count"],
+    })
+
+
+def _register_observability_routes(app: web.Application) -> None:
+    """Register the health/capacity/node/event routes on the authenticated app."""
+    app.router.add_get("/health/live", handle_liveness)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/capacity", handle_capacity)
+    app.router.add_get("/nodes", handle_nodes)
+    app.router.add_get("/events", handle_transition_events)
+    app.router.add_get("/v1/metrics/observability", handle_observability_metrics)
 
 
 def _queue_authority_snapshot() -> dict[str, Any]:
@@ -17655,6 +12863,22 @@ def _queue_authority_snapshot() -> dict[str, Any]:
 
 async def handle_health(request: web.Request):
     """GET /health — overall status including GPU state machine."""
+    if (
+        _scoped_gemma_request_is_authorized(request)
+        or _honcho_gemma_request_is_authorized(request)
+    ):
+        # Scoped pre-claim probes must reflect actual broker readiness, not the
+        # generic controller liveness response or private fleet telemetry.
+        try:
+            _, code = _CombinedGemmaAPIProxy().health_ready()
+        except Exception:
+            code = 503
+        ready = code == 200
+        return web.json_response(
+            {"status": "ok" if ready else "unavailable"},
+            status=200 if ready else 503,
+            headers={"Cache-Control": "no-store"},
+        )
     status = llm.status()
     status["queue_total_served"] = _queue_total_served
     status["scheduler"] = scheduler.get_queue_status() if scheduler else {}
@@ -17721,6 +12945,13 @@ async def handle_health(request: web.Request):
     # reaper that cannot tick is not healthy.
     status["orphan_reaper"] = _orphan_reaper_status()
     _apply_runtime_semantics(status, readiness)
+    observability = await _observability_snapshot(request)
+    status["gpu_capacity"] = observability["gpu_capacity"]
+    status["nodes"] = observability["nodes"]
+    status["queue_counters"] = observability["queue"]
+    status["oom_counters"] = observability["oom"]
+    status["admission"] = observability["admission"]
+    status["transition_event_count"] = observability["transition_event_count"]
     return web.json_response(status)
 
 
@@ -18036,6 +13267,223 @@ def _submit_request_envelope(code: str, message: str, *, status: int) -> web.Res
     return web.json_response(envelope, status=status)
 
 
+# ── Admission + placement gate (GPU Manager v2) ────────────────────
+# Every request that could trigger a model load or eviction is checked here
+# BEFORE any queue claim, capacity reservation, eviction or unload.
+# GPUScheduler remains the sole allocator: PlacementOrchestrator only vets the
+# placement (all participating GPUs before any eviction) and never evicts.
+_placement_orchestrator: PlacementOrchestrator | None = None
+
+
+def _get_placement_orchestrator() -> PlacementOrchestrator:
+    global _placement_orchestrator
+    if _placement_orchestrator is None:
+        _placement_orchestrator = PlacementOrchestrator({})
+    return _placement_orchestrator
+
+
+def _admission_telemetry() -> dict | None:
+    """Live GPU telemetry for admission; None when it cannot be read."""
+    try:
+        return {"gpus": _detect_gpus()}
+    except Exception as exc:
+        logger.warning("ADMISSION: telemetry unavailable: %s", exc)
+        return None
+
+
+def _admission_rejection_response(reason: str, alternative: dict | None) -> web.Response:
+    return web.json_response(
+        {
+            "status": "rejected",
+            "error": reason,
+            "code": "admission_rejected",
+            "reason": reason,
+            # No device can host it: the CPU route is the nearest alternative.
+            "nearest_alternative": alternative or {"device": "cpu"},
+        },
+        status=422,
+    )
+
+
+def _admission_gate(
+    service_name: str | None,
+    data: Mapping[str, Any] | None = None,
+) -> tuple[web.Response | None, dict | None]:
+    """Admission + placement check. Returns (rejection_response, info).
+
+    rejection_response is not None only for ``rejected``; ``queued`` returns
+    (None, {"status": "queued", ...}) so the caller continues into its
+    existing queue path (the scheduler performs any eviction later); accepted
+    returns (None, {"status": "accepted", ...}). Requests that do not target a
+    GPU-backed service (CPU Gemma, unknown names, routing groups) pass through
+    untouched. A failure inside the gate itself never takes the service down.
+    """
+    data = data or {}
+    try:
+        config = _services_config or {}
+        services = config.get("services", {}) or {}
+        svc = services.get(service_name or "") or {}
+        model_set = data.get("model_set") if isinstance(data.get("model_set"), Mapping) else None
+        gpu_id = svc.get("gpu_id")
+        requested_gpu_ids = {str(gpu_id)} if gpu_id else set()
+        if model_set:
+            for component in model_set.get("components", []) or []:
+                if isinstance(component, Mapping) and component.get("device"):
+                    requested_gpu_ids.add(str(component["device"]))
+        for requested_gpu_id in requested_gpu_ids:
+            state = _gpu_states.get(requested_gpu_id)
+            oom_state = str(getattr(state, "oom_state", "idle")) if state is not None else "idle"
+            if oom_state in {"detected", "draining", "verifying", "recovering", "oom_failed", "permanent_failed"}:
+                return _admission_rejection_response(
+                    f"GPU {requested_gpu_id} OOM recovery unresolved ({oom_state})",
+                    {"device": "cpu"},
+                ), None
+        if not model_set and not gpu_id:
+            return None, None
+
+        telemetry = _admission_telemetry()
+        gpu_devices = config.get("gpu_devices", {}) or {}
+        registry = {}
+        for dev_id, dev_cfg in gpu_devices.items():
+            telem_dev = None
+            for g in (telemetry or {}).get("gpus", []):
+                if g.get("card") and g.get("card") == (dev_cfg or {}).get("card"):
+                    telem_dev = g
+                    break
+            registry[dev_id] = recognize_hardware_device(dev_id, dev_cfg or {}, telem_dev)
+
+        controller = AdmissionController(registry)
+        orchestrator = _get_placement_orchestrator()
+        orchestrator.hardware_registry = dict(registry)
+
+        if model_set:
+            decision = orchestrator.place_model_set(
+                model_set,
+                {
+                    gid: {
+                        "loaded_bundle": st.loaded_bundle,
+                        "bundle_priority": st.bundle_priority,
+                        "state": st.state,
+                    }
+                    for gid, st in _gpu_states.items()
+                },
+                queue_depth=0,
+            )
+            if decision.status == PlacementDecisionStatus.REJECTED:
+                return _admission_rejection_response(decision.reason, decision.nearest_alternative), None
+            if decision.status == PlacementDecisionStatus.QUEUED:
+                return None, {"status": "queued", "position": decision.position, "reason": decision.reason}
+            if decision.lease:
+                orchestrator.release_lease(decision.lease.lease_id)
+                orchestrator._active_leases.pop(decision.lease.lease_id, None)
+            return None, {"status": "accepted", "placement": dict(decision.lease.allocations) if decision.lease else {}}
+
+        admission_request = {
+            "kind": "llm",
+            "service": service_name,
+            "model": service_name,
+            "device": gpu_id,
+            "precision": svc.get("precision") or data.get("precision") or "",
+            "compute_api": svc.get("compute_api") or "rocm",
+            "min_vram_mib": int(
+                data.get("min_vram_mib") or svc.get("min_vram_mib") or svc.get("vram_mib") or 0
+            ),
+        }
+        decision = controller.evaluate_admission(admission_request, config, telemetry)
+        if decision.status == AdmissionStatus.REJECTED:
+            return _admission_rejection_response(decision.reason, decision.nearest_alternative), None
+        if decision.status == AdmissionStatus.QUEUED:
+            return None, decision.to_dict()
+
+        orchestrator.hardware_registry = dict(controller.hardware_registry)
+        placement = orchestrator.place_model_set(
+            {
+                "id": service_name,
+                "components": [{
+                    "device": gpu_id,
+                    "model": service_name,
+                    "precision": admission_request["precision"],
+                    "min_vram_mib": admission_request["min_vram_mib"],
+                }],
+            },
+            {},
+        )
+        if placement.lease:
+            orchestrator.release_lease(placement.lease.lease_id)
+            orchestrator._active_leases.pop(placement.lease.lease_id, None)
+        if placement.status == PlacementDecisionStatus.REJECTED:
+            return _admission_rejection_response(placement.reason, placement.nearest_alternative), None
+        if placement.status == PlacementDecisionStatus.QUEUED:
+            return None, {"status": "queued", "position": placement.position, "reason": placement.reason}
+        return None, decision.to_dict()
+    except Exception:
+        logger.exception("ADMISSION: gate error; falling through to existing routing")
+        return None, None
+
+
+def _service_gpu_transitioning(service_name: str | None) -> bool:
+    """True while the service's GPU is evicting, loading or draining."""
+    svc = ((_services_config or {}).get("services") or {}).get(service_name or "") or {}
+    gpu_id = svc.get("gpu_id")
+    state = _gpu_states.get(gpu_id) if gpu_id else None
+    return bool(
+        state is not None
+        and (state.evicting or state.loading or state.draining)
+    )
+
+
+async def _queue_position_fields(
+    service_name: str | None,
+    routing_group: str | None,
+    entry_id: str | None,
+    job: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Additive queue fields for submit and job-status responses.
+
+    ``queue_reason`` always says why the job has not started. ``queue_ahead`` is
+    the exact count of undelivered entries ahead of this one and appears only
+    when the broker can prove it; ``queue_position_exact`` is False when
+    priority lanes or the scan cap make it a lower bound. The historical
+    ``queue_position``/``position`` depth fields are left untouched.
+    """
+    fields: dict[str, Any] = {
+        "queue_reason": _queue_reason_code(
+            job, gpu_transitioning=_service_gpu_transitioning(service_name)
+        )
+    }
+    getter = getattr(queue_engine, "get_entry_position", None) if queue_engine else None
+    if entry_id and service_name and callable(getter):
+        try:
+            loop = asyncio.get_running_loop()
+            observed = await loop.run_in_executor(
+                None, getter, service_name, entry_id, routing_group or None
+            )
+        except Exception:
+            observed = None
+        if isinstance(observed, dict) and observed.get("known") is True:
+            fields["queue_ahead"] = observed.get("ahead")
+            fields["queue_position_exact"] = bool(observed.get("exact"))
+    return fields
+
+
+def _queue_recovery_summary() -> dict[str, Any]:
+    """Recovery counters and the bounds they run under, for GET /v1/queue."""
+    return {
+        "counters": dict(_queue_recovery_stats),
+        "restart_requeue_max": RESTART_REQUEUE_MAX,
+        "evicting_stale_after_s": EVICTING_STALE_AFTER_S,
+        "generation_poll_deadline_max_s": GENERATION_POLL_DEADLINE_MAX_S,
+        "process_started_at": _PROCESS_STARTED_AT,
+    }
+
+
+def _admission_fields(info: dict | None) -> dict:
+    """Additive response fields describing a queued admission."""
+    if not info or info.get("status") != "queued":
+        return {}
+    return {"admission": {k: info.get(k) for k in ("status", "position", "reason")}}
+
+
 async def handle_submit_job(request: web.Request):
     """POST /v1/submit — Submit a job to the Redis queue."""
     _owner_fence = _queue_owner_route_fence('durable', '/v1/submit')
@@ -18113,6 +13561,14 @@ async def handle_submit_job(request: web.Request):
 
     if not routing_group:
         return web.json_response({"error": "model or routing_group required"}, status=400)
+
+    # Admission + placement BEFORE any capacity reservation / queue claim.
+    _admission_target = model or (
+        routing_group if routing_group in _services_config.get("services", {}) else ""
+    )
+    _admission_rejection, _admission_info = _admission_gate(_admission_target, data)
+    if _admission_rejection is not None:
+        return _admission_rejection
 
     # Use RoutingEngine to find best service, with health awareness
     # Try each candidate in the routing group until we find one that's healthy
@@ -18397,12 +13853,15 @@ async def handle_submit_job(request: web.Request):
     _svc_speed = int(_svc_cfg_final.get("speed", 50))
     estimated_wait_secs = int(queue_depth * (200 / max(_svc_speed, 1)))
     estimated_wait = f"~{estimated_wait_secs}s"
+    _queue_fields = await _queue_position_fields(service_name, routing_group, entry_id)
 
     return web.json_response({
         "job_id": job_id,
         "status": "queued",
         "service": service_name,
         "queue_position": queue_depth,
+        **_queue_fields,
+        **_admission_fields(_admission_info),
         "estimated_wait": estimated_wait,
         "routing_group": routing_group,
         "priority": _priority_payload["priority"],
@@ -18430,6 +13889,11 @@ async def handle_submit_job(request: web.Request):
 # removing the need for a controller edit per new service.
 _GENERATION_ROUTING_GROUPS = frozenset({
     "image-gen", "video-gen", "comfyui-gen", "qwen-edit-gen",
+    # Audio services registered in services.json must pass the generation
+    # ingress whitelist before dispatch.
+    "apollo-restoration-gen",
+    "audio-separation-gen",
+    "resemble-enhance-gen",
 })
 
 # Reviewed in-process queue consumers. A service may select one of these
@@ -19605,185 +15069,6 @@ def _resolve_inject_keys(tmpl: dict) -> tuple:
     return tuple((str(k[0]), str(k[1]), str(k[2])) for k in keys)
 
 
-# ── Open Design prompt-enhancement helper ────────────────────────
-# When the template declares `prompt_enhance.enabled = true`, this
-# helper POSTs the raw prompt to OD's `/api/runs` (port 17456), polls
-# the run to terminal status, reads the accumulated assistant text
-# from the conversation messages endpoint, and returns it.
-#
-# Any failure (OD down, timeout, run failure, empty text, missing
-# project) logs a single warning and returns None — the caller falls
-# through to the existing direct caption adapter. OD is a latency
-# optimisation, never a correctness dependency.
-_OD_BASE_URL = "http://127.0.0.1:17456"
-_OD_PROJECT_BOOTSTRAP_DONE: set[str] = set()
-
-
-async def _ensure_od_project(project_id: str, design_system_id) -> bool:
-    """Create the OD project on first use if it doesn't exist.
-
-    Idempotent: returns True if `project_id` already exists or was just
-    created; False on any failure (which causes the caller to fall
-    through to the direct adapter).
-    """
-    global _OD_PROJECT_BOOTSTRAP_DONE
-    if project_id in _OD_PROJECT_BOOTSTRAP_DONE:
-        return True
-    try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=2.0, connect=1.0)
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            # list projects; check for id match
-            async with sess.get(f"{_OD_BASE_URL}/api/projects") as r:
-                if r.status != 200:
-                    return False
-                data = await r.json()
-            existing = {p.get("id") for p in (data.get("projects") or [])}
-            if project_id in existing:
-                _OD_PROJECT_BOOTSTRAP_DONE.add(project_id)
-                return True
-            # create it
-            body = {"name": project_id, "id": project_id}
-            if design_system_id:
-                body["designSystemId"] = design_system_id
-            async with sess.post(
-                f"{_OD_BASE_URL}/api/projects", json=body
-            ) as r:
-                if r.status not in (200, 201):
-                    logger.warning(
-                        "od_enhance: project_create_failed id=%s status=%s",
-                        project_id, r.status,
-                    )
-                    return False
-                _OD_PROJECT_BOOTSTRAP_DONE.add(project_id)
-                logger.info("od_enhance: project_created id=%s", project_id)
-                return True
-    except Exception as e:
-        logger.warning("od_enhance: project_bootstrap_failed err=%s", e)
-        return False
-
-
-async def _od_health_check(sess) -> bool:
-    """Quick health probe. Returns True if OD reports healthy."""
-    try:
-        async with sess.get(f"{_OD_BASE_URL}/api/health") as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-
-async def _od_submit_run(sess, body: dict):
-    """POST /api/runs. Returns the run dict or None on failure."""
-    try:
-        async with sess.post(f"{_OD_BASE_URL}/api/runs", json=body) as r:
-            if r.status not in (200, 201, 202):
-                logger.warning(
-                    "od_enhance: skipped reason=submit_failed status=%s", r.status,
-                )
-                return None
-            return await r.json()
-    except Exception as e:
-        logger.warning("od_enhance: submit_error err=%s", e)
-        return None
-
-
-async def _od_poll_run(sess, run_id: str, timeout_s: float):
-    """Poll /api/runs/<id> until terminal or timeout. Returns final status dict or None."""
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout_s
-    terminal_status = None
-    while loop.time() < deadline:
-        try:
-            async with sess.get(f"{_OD_BASE_URL}/api/runs/{run_id}") as r:
-                if r.status != 200:
-                    break
-                terminal_status = await r.json()
-        except Exception:
-            break
-        if terminal_status and terminal_status.get("status") in (
-            "succeeded", "failed", "canceled"
-        ):
-            return terminal_status
-        await asyncio.sleep(0.2)
-    # timeout — best-effort cancel
-    try:
-        async with sess.post(f"{_OD_BASE_URL}/api/runs/{run_id}/cancel"):
-            pass
-    except Exception:
-        pass
-    logger.warning(
-        "od_enhance: skipped reason=submit_timeout run_id=%s", run_id,
-    )
-    return None
-
-
-def _extract_od_assistant_text(messages_payload, run_id: str) -> str | None:
-    """Accept legacy message arrays and current {messages: [...]} payloads."""
-    if isinstance(messages_payload, dict):
-        messages = messages_payload.get("messages") or []
-    elif isinstance(messages_payload, list):
-        messages = messages_payload
-    else:
-        messages = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if message.get("runId") == run_id and message.get("role") == "assistant":
-            text = (message.get("content") or "").strip()
-            if text:
-                return text
-    return None
-
-
-async def _od_fetch_assistant_text(
-    sess, project_id: str, run_id: str, conversation_id,
-):
-    """GET messages endpoint; return the assistant text for run_id, or None."""
-    if not conversation_id:
-        logger.warning(
-            "od_enhance: skipped reason=no_conversation_id run_id=%s", run_id,
-        )
-        return None
-    try:
-        async with sess.get(
-            f"{_OD_BASE_URL}/api/projects/{project_id}"
-            f"/conversations/{conversation_id}/messages"
-        ) as r:
-            if r.status != 200:
-                logger.warning(
-                    "od_enhance: skipped reason=messages_fetch_failed status=%s",
-                    r.status,
-                )
-                return None
-            messages_payload = await r.json()
-    except Exception as e:
-        logger.warning("od_enhance: messages_fetch_error err=%s", e)
-        return None
-    text = _extract_od_assistant_text(messages_payload, run_id)
-    if text:
-        return text
-    logger.warning(
-        "od_enhance: skipped reason=empty_assistant_text run_id=%s", run_id,
-    )
-    return None
-
-
-def _od_prompt_validation_error(text: str) -> str | None:
-    """Reject malformed enrichment while preserving an explicit raw fallback."""
-    if not isinstance(text, str) or not text.strip():
-        return "empty"
-    if len(text) > 12000:
-        return "too_long"
-    if "```" in text:
-        return "markdown_fence"
-    if any(
-        "\u3400" <= char <= "\u4dbf" or "\u4e00" <= char <= "\u9fff"
-        for char in text
-    ):
-        return "unexpected_cjk"
-    return None
-
-
 def _extract_json_object_text(text: str):
     """Parse a bounded JSON object, tolerating a single fenced wrapper."""
     value = (text or "").strip()
@@ -19796,53 +15081,6 @@ def _extract_json_object_text(text: str):
     except (TypeError, json.JSONDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
-
-
-def _validate_visual_qc_decision(payload):
-    """Validate OD's bounded correction decision contract."""
-    if not isinstance(payload, dict):
-        return None, "not_object"
-    decision = str(payload.get("decision") or "").strip().lower()
-    if decision not in {"pass", "edit", "review", "reject"}:
-        return None, "invalid_decision"
-    score = payload.get("score")
-    if not isinstance(score, (int, float)) or isinstance(score, bool) or not 0 <= score <= 10:
-        return None, "invalid_score"
-    issues = payload.get("issues")
-    if not isinstance(issues, list) or len(issues) > 32:
-        return None, "invalid_issues"
-    for issue in issues:
-        if not isinstance(issue, dict):
-            return None, "invalid_issue"
-        if str(issue.get("status") or "") not in {"pass", "fail", "uncertain"}:
-            return None, "invalid_issue_status"
-        if not str(issue.get("requirement") or "").strip():
-            return None, "invalid_issue_requirement"
-    instruction = str(payload.get("edit_instruction") or "").strip()
-    edit_plan = payload.get("edit_plan")
-    if edit_plan is not None:
-        if not isinstance(edit_plan, list) or len(edit_plan) > 8:
-            return None, "invalid_edit_plan"
-        for stage in edit_plan:
-            if not isinstance(stage, dict):
-                return None, "invalid_edit_stage"
-            if not str(stage.get("requirement") or "").strip():
-                return None, "invalid_edit_stage_requirement"
-            stage_instruction = str(stage.get("instruction") or "").strip()
-            if not stage_instruction or len(stage_instruction) > 1200 or "```" in stage_instruction:
-                return None, "invalid_edit_stage_instruction"
-    if decision in {"edit", "reject"} and not instruction and not edit_plan:
-        return None, "edit_instruction_required"
-    if decision == "edit" and not instruction and edit_plan:
-        instruction = str(edit_plan[0].get("instruction") or "").strip()
-        payload = dict(payload)
-        payload["edit_instruction"] = instruction
-    if len(instruction) > 2000 or "```" in instruction:
-        return None, "invalid_edit_instruction"
-    summary = str(payload.get("summary") or "").strip()
-    if len(summary) > 1000:
-        return None, "summary_too_long"
-    return payload, None
 
 
 def _derive_prompt_atomic_requirements(prompt: str) -> list[str]:
@@ -19935,23 +15173,79 @@ def _build_visual_check_plan(prompt: str, policy: dict) -> list[dict]:
 
 
 def _slot_reaper_max_age(service_config: dict) -> int:
-    """Return the bounded worker-slot lease for one service."""
+    """Return the bounded worker-slot lease for one service.
+
+    A service that polls ComfyUI workflow history is never leased for less than
+    the longest generation poll (plus margin): the reaper must not fail a job
+    whose poll loop is still legitimately running.
+    """
     timeout = int(service_config.get("forward_timeout", 600))
     grace = int(service_config.get("post_load_grace_seconds", 0) or 0)
-    return timeout + 60 + grace
+    return bounded_lease_s(
+        timeout + 60 + grace,
+        polls_workflows=service_polls_workflows(service_config),
+    )
 
 
 def _pending_reaper_max_idle_ms(service_config: dict) -> int:
-    """Return the pending-entry lease, preserving the historical 15-minute floor."""
+    """Return the pending-entry lease, preserving the historical 15-minute floor.
+
+    The same poll-deadline floor as the slot lease applies to an explicit
+    ``pending_lease_seconds`` override, so no configuration can make the PEL
+    lease expire before a generation poll deadline.
+    """
     admission = service_config.get("admission", {}) or {}
+    polls = service_polls_workflows(service_config)
     if isinstance(admission, Mapping) and admission.get("pending_lease_seconds") is not None:
         try:
             requested = int(admission["pending_lease_seconds"])
         except (TypeError, ValueError):
             requested = 0
         if requested > 0:
-            return max(60_000, requested * 1000)
+            return max(60_000, bounded_lease_s(requested, polls_workflows=polls) * 1000)
     return max(900_000, _slot_reaper_max_age(service_config) * 1000)
+
+
+def _pending_orphan_ttl_ms(service_config: dict) -> int:
+    """Return the bounded age-from-submission TTL before pending work is orphaned."""
+    admission = service_config.get("admission", {}) or {}
+    raw = admission.get("orphan_ttl_seconds", 1800) if isinstance(admission, Mapping) else 1800
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        requested = 1800
+    return min(86_400_000, max(60_000, requested * 1000))
+
+
+def _pending_entry_submission_age_ms(
+    entry_id: str,
+    now_ms: int | None = None,
+    submitted_at_ms: int | None = None,
+) -> int:
+    """Return immutable submission age; missing legacy identity fails closed as fresh."""
+    try:
+        if submitted_at_ms is None:
+            return 0
+        submitted_ms = int(submitted_at_ms)
+        current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        return max(0, current_ms - submitted_ms)
+    except (TypeError, ValueError):
+        return 0
+
+
+REAPER_STALE_DEAD_LETTER_FLOOR_MS = 3_600_000
+
+
+def _reaper_nack_max_retries(idle_ms: int | float, lease_ms: int | float) -> int:
+    """Return the nack retry budget for a reaped pending entry.
+
+    An entry idle far beyond its lease belongs to a submitter that is long
+    gone; re-queueing it would load a generation bundle and evict the idle
+    baselines for a job nobody wants (2026-10-06 13:52 incident). A budget of
+    1 makes ``nack`` dead-letter it instead. Ordinary stuck entries keep 4.
+    """
+    ceiling = max(REAPER_STALE_DEAD_LETTER_FLOOR_MS, 4 * int(lease_ms or 0))
+    return 1 if float(idle_ms or 0) > ceiling else 4
 
 
 def _background_crop_regions(width: int, height: int) -> dict[str, tuple[int, int, int, int]]:
@@ -19961,6 +15255,35 @@ def _background_crop_regions(width: int, height: int) -> dict[str, tuple[int, in
         "left background": (0, 0, edge, height),
         "right background": (max(0, width - edge), 0, width, height),
     }
+
+
+def _vision_request_headers(url: str, policy: Mapping[str, Any]) -> tuple[dict[str, str], bool]:
+    """Headers for a vision QC call; a self-call becomes a combined Gemma broker job.
+
+    When ``vision_url`` is this controller's own loopback listener (plan 5.1),
+    the call carries the controller token and ``X-Backend`` (policy
+    ``vision_backend``, default the Gemma group) so it queues on the broker:
+    Gemini first, GPU Gemma when the cloud vision member is unavailable.
+    Redirects are refused so the token never leaves loopback.
+    """
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if not (
+        parsed.scheme == "http"
+        and (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+        and port == int(LISTEN_PORT)
+    ):
+        return {}, True
+    headers = {"X-Backend": str(policy.get("vision_backend") or _COMBINED_GEMMA_ROUTING_GROUP)}
+    token = _api_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers, False
 
 
 async def _analyze_image_with_local_vision(
@@ -19973,6 +15296,15 @@ async def _analyze_image_with_local_vision(
 
     if not image_bytes:
         raise RuntimeError("local vision received empty image")
+    # Fail closed: the former CPU Gemma vision fallback was retired 2026-10-10.
+    # Vision is served by the fleet LLM router, so the policy must name vision_url.
+    vision_url = str(policy.get("vision_url") or "").strip()
+    if not vision_url:
+        raise RuntimeError(
+            "local vision policy has no vision_url; refusing to call a default endpoint "
+            "(the CPU vision backend was retired 2026-10-10, configure generation template "
+            "post_generate.vision_url to the fleet LLM router)"
+        )
     try:
         from PIL import Image
         source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -20014,12 +15346,15 @@ async def _analyze_image_with_local_vision(
         "response_format": {"type": "json_object"},
     }
     import aiohttp as _aiohttp
-    url = str(policy.get("vision_url") or "http://127.0.0.1:8127/v1/chat/completions")
+    url = vision_url
     timeout_s = int(policy.get("vision_timeout_s", 180))
+    headers, allow_redirects = _vision_request_headers(url, policy)
     async with _aiohttp.ClientSession(
         timeout=_aiohttp.ClientTimeout(total=timeout_s, connect=3),
     ) as sess:
-        async with sess.post(url, json=body) as resp:
+        async with sess.post(
+            url, json=body, headers=headers, allow_redirects=allow_redirects,
+        ) as resp:
             text = await resp.text()
             if resp.status != 200:
                 raise RuntimeError(f"local vision HTTP {resp.status}: {text[:200]}")
@@ -20125,69 +15460,13 @@ async def _run_granular_visual_checks(image_bytes: bytes, *, prompt: str, policy
             })
     return results
 
+def _reduce_visual_qc_decision(
+    observations: dict, critique_decision: dict, policy: dict,
+) -> dict:
+    """Deterministically reduce atomic evidence into one terminal verdict.
 
-async def _critique_visual_observations_with_od(
-    observations: dict, *, prompt: str, policy: dict, image_name: str,
-):
-    """Ask OD to turn grounded observations into a bounded correction decision."""
-    project_id = str(policy.get("project_id") or "production-image-qc")
-    if not await _ensure_od_project(project_id, policy.get("design_system_id")):
-        raise RuntimeError("OD QC project unavailable")
-    timeout_s = int(policy.get("timeout_s", 90))
-    body = {
-        "projectId": project_id,
-        "agentId": str(policy.get("agent") or "opencode"),
-        "model": str(policy.get("model") or "minimax/MiniMax-M3"),
-        "mediaExecution": {"mode": "disabled"},
-        "message": (
-            "You are the correction controller for a local image pipeline. The pixel "
-            "observations below came from a local vision model. Do not invent any visual "
-            "facts beyond them. Return ONLY valid JSON: {decision: pass|edit|review|reject, "
-            "score: 0..10, issues: [{requirement,status,evidence}], edit_instruction: string, "
-            "edit_plan: [{requirement,instruction}], summary: string}. Evaluate every "
-            "granular_checks item independently. Choose edit only for specific correctable "
-            "defects. When multiple defects exist, create one short ordered edit_plan stage "
-            "per defect; each stage must change only that defect and preserve all unrelated "
-            "content. The edit instruction must explicitly preserve identity, correct content, "
-            "composition, lighting, framing, palette, and background.\n\n"
-            f"IMAGE FILE: {image_name}\nREQUESTED PROMPT:\n{prompt}\n\n"
-            f"GROUNDED OBSERVATIONS:\n{json.dumps(observations, ensure_ascii=False)}"
-        ),
-    }
-    import aiohttp as _aiohttp
-    async with _aiohttp.ClientSession(
-        timeout=_aiohttp.ClientTimeout(total=timeout_s, connect=2),
-    ) as sess:
-        if not await _od_health_check(sess):
-            raise RuntimeError("OD health check failed")
-        run = await _od_submit_run(sess, body)
-        if not run or not run.get("runId"):
-            raise RuntimeError("OD QC run submission failed")
-        run_id = run["runId"]
-        terminal = await _od_poll_run(sess, run_id, timeout_s)
-        if not terminal or terminal.get("status") != "succeeded":
-            raise RuntimeError("OD QC run failed")
-        text = await _od_fetch_assistant_text(
-            sess, project_id, run_id, run.get("conversationId"),
-        )
-    parsed = _extract_json_object_text(text or "")
-    valid, error = _validate_visual_qc_decision(parsed)
-    if error or valid is None:
-        raise RuntimeError(f"OD QC contract invalid: {error or 'empty_validated_payload'}")
-    valid["provider"] = "open-design"
-    valid["project_id"] = project_id
-    valid["run_id"] = run_id
-    valid["media_execution"] = "disabled"
-    return valid
-
-
-
-
-def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: dict) -> dict:
-    """Deterministically reduce atomic evidence and OD into one terminal verdict.
-
-    OD is an advisory controller only.  Atomic evidence and the policy gate the
-    terminal result, so an OD ``pass`` cannot erase a blocking P0 observation.
+    The critique input is advisory only.  Atomic evidence and the policy gate the
+    terminal result, so a critique ``pass`` cannot erase a blocking P0 observation.
 
     Task 3 (anti-lineup atoms) is additive: when ``observations`` carries an
     ``anti_lineup_atoms`` envelope, the reducer folds each emitted atom into
@@ -20196,7 +15475,7 @@ def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: di
     no envelope is present.
     """
     observations = copy.deepcopy(observations) if isinstance(observations, dict) else {}
-    od_decision = copy.deepcopy(od_decision) if isinstance(od_decision, dict) else {}
+    critique_decision = copy.deepcopy(critique_decision) if isinstance(critique_decision, dict) else {}
     policy = copy.deepcopy(policy) if isinstance(policy, dict) else {}
 
     # ── Task 3: anti_lineup_atoms envelope handling (additive) ───────────
@@ -20225,7 +15504,7 @@ def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: di
             # preserved verbatim below.
             reducer_input = {
                 "observations": copy.deepcopy(observations),
-                "od_decision": copy.deepcopy(od_decision),
+                "critique_decision": copy.deepcopy(critique_decision),
                 "policy": copy.deepcopy(policy),
             }
             return {
@@ -20251,8 +15530,8 @@ def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: di
                     "soft_uncertain": 0,
                 },
                 "overrides": (
-                    ["od_pass_blocked_by_atomic_evidence"]
-                    if str(od_decision.get("decision") or "").strip().casefold()
+                    ["critique_pass_blocked_by_atomic_evidence"]
+                    if str(critique_decision.get("decision") or "").strip().casefold()
                     == "pass"
                     else []
                 ),
@@ -20261,7 +15540,7 @@ def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: di
 
         # Validate through the one public closed-envelope validator before
         # folding. A reducer-local subset would let schema/provenance/order
-        # failures reach an OD pass path.
+        # failures reach a critique pass path.
         try:
             from semantic_scene_anti_lineup_observations import validate_anti_lineup_atoms
             validator_errors = validate_anti_lineup_atoms(envelope)
@@ -20418,35 +15697,35 @@ def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: di
             terminal_status = "review"
             human_review_required = True
         else:
-            # Without a declared P0 gate, the OD verdict remains advisory in
+            # Without a declared P0 gate, the critique verdict remains advisory in
             # the intended sense: ordinary atomic observations must not turn
             # an otherwise valid edit decision into an unsolicited review.
             terminal_status = str(
-                od_decision.get("decision") or "review"
+                critique_decision.get("decision") or "review"
             ).strip().casefold()
             if terminal_status not in {"pass", "edit", "review", "reject"}:
                 terminal_status = "review"
-            applied_rule_ids.append("od_decision_advisory")
+            applied_rule_ids.append("critique_decision_advisory")
             human_review_required = terminal_status in {"review", "reject"}
     else:
-        terminal_status = str(od_decision.get("decision") or "review").strip().casefold()
+        terminal_status = str(critique_decision.get("decision") or "review").strip().casefold()
         if terminal_status not in {"pass", "edit", "review", "reject"}:
             terminal_status = "review"
-        applied_rule_ids.append("od_decision_advisory")
+        applied_rule_ids.append("critique_decision_advisory")
         human_review_required = terminal_status in {"review", "reject"}
 
     if p0_missing_review:
         # P0 missing/malformed always fails closed to review and blocks any
-        # OD ``pass`` regardless of aggregate counts.
+        # critique ``pass`` regardless of aggregate counts.
         terminal_status = "review"
         human_review_required = True
 
-    if str(od_decision.get("decision") or "").casefold() == "pass" and terminal_status != "pass":
+    if str(critique_decision.get("decision") or "").casefold() == "pass" and terminal_status != "pass":
         if p0_missing_review:
-            overrides.append("od_pass_blocked_by_atomic_p0_fail")
+            overrides.append("critique_pass_blocked_by_atomic_p0_fail")
         else:
             overrides.append(
-                "od_pass_blocked_by_atomic_"
+                "critique_pass_blocked_by_atomic_"
                 + (
                     "p0_fail"
                     if aggregates["hard_failures"]
@@ -20456,7 +15735,7 @@ def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: di
                 )
             )
 
-    reducer_input = {"observations": observations, "od_decision": od_decision, "policy": policy}
+    reducer_input = {"observations": observations, "critique_decision": critique_decision, "policy": policy}
     # Project the folded checks back into a copy of ``observations`` so the
     # caller (and ``raw_observations``) can see the fold without mutating
     # the input dict (which would perturb ``input_sha256``).
@@ -20481,7 +15760,22 @@ def _reduce_visual_qc_decision(observations: dict, od_decision: dict, policy: di
 async def _run_grounded_image_qc(
     image_bytes: bytes, *, prompt: str, policy: dict, image_name: str,
 ):
-    """Run local pixel observations followed by OD correction policy."""
+    """Run local pixel observations and reduce them without external critique."""
+    # Fail closed: the vision endpoint must come from the policy. No hard-coded
+    # fallback endpoint is consulted from this path.
+    if not str(policy.get("vision_url") or "").strip():
+        logger.warning("image_qc: fail_closed reason=vision_url_not_configured")
+        return {
+            "decision": "review",
+            "score": 0,
+            "issues": [],
+            "edit_instruction": "",
+            "summary": "QC unavailable: no vision_url configured in the QC policy",
+            "qc_status": "unavailable",
+            "qc_failure": True,
+            "failure_reason": "qc_unavailable",
+            "error": "vision_url_not_configured",
+        }
     try:
         observations = await _analyze_image_with_local_vision(
             image_bytes, prompt=prompt, policy=policy,
@@ -20492,9 +15786,10 @@ async def _run_grounded_image_qc(
             )
             observations["granular_checks"] = granular
             observations.setdefault("atomic_checks", []).extend(granular)
-        decision = await _critique_visual_observations_with_od(
-            observations, prompt=prompt, policy=policy, image_name=image_name,
-        )
+        # No external controller is consulted. Without a locally produced
+        # approval signal the critique input stays neutral; the reducer may only
+        # fail or review from grounded evidence and must never manufacture a pass.
+        decision = {"decision": "review", "provider": "local-observations"}
         reduced = _reduce_visual_qc_decision(observations, decision, policy)
         decision.update(reduced)
         decision["grounded_observations"] = observations
@@ -20506,13 +15801,6 @@ async def _run_grounded_image_qc(
         # and a typed failure_reason so the caller can distinguish unavailable QC from
         # an accepted (pass) result.
         reason = str(exc)
-        contract_match = re.search(
-            r"OD QC contract invalid: ([a-z_]+)", reason,
-        )
-        failure_kind = (
-            f"contract_invalid:{contract_match.group(1)}"
-            if contract_match else "qc_unavailable"
-        )
         logger.warning("image_qc: fail_open reason=%s", exc)
         return {
             "decision": "review",
@@ -20522,7 +15810,7 @@ async def _run_grounded_image_qc(
             "summary": "QC unavailable; raw Krea output returned",
             "qc_status": "unavailable",
             "qc_failure": True,
-            "failure_reason": failure_kind,
+            "failure_reason": "qc_unavailable",
             "error": reason[:500],
         }
 
@@ -20877,7 +16165,7 @@ def _is_anti_lineup_correction_eligible(initial, policy) -> tuple[bool, str]:
     Returns ``(eligible, reason)`` where ``eligible`` is True only when
     ALL of the following hold:
 
-      * ``initial`` is a mapping carrying an OD ``edit`` or ``reject``
+      * ``initial`` is a mapping carrying an ``edit`` or ``reject``
         decision (NOT a terminal ``pass``).
       * ``initial["edit_instruction"]`` is a non-empty string (the bounded
         instruction we are willing to hand to Qwen once).
@@ -21219,134 +16507,6 @@ async def _run_post_generation_image_pipeline(
         report["correction_rejected"] = report["stages"][-1].get("rejected", "no_measured_improvement")
     return image_data, report
 
-
-async def _enhance_prompt_with_od(
-    raw_prompt, *, tmpl,
-):
-    """Optionally replace `raw_prompt` with an OD-enhanced version.
-
-    Returns enhancement text plus bounded provenance on success, or None to
-    signal the caller should use `raw_prompt` unchanged.
-    """
-    enhance = tmpl.get("prompt_enhance") or {}
-    if not enhance.get("enabled"):
-        return None
-    project_id = enhance.get("project_id")
-    if not project_id:
-        logger.warning("od_enhance: skipped reason=no_project_id")
-        return None
-
-    n = len(raw_prompt) if isinstance(raw_prompt, str) else 0
-    min_n = int(enhance.get("min_input_chars", 0))
-    max_n = int(enhance.get("max_input_chars", 10000))
-    if not (min_n <= n <= max_n):
-        logger.warning(
-            "od_enhance: skipped reason=input_len_out_of_range n=%d range=[%d,%d]",
-            n, min_n, max_n,
-        )
-        return None
-
-    timeout_s = int(enhance.get("timeout_s", 5))
-    if not await _ensure_od_project(
-        project_id, enhance.get("design_system_id")
-    ):
-        return None
-
-    _default_instruction = (
-        "Read PROMPT_POLICY.md, then enhance this image-generation prompt. "
-        "Return ONLY the enhanced text, no preamble, no quotes, no markdown, "
-        "no explanation. Preserve named subjects, actions, exclusions, aspect "
-        "ratio intent, and overlay space. Add composition, lighting, lens, mood, "
-        "materials, depth, and a coherent visual hierarchy. Keep under 200 words."
-    )
-    body = {
-        "projectId": project_id,
-        "agentId": enhance.get("agent", "opencode"),
-        "model": enhance.get("model", "minimax/MiniMax-M3"),
-        # OD must never execute image/video/audio generation for this run.
-        # GPUManager/ComfyUI is the sole media owner and receives only text.
-        "mediaExecution": {"mode": "disabled"},
-        "message": (
-            str(enhance.get("instruction") or _default_instruction).strip()
-            + "\n\n---\n\n"
-            + raw_prompt
-        ),
-    }
-    if enhance.get("design_system_id"):
-        body["designSystemId"] = enhance["design_system_id"]
-
-    try:
-        import aiohttp as _aiohttp
-        timeout = _aiohttp.ClientTimeout(total=timeout_s, connect=1.0)
-        async with _aiohttp.ClientSession(timeout=timeout) as sess:
-            if not await _od_health_check(sess):
-                logger.warning(
-                    "od_enhance: skipped reason=health_check_failed"
-                )
-                return None
-            run = await _od_submit_run(sess, body)
-            if not run:
-                return None
-            run_id = run.get("runId")
-            if not run_id:
-                logger.warning(
-                    "od_enhance: skipped reason=no_run_id resp=%s",
-                    str(run)[:200],
-                )
-                return None
-            terminal_status = await _od_poll_run(sess, run_id, timeout_s)
-            if not terminal_status:
-                return None
-            if terminal_status.get("status") != "succeeded":
-                logger.warning(
-                    "od_enhance: skipped reason=run_failed status=%s error=%s",
-                    terminal_status.get("status"),
-                    terminal_status.get("error"),
-                )
-                return None
-            text = await _od_fetch_assistant_text(
-                sess, project_id, run_id, run.get("conversationId"),
-            )
-            if text:
-                validation_error = _od_prompt_validation_error(text)
-                if validation_error:
-                    logger.warning(
-                        "od_enhance: invalid_output reason=%s run_id=%s; using raw prompt",
-                        validation_error, run_id,
-                    )
-                    return {
-                        "text": raw_prompt,
-                        "provider": "open-design",
-                        "project_id": project_id,
-                        "run_id": run_id,
-                        "agent": body["agentId"],
-                        "model": body["model"],
-                        "media_execution": "disabled",
-                        "fallback": "raw_prompt",
-                        "validation_error": validation_error,
-                    }
-                logger.info(
-                    "od_enhance: ok in_len=%d out_len=%d run_id=%s",
-                    n, len(text), run_id,
-                )
-                return {
-                    "text": text,
-                    "provider": "open-design",
-                    "project_id": project_id,
-                    "run_id": run_id,
-                    "agent": body["agentId"],
-                    "model": body["model"],
-                    "media_execution": "disabled",
-                }
-            return None
-    except (ClientError, asyncio.TimeoutError) as e:
-        logger.warning("od_enhance: client_error err=%s", e)
-        return None
-    except Exception as e:
-        logger.exception("od_enhance: unexpected_error err=%s", e)
-        return None
-
-
 def _build_prompt_evidence(
     *,
     original_prompt,
@@ -21403,63 +16563,45 @@ def _build_prompt_evidence(
 
 
 async def _prepare_comfyui_body_after_claim(job: dict, body: bytes):
-    """Run deferred text enhancement after Redis claim and patch the workflow.
+    """Verify the admitted raw prompt survived to the claimed workflow.
 
-    Returns ``(body_bytes, prompt_evidence_or_none)``.  OD is deliberately
-    fail-open: malformed/unavailable enhancement keeps the raw prompt, but the
-    fallback is explicit in provenance.
+    Returns ``(body_bytes, prompt_evidence_or_none)``.  The body is forwarded
+    byte-for-byte: nothing rewrites the prompt here, so no outbound enhancement
+    call is made and no retired-provider provenance is recorded.  Evidence
+    names the admitted raw prompt explicitly, and a workflow whose prompt target
+    no longer carries it is refused instead of forwarded.
     """
     try:
         metadata = json.loads(job.get("metadata") or "{}")
     except (TypeError, json.JSONDecodeError):
         metadata = {}
     pipeline = metadata.get("worker_pipeline") or {}
-    enhance = pipeline.get("prompt_enhance") or {}
-    if not enhance.get("enabled"):
-        return body, None
-
     raw_prompt = str(pipeline.get("original_prompt") or "")
     prompt_target = str(pipeline.get("prompt_target") or "")
     if not raw_prompt or ".inputs." not in prompt_target:
-        raise RuntimeError("invalid deferred prompt-enhancement metadata")
-    node_id, field = prompt_target.split(".inputs.", 1)
+        return body, None
 
     try:
-        payload = json.loads(body.decode("utf-8"))
-        workflow = payload["prompt"]
-        node_inputs = workflow[node_id]["inputs"]
+        workflow = json.loads(body.decode("utf-8"))["prompt"]
+        node_id, field = prompt_target.split(".inputs.", 1)
+        effective_prompt = str(workflow[node_id]["inputs"][field])
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RuntimeError(
-            f"could not patch deferred prompt target {prompt_target}: {exc}"
+            f"could not verify prompt target {prompt_target}: {exc}"
         ) from exc
-
-    enhancement = await _enhance_prompt_with_od(
-        raw_prompt,
-        tmpl={"prompt_enhance": dict(enhance)},
-    )
-    if enhancement is None:
-        effective_prompt = raw_prompt
-        enhancer_evidence = {
-            "provider": "open-design",
-            "media_execution": "disabled",
-            "fallback": "raw_prompt",
-            "validation_error": "enhancer_unavailable_after_claim",
-        }
-    else:
-        effective_prompt = str(enhancement.get("text") or raw_prompt)
-        enhancer_evidence = {
-            key: value for key, value in enhancement.items() if key != "text"
-        }
-
-    node_inputs[field] = effective_prompt
+    if effective_prompt != raw_prompt:
+        raise RuntimeError(
+            f"prompt target {prompt_target} no longer carries the admitted "
+            "raw prompt"
+        )
     evidence = _build_prompt_evidence(
         original_prompt=raw_prompt,
         effective_prompt=effective_prompt,
         workflow=workflow,
         prompt_target=prompt_target,
-        enhancer=enhancer_evidence,
+        enhancer={"provider": "none"},
     )
-    return json.dumps(payload, separators=(",", ":")).encode("utf-8"), evidence
+    return body, evidence
 
 
 async def _build_comfyui_workflow_entry(
@@ -21519,8 +16661,19 @@ async def _build_comfyui_workflow_entry(
             with open(workflow_path) as _wf:
                 workflow = json.load(_wf)
         except (OSError, json.JSONDecodeError) as e:
+            # A graph the release does not ship (or ships corrupt) cannot be
+            # fixed by a retry: carry a stable reason so the coordinator ends
+            # the job typed instead of re-ticking an untyped 500 forever.
+            _asset_reason = (
+                "workflow_asset_invalid"
+                if isinstance(e, json.JSONDecodeError)
+                else "workflow_asset_missing"
+            )
+            logger.error("%s: %s (%s)", _asset_reason, workflow_path, e)
             return None, {
                 "error": f"Could not load workflow {workflow_path}: {e}",
+                "reason": _asset_reason,
+                "workflow": str(workflow_path),
                 "status": 500,
             }
         workflow_source = str(workflow_path)
@@ -21558,10 +16711,9 @@ async def _build_comfyui_workflow_entry(
     workflow.clear()
     workflow.update(_sanitized)
 
-    # ── Universal input-adapter + deferred OD prompt enhancement ───
-    # The HTTP ingress must enqueue the raw request first.  OD runs only after
-    # a WorkerPool consumer has claimed the Redis entry, preserving queue order
-    # and ensuring enhancement latency is owned by the active job.
+    # ── Universal input-adapter + raw prompt admission ─────────────
+    # The HTTP ingress enqueues the raw request first; the worker verifies the
+    # admitted raw prompt against the claimed workflow before /prompt.
     _adapter_warnings: list[str] = []
     _original_prompt = params.get("prompt")
     _enhancer_evidence: dict = {"provider": "none"}
@@ -21570,19 +16722,7 @@ async def _build_comfyui_workflow_entry(
         if isinstance(compiled_pipeline, Mapping) and compiled_pipeline.get("stages")
         else {}
     )
-    _prompt_enhance = dict(tmpl.get("prompt_enhance") or {})
     _post_generate = dict(tmpl.get("post_generate") or {})
-    if _prompt_enhance.get("enabled"):
-        if _original_prompt is None:
-            return None, {
-                "error": "params.prompt is required when prompt_enhance is enabled",
-                "status": 400,
-            }
-        _enhancer_evidence = {
-            "provider": "open-design",
-            "status": "pending_worker_claim",
-            "media_execution": "disabled",
-        }
 
     if tmpl.get("prompt_format"):
         raw_prompt = params.get("prompt")
@@ -21612,18 +16752,12 @@ async def _build_comfyui_workflow_entry(
             continue
         _effective_prompt = workflow[node_id]["inputs"].get(field, "")
         _prompt_target = f"{node_id}.inputs.{field}"
-        if (
-            _prompt_enhance.get("enabled")
-            or _post_generate.get("enabled")
-            or _worker_pipeline.get("stages")
-        ):
+        if _post_generate.get("enabled") or _worker_pipeline.get("stages"):
             _worker_pipeline.update({
                 "schema": "image-pipeline.v1",
                 "original_prompt": str(_original_prompt),
                 "prompt_target": _prompt_target,
             })
-            if _prompt_enhance.get("enabled"):
-                _worker_pipeline["prompt_enhance"] = _prompt_enhance
             if _post_generate.get("enabled"):
                 _worker_pipeline["post_generate"] = _post_generate
         _prompt_evidence = _build_prompt_evidence(
@@ -22130,6 +17264,7 @@ async def handle_submit_generation(
         )
     except Exception:
         position = None
+    _queue_fields = await _queue_position_fields(service_name, routing_group, entry_id)
 
     return web.json_response(
         {
@@ -22139,6 +17274,7 @@ async def handle_submit_generation(
             "routing_group": routing_group,
             "status": "queued",
             "position": position,
+            **_queue_fields,
             **({"idempotent_replay": False} if _idempotency_key else {}),
         },
         status=202,
@@ -22197,6 +17333,11 @@ async def handle_get_job(request: web.Request):
                 None, queue_engine.get_queue_depth, svc_name, routing_group
             )
             job_dict["queue_position"] = depth
+            job_dict.update(
+                await _queue_position_fields(
+                    svc_name, routing_group, job_dict.get("entry_id"), job=job_dict
+                )
+            )
         except Exception:
             pass
 
@@ -22236,6 +17377,37 @@ async def handle_cancel_job(request: web.Request):
         return web.json_response({"error": f"Job {job_id} already {status}"}, status=410)
 
     if status == "in_flight":
+        if (
+            job.get("workflow_execution_authority") == "coordinator"
+            and job.get("coordinator_run_id")
+        ):
+            runtime = request.app.get(WORKFLOW_COORDINATOR_RUNTIME_KEY)
+            cancel = getattr(runtime, "cancel", None)
+            if not callable(cancel):
+                return web.json_response(
+                    {"error": "pipeline coordinator unavailable", "job_id": job_id},
+                    status=503,
+                )
+            try:
+                accepted = await loop.run_in_executor(
+                    None, cancel, str(job["coordinator_run_id"])
+                )
+            except Exception as exc:
+                logger.exception("coordinator cancel failed for %s", job_id)
+                return web.json_response(
+                    {"error": f"failed to request coordinator cancellation: {exc}",
+                     "job_id": job_id, "status": "cancellation_failed"},
+                    status=503,
+                )
+            if not accepted:
+                return web.json_response(
+                    {"error": f"coordinator run for job {job_id} is unavailable or terminal",
+                     "job_id": job_id, "status": "cancellation_failed"},
+                    status=409,
+                )
+            return web.json_response(
+                {"job_id": job_id, "status": "cancellation_requested"}
+            )
         # Cooperative cancellation: the worker owns the terminal transition.
         # The intent write is part of the API contract; never return a clean
         # acceptance when Redis rejected it.
@@ -22615,6 +17787,30 @@ def _apply_combined_gemma_visibility(
     total_free = 0
     latest_observed_at = None
     for name, item in observed.items():
+        inactive_by_systemd = (
+            item.get("accepting") is False
+            and isinstance(item.get("reason_codes"), list)
+            and "MEMBER_SYSTEMD_INACTIVE" in item["reason_codes"]
+        )
+        if inactive_by_systemd:
+            # An explicitly inactive systemd member is intentionally outside
+            # the broker's capacity pool. Preserve its unknown per-member
+            # telemetry, but do not let it poison live group capacity.
+            normalized_members[name] = {
+                "slots_total": None,
+                "slots_active": None,
+                "slots_available": None,
+                "slots_free": None,
+                "queue_depth": queue["depth"],
+                "total_load": None,
+                "capacity_source": source,
+                "queue_source": source,
+                "capacity_fresh": False,
+                "capacity_unknown": True,
+                "observed_at": item.get("observed_at"),
+            }
+            continue
+
         total = item.get("backend_slots_total")
         busy = item.get("backend_slots_busy")
         free = item.get("compatible_free_slots")
@@ -22857,6 +18053,12 @@ async def _probe_configured_llm_service(config: dict, service_name: str | None) 
 async def _llm_readiness_snapshot(config: dict) -> dict:
     broker_payload, broker_error = await _fetch_combined_gemma_visibility()
     combined = _summarize_combined_router_readiness(broker_payload, broker_error)
+    # disabled placeholders (Qwen-Dual) are not members anyone can route to
+    services = config.get("services", {}) or {}
+    for name in [n for n in combined["members"] if (services.get(n) or {}).get("enabled") is False]:
+        combined["members"].pop(name)
+    if _combined_gemma_broker_config_stale:
+        combined["config_stale"] = _combined_gemma_broker_config_stale
     scheduling = config.get("scheduling", {}) or {}
     runtime_pin_raw = getattr(scheduler, "_pinned_service", None) if scheduler is not None else None
     runtime_pin = runtime_pin_raw if isinstance(runtime_pin_raw, str) and runtime_pin_raw else None
@@ -22925,6 +18127,7 @@ async def handle_all_queues(request: web.Request):
     return web.json_response({
         "services": services_status,
         "routing_groups": routing_groups,
+        "recovery": _queue_recovery_summary(),
     })
 
 
@@ -23036,7 +18239,8 @@ async def handle_slots(request: web.Request):
             }
         except Exception as e:
             out[svc] = {"error": str(e)}
-    return web.json_response(out)
+    out.update(deprecated=True, see="/v1/catalog")
+    return web.json_response(out, headers=_CATALOG_DEPRECATION_HEADERS)
 
 
 async def handle_stats(request: web.Request):
@@ -23078,7 +18282,10 @@ async def handle_routing(request: web.Request):
             out[rg] = routing_engine.get_group_status(rg)
         except Exception as e:
             out[rg] = {"error": str(e)}
-    return web.json_response({"routing_groups": out, "timestamp": time.time()})
+    return web.json_response(
+        {"routing_groups": out, "timestamp": time.time(), "deprecated": True, "see": "/v1/catalog"},
+        headers=_CATALOG_DEPRECATION_HEADERS,
+    )
 
 
 def _coerce_group_priority(priority_value, default=50, allow_cpu_fallback=False) -> int:
@@ -23637,6 +18844,508 @@ def _metrics_service_names(config: Mapping[str, Any]) -> list[str]:
         and _is_queue_consumer_service(service)
     )
 
+async def handle_get_fit_report(request: web.Request):
+    """GET /v1/fit-report: report-only GPU fit findings (plan v3 phase 4b)."""
+    return web.json_response(await asyncio.to_thread(
+        _fit_validator.report, _load_services_config(), _vram_cache or None,
+        project_root=PROJECT_ROOT))
+
+
+async def handle_get_broker_metrics(request: web.Request):
+    """GET /v1/metrics/broker — embedded Gemma broker metrics."""
+    from gemma_broker.api import APIError
+
+    try:
+        payload = await asyncio.to_thread(_combined_gemma_api_proxy.broker_metrics)
+    except _RepositoryUnavailable as exc:
+        # The brief and the standalone broker route (gemma_broker/runtime.py)
+        # answer a repository outage with this exact stable code; the raised
+        # message is the internal ReasonCode value, never the wire contract.
+        return web.json_response(
+            {"error": "repository unavailable", "code": "redis_state_unknown"},
+            status=503,
+        )
+    except APIError as exc:
+        # The embedded broker is absent (initialisation failed or was never
+        # embedded). That is an unavailable repository projection, not a crash:
+        # answer the same typed 503 instead of leaking a stack trace as 500.
+        return web.json_response(
+            {"error": "repository unavailable", "code": exc.code},
+            status=exc.status,
+        )
+    return web.json_response(payload)
+
+
+# ── Service catalog (plan phase 1: read-only) ────────────────────────
+# Seeds the plan taxonomy (fleet-brain gpu-manager-service-catalog-plan) for
+# services without metadata.public_id; an explicit metadata.public_id wins.
+# Plan phase 6: human name per service; metadata.display_name wins, else services.json display.
+_CATALOG_DEFAULT_DISPLAY_NAMES = {"combined_gemma_broker": "Combined LLM"}
+_CATALOG_DEFAULT_PUBLIC_IDS = {
+    "combined_gemma_broker": "llm.chat",
+    "EmbeddingGemma-2": "embed.text",
+    "comfyui": "image.generate",
+    "comfyui-qwen": "image.edit",
+    "minimax-music3-full": "music.generate",
+    "apollo-audio-restoration": "audio.restore",
+    "audio-separator-rocm": "audio.separate",
+    "resemble-enhance": "audio.enhance",
+    "production-brief-live-f7": "text.brief",
+    # s1.agent has no portable default (host-specific service name): set
+    # metadata.public_id on the System One service instead.
+}
+_CATALOG_HEALTHY_MEMBER_STATES = frozenset({"ready_accepting", "ready_busy"})
+# fleet-llm-router sends these model families through Star CLIProxy, whose
+# validation.max_message_length is the Haiku 250k-char cap.
+_CATALOG_CLIPROXY_MODEL_PREFIXES = ("claude-", "gemini-")
+_CATALOG_CLIPROXY_CONFIG_ENV = "GPU_MANAGER_CLIPROXY_CONFIG"
+_CATALOG_DEPRECATION_HEADERS = {
+    "Deprecation": "@1792627200",  # 2026-10-22
+    "Link": '</v1/catalog>; rel="successor-version"',
+}
+
+
+def _cliproxy_max_input_chars() -> int | None:
+    """Read the proxy cap from Star CLIProxy's config, its single owner."""
+    path = os.environ.get(_CATALOG_CLIPROXY_CONFIG_ENV) or os.path.expanduser(
+        "~/projects/star-cliproxy/config.yaml"
+    )
+    try:
+        import yaml
+
+        with open(path, encoding="utf-8") as handle:
+            value = int(yaml.safe_load(handle)["validation"]["max_message_length"])
+        return value if value > 0 else None
+    except Exception as exc:
+        # The file also holds credentials: never log parser text, only the type.
+        logger.debug("catalog: cliproxy cap unavailable (%s)", type(exc).__name__)
+        return None
+
+
+def _catalog_static_slots(service: Mapping) -> int | None:
+    admission = service.get("admission") if isinstance(service.get("admission"), Mapping) else {}
+    value = service.get("parallel") or service.get("worker_parallel") or admission.get("max_parallel")
+    return int(value) if value else None
+
+
+def _catalog_constituents(service: Mapping, config: Mapping) -> list[dict]:
+    out = [{"kind": "dependency", "name": name} for name in service.get("dependencies") or []]
+    group = service.get("routing_group")
+    pipelines = config.get("service_pipelines") or {}
+    for template in (config.get("generation_templates") or {}).values():
+        pipeline_id = template.get("service_pipeline_id") if isinstance(template, Mapping) else None
+        if not group or template.get("routing_group") != group or pipeline_id not in pipelines:
+            continue
+        for stage in pipelines[pipeline_id].get("stages") or []:
+            out.append({"kind": "stage", "name": stage.get("provider"),
+                        "stage": stage.get("id"), "pipeline": pipeline_id})
+    return out
+
+
+def _catalog_broker_members(config: Mapping, metrics: Mapping | None, proxy_cap: int | None) -> list[dict]:
+    services = config.get("services") or {}
+    live = {m.get("name"): m for m in (metrics or {}).get("members") or [] if isinstance(m, Mapping)}
+    walls = ((metrics or {}).get("dispatch_loop") or {}).get("quota_walls") or {}
+    members = []
+    cloud_slots = (config.get("combined_gemma_broker") or {}).get("slots_per_cloud_member", 2)
+    for name in (config.get("combined_gemma_broker") or {}).get("ordered_members") or []:
+        member = services.get(name) or {}
+        observed = live.get(name)
+        model = str(member.get("model") or "")
+        uses_cliproxy = model.startswith(_CATALOG_CLIPROXY_MODEL_PREFIXES)
+        # Same rule as the broker's admission ceiling (member_cache / readiness).
+        context = int(member.get("broker_context_limit") or member.get("context_per_slot", 0) or 0)
+        members.append({
+            "name": name,
+            "enabled": bool(member.get("enabled")),
+            "state": observed.get("state") if observed else None,
+            "accepting": observed.get("accepting") if observed else None,
+            "walled": name in walls,
+            "healthy": bool(
+                observed
+                and observed.get("state") in _CATALOG_HEALTHY_MEMBER_STATES
+                and observed.get("accepting") is True
+                and name not in walls
+            ),
+            "slots": int(observed.get("configured_slots") or 0) if observed
+            else int(member.get("parallel", member.get("worker_parallel", cloud_slots
+                     if member.get("member_type") == "openai_compatible" else 0)) or 0),
+            "free_slots": observed.get("compatible_free_slots") if observed else None,
+            "context_tokens": context or None,
+            "max_input_chars": int(member.get("max_input_chars") or 0)
+            or (proxy_cap if uses_cliproxy else None),
+            "_cap_unknown": uses_cliproxy and proxy_cap is None,
+        })
+    return members
+
+
+def _catalog_entry(name: str, public_id: str, service: Mapping, config: Mapping,
+                   metrics: Mapping | None, proxy_cap: int | None) -> dict:
+    entry = {
+        "public_id": public_id,
+        "service": name,
+        "display_name": (service.get("metadata") or {}).get("display_name")
+        or _CATALOG_DEFAULT_DISPLAY_NAMES.get(name) or service.get("display") or name,
+        "type": service.get("type"),
+        "enabled": bool(service.get("enabled")),
+        "aliases": list(service.get("aliases") or []),
+        "live": False,
+        "slots_total": _catalog_static_slots(service),
+        "slots_healthy": None,
+        "recommended_concurrency": None,
+        "limits": {"context_tokens": service.get("context_per_slot"), "max_input_chars": None,
+                   "basis": "configured", "complete": True},
+        "members": [],
+        "constituents": _catalog_constituents(service, config),
+    }
+    if service.get("type") != "embedded_broker":
+        return entry
+    members = [m for m in _catalog_broker_members(config, metrics, proxy_cap) if m["enabled"]]
+    healthy = [m for m in members if m["healthy"]]
+    live = metrics is not None
+    # Limits come from healthy members; with none healthy (or no live view)
+    # fall back to every enabled member so static clients still get numbers.
+    pool = healthy or members
+    contexts = [m["context_tokens"] for m in pool if m["context_tokens"]]
+    caps = [m["max_input_chars"] for m in pool if m["max_input_chars"]]
+    entry.update({
+        "live": live,
+        "slots_total": sum(m["slots"] for m in members),
+        "slots_healthy": sum(m["slots"] for m in healthy) if live else None,
+        "recommended_concurrency": sum(m["slots"] for m in healthy) if live else None,
+        "limits": {
+            "context_tokens": min(contexts) if contexts else None,
+            "max_input_chars": min(caps) if caps else None,
+            "basis": "healthy" if healthy else "configured",
+            "complete": not any(m["_cap_unknown"] for m in pool),
+        },
+        "members": [{k: v for k, v in m.items() if not k.startswith("_")} for m in members],
+    })
+    return entry
+
+
+def _build_service_catalog(config: Mapping, metrics: Mapping | None,
+                           proxy_cap: int | None = None) -> dict:
+    """Project services.json plus live broker metrics into the public catalog."""
+    services = config.get("services") or {}
+    claims = [
+        (name, (service.get("metadata") or {}).get("public_id"))
+        for name, service in services.items() if isinstance(service, Mapping)
+    ]
+    claims = [(n, pid) for n, pid in claims if pid] + [
+        (n, _CATALOG_DEFAULT_PUBLIC_IDS[n]) for n, pid in claims
+        if not pid and n in _CATALOG_DEFAULT_PUBLIC_IDS
+    ]
+    entries: dict[str, dict] = {}
+    for name, public_id in claims:
+        if str(public_id) not in entries:  # first claim wins; explicit ids claim first
+            entries[str(public_id)] = _catalog_entry(
+                name, str(public_id), services[name], config, metrics, proxy_cap
+            )
+    return {
+        "catalog_version": registry_summary(config, owner="controller")["fingerprint"],
+        "live": metrics is not None,
+        "ttl_s": 15,
+        "services": sorted(entries.values(), key=lambda e: e["public_id"]),
+    }
+
+
+def _service_catalog_response(catalog: dict, public_id: str | None) -> tuple[int, dict]:
+    if public_id is None:
+        return 200, catalog
+    for entry in catalog["services"]:
+        if entry["public_id"] == public_id:
+            return 200, {**entry, "catalog_version": catalog["catalog_version"]}
+    return 404, {"error": "unknown service", "code": "unknown_public_id", "public_id": public_id}
+
+
+async def _catalog_broker_metrics() -> dict | None:
+    """Live broker metrics, or None when the broker cannot answer (never raise)."""
+    from gemma_broker.api import APIError
+
+    try:
+        return await asyncio.to_thread(_combined_gemma_api_proxy.broker_metrics)
+    except (_RepositoryUnavailable, APIError):
+        return None
+    except Exception as exc:
+        logger.warning("catalog: broker metrics failed (%s)", type(exc).__name__)
+        return None
+
+
+async def _catalog_snapshot() -> dict:
+    return _build_service_catalog(
+        _load_services_config(),
+        await _catalog_broker_metrics(),
+        await asyncio.to_thread(_cliproxy_max_input_chars),
+    )
+
+
+async def handle_service_catalog(request: web.Request):
+    """GET /v1/catalog[/{public_id}] — read-only service catalog."""
+    status, body = _service_catalog_response(await _catalog_snapshot(),
+                                             request.match_info.get("public_id"))
+    leases = _catalog_live_leases(body["public_id"]) if status == 200 and "public_id" in body else []
+    if status == 200 and "public_id" in body:
+        body["subscribers"] = len(leases)
+    client = _catalog_client_identity(request) if leases else None
+    lease = next((lease for lease in leases if lease["client"] == client), None) if client else None
+    if lease is not None:
+        body["you"] = _catalog_lease_view(body, lease)
+    return web.json_response(body, status=status)
+
+
+# ── Catalog subscribers (plan phase 2: advisory fair share) ──────────
+# Identity is the per-client token (api_auth.catalog_client_identity), never
+# the body. One lease per (client, public_id): a re-subscribe replaces it.
+_CATALOG_PRIORITY_WEIGHTS = {"interactive": 4, "kanban": 2, "background": 1}
+_CATALOG_HEARTBEAT_S = 60
+_CATALOG_LEASE_TTL_S = 3 * _CATALOG_HEARTBEAT_S
+_CATALOG_INT_LIMIT = 1024
+_CATALOG_OVER_SHARE_LOG_S = 60.0
+_catalog_clock = time.monotonic
+# shortcut: leases live in process memory; a restart drops them and clients
+# re-subscribe on their next 404 heartbeat. Persist only if that churn hurts.
+_catalog_leases: dict[str, dict] = {}
+_catalog_over_share_logged: dict[tuple[str, str], float] = {}
+# Per-client totals that outlive lease replacement (plan gap 9); restart wipes them too.
+_CATALOG_CLIENT_COUNTERS = ("subscribes", "replacements", "expiries", "over_share_events")
+_catalog_client_counters: dict[str, Counter] = defaultdict(Counter)
+
+
+def _catalog_live_leases(public_id: str | None = None) -> list[dict]:
+    """Drop expired leases, then return the live ones (optionally for one service)."""
+    now = _catalog_clock()
+    for sid in [sid for sid, lease in _catalog_leases.items() if lease["expires_at"] <= now]:
+        _catalog_client_counters[_catalog_leases.pop(sid)["client"]]["expiries"] += 1
+    return [lease for lease in _catalog_leases.values()
+            if public_id is None or lease["public_id"] == public_id]
+
+
+def _catalog_recommended(entry: Mapping, lease: Mapping, leases: list[Mapping]) -> int | None:
+    """(healthy_free + own in_flight) split by priority weight over live leases,
+    capped at want_max and at least 1 while any slot is healthy."""
+    if entry.get("slots_healthy") is None:
+        return None  # static-only entry: broker down, or not a broker service
+    healthy_free = sum(int(m.get("free_slots") or 0)
+                       for m in entry.get("members") or [] if m.get("healthy"))
+    total_weight = sum(_CATALOG_PRIORITY_WEIGHTS[other["priority"]] for other in leases) or 1
+    share = ((healthy_free + lease["in_flight"]) * _CATALOG_PRIORITY_WEIGHTS[lease["priority"]]
+             // total_weight)
+    return min(lease["want_max"], max(1 if entry["slots_healthy"] > 0 else 0, share))
+
+
+def _catalog_over_share(lease: Mapping, recommended: int | None) -> dict | None:
+    """Over-share record, or None. Logged always; with GPU_MANAGER_CATALOG_ENFORCE
+    on, _catalog_enforce turns it into a 429 + retry_after (phase 4)."""
+    if recommended is None or lease["in_flight"] <= recommended:
+        return None
+    return {"client": lease["client"], "public_id": lease["public_id"],
+            "subscriber_id": lease["subscriber_id"], "priority": lease["priority"],
+            "in_flight": lease["in_flight"], "recommended_concurrency": recommended}
+
+
+def _catalog_lease_view(entry: Mapping, lease: dict) -> dict:
+    recommended = _catalog_recommended(entry, lease, _catalog_live_leases(lease["public_id"]))
+    record = _catalog_over_share(lease, recommended)
+    key = (lease["client"], lease["public_id"])
+    now = _catalog_clock()
+    if record and now - _catalog_over_share_logged.get(key, -math.inf) >= _CATALOG_OVER_SHARE_LOG_S:
+        _catalog_over_share_logged[key] = now
+        logger.warning("catalog_over_share %s", json.dumps(record, sort_keys=True))
+    return {
+        "subscriber_id": lease["subscriber_id"], "client": lease["client"],
+        "public_id": lease["public_id"], "priority": lease["priority"],
+        "want_max": lease["want_max"], "in_flight": lease["in_flight"],
+        "recommended_concurrency": recommended, "advisory": True,
+        "heartbeat_s": _CATALOG_HEARTBEAT_S,
+        "expires_in_s": max(0, round(lease["expires_at"] - now)),
+    }
+
+
+def _catalog_note_report(lease: dict, view: Mapping) -> None:
+    """Count one in_flight report (subscribe or heartbeat) against the lease and client."""
+    lease["max_in_flight"] = max(lease["max_in_flight"], lease["in_flight"])
+    if _catalog_over_share(lease, view["recommended_concurrency"]):
+        lease["over_share_events"] += 1
+        _catalog_client_counters[lease["client"]]["over_share_events"] += 1
+
+
+def _catalog_error(status: int, code: str, **extra) -> web.Response:
+    return web.json_response({"error": code.replace("_", " "), "code": code, **extra},
+                             status=status, headers={"Cache-Control": "no-store"})
+
+
+def _catalog_enforce(entry: Mapping, lease: dict, view: Mapping) -> web.Response | None:
+    """Phase 4 (heartbeat only): 429 when the lease is over its share AND another
+    client on the same service is saturated and wants more (in_flight >= its own
+    recommended and want_max > in_flight); idle clients do not count. A hard cap,
+    not a plan wall: code catalog_over_share is deliberately not rate_limited/quota.
+    Flag off (default) = None, log-only."""
+    if not _env_bool("GPU_MANAGER_CATALOG_ENFORCE", False):
+        return None
+    if not _catalog_over_share(lease, view["recommended_concurrency"]):
+        return None
+    leases = _catalog_live_leases(lease["public_id"])
+    if not any(other["client"] != lease["client"] and other["want_max"] > other["in_flight"] > 0
+               and other["in_flight"] >= (_catalog_recommended(entry, other, leases) or 0)
+               for other in leases):
+        return None
+    retry_after = _CATALOG_HEARTBEAT_S
+    return web.json_response(
+        {"error": "catalog over share", "code": "catalog_over_share",
+         "retry_after": retry_after, "lease": view},  # lease stays held; clients can still read their share
+        status=429, headers={"Cache-Control": "no-store", "Retry-After": str(retry_after)})
+
+
+async def _catalog_body(request: web.Request) -> dict:
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("body") from None
+    if not isinstance(body, dict):
+        raise ValueError("body")
+    return body
+
+
+def _catalog_int(body: Mapping, key: str, default: Any, low: int) -> int:
+    value = body.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= _CATALOG_INT_LIMIT:
+        raise ValueError(key)
+    return value
+
+
+def _catalog_in_flight(entry: Mapping, value: int) -> int:
+    # Self-reported (the broker has no per-client attribution); clamp so a
+    # client cannot inflate its own pool past the service's size.
+    # shortcut: phase 4 enforcement needs identity on the chat path to count it server-side.
+    return min(value, entry.get("slots_total") or value)
+
+
+async def handle_catalog_subscribe(request: web.Request):
+    """POST /v1/catalog/{public_id}/subscribe {client?, want_max, priority, in_flight?}."""
+    client = _catalog_client_identity(request)
+    if client is None:
+        return _catalog_error(403, "catalog_client_token_required")
+    try:
+        body = await _catalog_body(request)
+        if body.get("client") is not None and body.get("client") != client:
+            return _catalog_error(403, "client_label_mismatch")
+        priority = body.get("priority", "background")
+        if not isinstance(priority, str) or priority not in _CATALOG_PRIORITY_WEIGHTS:
+            raise ValueError("priority")
+        want_max = _catalog_int(body, "want_max", None, 1)
+        in_flight = _catalog_int(body, "in_flight", 0, 0)
+    except ValueError as exc:
+        return _catalog_error(400, "invalid_subscription", field=str(exc))
+    status, entry = _service_catalog_response(await _catalog_snapshot(),
+                                              request.match_info["public_id"])
+    if status != 200:
+        return web.json_response(entry, status=status)
+    public_id = entry["public_id"]
+    counters = _catalog_client_counters[client]
+    _catalog_live_leases()  # an expired lease counts as an expiry, not a replacement
+    for sid in [sid for sid, lease in _catalog_leases.items()
+                if (lease["client"], lease["public_id"]) == (client, public_id)]:
+        del _catalog_leases[sid]
+        counters["replacements"] += 1
+    counters["subscribes"] += 1
+    sid = secrets.token_hex(16)
+    now = _catalog_clock()
+    lease = _catalog_leases[sid] = {
+        "subscriber_id": sid, "client": client, "public_id": public_id,
+        "priority": priority, "want_max": want_max,
+        "in_flight": _catalog_in_flight(entry, in_flight),
+        "expires_at": now + _CATALOG_LEASE_TTL_S,
+        "created_at": now, "heartbeat_at": now,
+        "heartbeats": 0, "over_share_events": 0, "max_in_flight": 0,
+    }
+    view = _catalog_lease_view(entry, lease)
+    _catalog_note_report(lease, view)
+    return web.json_response(view, status=201)  # never 429: it would still create the lease
+
+
+def _catalog_own_lease(request: web.Request) -> tuple[dict | None, web.Response | None]:
+    client = _catalog_client_identity(request)
+    if client is None:
+        return None, _catalog_error(403, "catalog_client_token_required")
+    _catalog_live_leases()
+    lease = _catalog_leases.get(request.match_info["subscriber_id"])
+    if lease is None or lease["client"] != client:
+        # Expired, released, replaced or someone else's: one signal, re-subscribe.
+        return None, _catalog_error(404, "unknown_subscription")
+    return lease, None
+
+
+async def handle_catalog_heartbeat(request: web.Request):
+    """POST /v1/catalog/subscriptions/{subscriber_id}/heartbeat {in_flight?}."""
+    lease, error = _catalog_own_lease(request)
+    if error is not None:
+        return error
+    try:
+        in_flight = _catalog_int(await _catalog_body(request), "in_flight", lease["in_flight"], 0)
+    except ValueError as exc:
+        return _catalog_error(400, "invalid_heartbeat", field=str(exc))
+    status, entry = _service_catalog_response(await _catalog_snapshot(), lease["public_id"])
+    sid = lease["subscriber_id"]
+    if status != 200 or _catalog_leases.get(sid) is not lease:
+        _catalog_leases.pop(sid, None)
+        return _catalog_error(404, "unknown_subscription")
+    lease["in_flight"] = _catalog_in_flight(entry, in_flight)
+    lease["heartbeat_at"] = _catalog_clock()
+    lease["expires_at"] = lease["heartbeat_at"] + _CATALOG_LEASE_TTL_S
+    lease["heartbeats"] += 1
+    view = _catalog_lease_view(entry, lease)
+    _catalog_note_report(lease, view)
+    return _catalog_enforce(entry, lease, view) or web.json_response(view)
+
+
+async def handle_catalog_release(request: web.Request):
+    """DELETE /v1/catalog/subscriptions/{subscriber_id}."""
+    lease, error = _catalog_own_lease(request)
+    if error is not None:
+        return error
+    _catalog_leases.pop(lease["subscriber_id"], None)
+    return web.json_response({"released": True, "subscriber_id": lease["subscriber_id"]})
+
+
+async def handle_catalog_subscriptions(request: web.Request):
+    """GET /v1/catalog/subscriptions — live leases plus per-client totals (plan gap 9).
+
+    subscriber_id is shown: heartbeat/DELETE also need the owning client's token,
+    so a sid alone acts on nothing (see _catalog_own_lease).
+    """
+    leases = _catalog_live_leases()
+    entries = {}
+    if leases:
+        entries = {e["public_id"]: e for e in (await _catalog_snapshot())["services"]}
+    now = _catalog_clock()
+    by_service: dict[str, list[dict]] = defaultdict(list)
+    for lease in leases:
+        by_service[lease["public_id"]].append(lease)
+    subscriptions = []
+    for lease in sorted(leases, key=lambda item: (item["public_id"], item["client"])):
+        entry = entries.get(lease["public_id"])
+        subscriptions.append({
+            "client": lease["client"], "public_id": lease["public_id"],
+            "subscriber_id": lease["subscriber_id"], "priority": lease["priority"],
+            "want_max": lease["want_max"], "in_flight": lease["in_flight"],
+            "max_in_flight": lease["max_in_flight"],
+            "recommended_concurrency": _catalog_recommended(
+                entry, lease, by_service[lease["public_id"]]) if entry else None,
+            "heartbeat_age_s": round(now - lease["heartbeat_at"]),
+            "age_s": round(now - lease["created_at"]),
+            "expires_in_s": max(0, round(lease["expires_at"] - now)),
+            "heartbeats": lease["heartbeats"],
+            "over_share_events": lease["over_share_events"],
+        })
+    clients = {name: {key: counts[key] for key in _CATALOG_CLIENT_COUNTERS}
+               for name, counts in sorted(_catalog_client_counters.items())}
+    return web.json_response(
+        {"subscriptions": subscriptions, "clients": clients, "advisory": True,
+         "heartbeat_s": _CATALOG_HEARTBEAT_S, "lease_ttl_s": _CATALOG_LEASE_TTL_S},
+        headers={"Cache-Control": "no-store"})
+
+
 async def handle_get_metrics(request: web.Request):
     """GET /v1/metrics?window=3600 — Queue performance metrics."""
     if not queue_metrics:
@@ -23860,8 +19569,64 @@ async def handle_purge_dead_letters(request: web.Request):
 
 # Combined Gemma LLM routing group used by nginx port 8095 (X-Backend: Gemma)
 _COMBINED_GEMMA_ROUTING_GROUP = "Gemma"
+# Hermes' auxiliary client cannot send X-Backend: its scoped-token chat calls for
+# this model become UNPINNED broker jobs on the Gemma routing group, so any
+# compatible member (GPU 12B or cloud) serves them. The CPU member was retired
+# 2026-10-10 (r188); the model scope is still enforced before submission.
+_SCOPED_DEFAULT_PIN = ("gemma-4-e4b", _COMBINED_GEMMA_ROUTING_GROUP)
 _combined_gemma_broker: Any | None = None
 _combined_gemma_member_cache: Any | None = None
+# B9: live dicts the embedded broker reads (configs/endpoints/timeouts) plus the
+# config signature they were built from, so member edits hot-apply.
+_combined_gemma_member_hot: dict[str, Any] = {}
+_combined_gemma_broker_config_stale: str | None = None
+
+
+def _combined_gemma_member_signature(config: Mapping[str, Any]) -> str:
+    block = config.get("combined_gemma_broker") or {}
+    services = config.get("services") or {}
+    members = block.get("ordered_members") or [] if isinstance(block, Mapping) else []
+    return json.dumps([block, {n: services.get(n) for n in members if isinstance(n, str)}],
+                      sort_keys=True, default=str)
+
+
+async def _hot_apply_combined_gemma_member_config(cache: Any) -> None:
+    """B9: apply per-member services.json edits to the running broker.
+
+    Enable/disable, slots, timeouts, model and endpoint apply in place (the
+    member fails closed until its next probe). A changed member list/order or
+    broker block still needs a gpu-manager restart and is reported as stale.
+    """
+    global _combined_gemma_broker_config_stale
+    hot = _combined_gemma_member_hot
+    config = _services_config or {}
+    sig = _combined_gemma_member_signature(config)
+    if not hot or sig == hot.get("sig"):
+        return
+    hot["sig"] = sig
+    block = config.get("combined_gemma_broker")
+    if block != hot.get("block"):
+        _combined_gemma_broker_config_stale = "combined_gemma_broker block changed; restart gpu-manager to apply"
+        logger.warning("BROKER_CONFIG_STALE: %s", _combined_gemma_broker_config_stale)
+        return
+    try:
+        from combined_gemma_broker_service import build_member_configs
+        from gemma_broker.config import BrokerConfig
+        broker_config = BrokerConfig.from_dict(block, candidate=block["candidate_mode"])
+        configs, endpoints = await asyncio.to_thread(
+            build_member_configs, config.get("services", {}), broker_config)
+    except Exception as exc:
+        _combined_gemma_broker_config_stale = f"member config rejected: {exc}"
+        logger.error("BROKER_CONFIG_STALE: %s", _combined_gemma_broker_config_stale)
+        return
+    for name, member in configs.items():
+        if member != hot["configs"].get(name):
+            hot["configs"][name] = member
+            hot["endpoints"][name] = endpoints[name]
+            hot["timeouts"][name] = float(member.get("forward_timeout", 600)) + 60.0
+            cache.reconfigure(name, member)
+            logger.warning("BROKER_CONFIG_HOT_APPLIED: %s enabled=%s", name, member.get("enabled"))
+    _combined_gemma_broker_config_stale = None
 
 
 async def _combined_gemma_systemd_facts(service_config: dict) -> dict:
@@ -23888,6 +19653,12 @@ async def _combined_gemma_systemd_facts(service_config: dict) -> dict:
         return {"systemd_active": False, "main_pid": None}
 
 
+# Last BROKER_REFRESH state logged per member: (state class, stable reason codes).
+_combined_gemma_refresh_logged_state: dict[str, tuple[str, tuple[str, ...]]] = {}
+# Healthy states: slot capacity flips between them as requests start and finish.
+_COMBINED_GEMMA_READY_STATES = frozenset({"ready_accepting", "ready_busy"})
+
+
 async def _refresh_combined_gemma_member_snapshots() -> None:
     """Refresh semantic backend evidence for an embedded broker only."""
     if not _combined_gemma_broker_embedded():
@@ -23906,6 +19677,9 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
     ):
         logger.error("Combined Gemma readiness refresh refused invalid ordered_members")
         return
+    await _hot_apply_combined_gemma_member_config(cache)
+    for stale_name in set(_combined_gemma_refresh_logged_state) - set(ordered_members):
+        _combined_gemma_refresh_logged_state.pop(stale_name, None)
     def _dispatcher_state(member_name: str) -> tuple[bool, int]:
         return (
             bool(getattr(broker.dispatch_loop, "is_running", False)),
@@ -23920,8 +19694,32 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
         timeout=3.0,
     )
     for name in ordered_members:
+        member_config = getattr(cache, "_configs", {}).get(name)
+        if member_config is None or member_config.get("enabled") is False:
+            self_disabled = (member_config or {}).get("self_disabled_reason")
+            reason = (
+                "member missing from embedded broker configuration"
+                if member_config is None
+                else f"self-disabled at broker build: {self_disabled}" if self_disabled
+                else "service disabled in config"
+            )
+            signature = ("absent/disabled", (reason,))
+            if _combined_gemma_refresh_logged_state.get(name) != signature:
+                log = logger.warning if member_config is None or self_disabled else logger.info
+                log(
+                    "BROKER_REFRESH: %s state=absent/disabled accepting=False blockers=%s",
+                    name, [reason],
+                )
+                _combined_gemma_refresh_logged_state[name] = signature
+            # A disabled or absent topology member is already fail-closed in
+            # the cache. Do not issue systemd/HTTP probes for it every refresh
+            # tick; enabled-but-down members still follow the normal probes.
+            continue
         try:
-            probes = await observer.observe(name, now=time.time())
+            probes = dict(await observer.observe(name, now=time.time()))
+            # The observation timestamp must cover the completed sequential
+            # probe sweep, not its start (which can already be stale on CPU).
+            probes["observed_at"] = time.time()
             readiness = cache.update(name, probes, now=time.time())
             stale_lifecycle = False
             # A persisted JOINING state can survive a manager crash/restart
@@ -23956,6 +19754,28 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
                         generation_fence=int(getattr(persisted, "generation_fence", 0) or 0),
                         compatible_free_slots=0,
                         blockers=tuple(dict.fromkeys((*readiness.blockers, lifecycle_states[persisted_state]))),
+                    )
+                    cache._snapshots[name] = readiness
+                suppression = broker.dispatch_loop.active_dispatch_suppression(name)
+                if (
+                    not (
+                        persisted is not None
+                        and persisted_state in lifecycle_states
+                    )
+                    and suppression is not None
+                ):
+                    from gemma_broker.contracts import MemberState
+
+                    reason = (
+                        f"active {suppression['kind']} ({suppression['reason']}) "
+                        f"for {suppression['remaining_seconds']:.3f}s"
+                    )
+                    readiness = dataclasses.replace(
+                        readiness,
+                        state=MemberState.UNHEALTHY,
+                        accepting=False,
+                        compatible_free_slots=0,
+                        blockers=tuple(dict.fromkeys((*readiness.blockers, reason))),
                     )
                     cache._snapshots[name] = readiness
                 if (
@@ -23998,14 +19818,30 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
         except Exception:
             # Preserve the cache's initialized unready snapshot on every malformed observation.
             logger.warning("Combined Gemma readiness refresh failed for %s", name, exc_info=True)
-        # DIAGNOSTIC: periodic state dump
+        # Member observations refresh every two seconds, but unchanged state is
+        # not an operational warning. Emit state only on transition. Healthy
+        # (accepting or merely busy) transitions are INFO; any other state
+        # keeps WARNING. The signature uses reason codes, not blocker text,
+        # because blockers can embed live values such as snapshot age.
         try:
             s = cache._snapshots.get(name)
             if s is not None:
-                logger.warning(
-                    "BROKER_REFRESH: %s state=%s accepting=%s blockers=%s",
-                    s.name, s.state, s.accepting, list(s.blockers)[:3],
+                state_value = getattr(s.state, "value", s.state)
+                ready = str(state_value) in _COMBINED_GEMMA_READY_STATES
+                reason_codes = getattr(s, "reason_codes", None) or s.blockers
+                signature = (
+                    "ready" if ready else str(state_value),
+                    () if ready else tuple(
+                        str(getattr(code, "value", code)) for code in reason_codes
+                    ),
                 )
+                if _combined_gemma_refresh_logged_state.get(name) != signature:
+                    log = logger.info if ready else logger.warning
+                    log(
+                        "BROKER_REFRESH: %s state=%s accepting=%s blockers=%s",
+                        s.name, state_value, s.accepting, list(s.blockers)[:3],
+                    )
+                    _combined_gemma_refresh_logged_state[name] = signature
                 # The runtime owns member state for the broker; the Lua scripts
                 # in ``reserve_job.lua`` read state from a Redis member-hash
                 # (``KEYS[3]``), so the in-memory cache snapshot must be
@@ -24018,7 +19854,7 @@ async def _refresh_combined_gemma_member_snapshots() -> None:
                     pass
         except Exception:
             pass
-        # END DIAGNOSTIC
+        # END STATE-CHANGE LOGGING
 
 
 async def _combined_gemma_refresh_loop() -> None:
@@ -24038,7 +19874,11 @@ async def _initialize_combined_gemma_broker() -> Any | None:
         logger.error("Combined Gemma broker unavailable: Redis or shared HTTP session missing")
         return None
     try:
-        from combined_gemma_broker_service import build_member_configs
+        from combined_gemma_broker_service import (
+            apply_member_reasoning,
+            build_member_configs,
+            recover_pre_acceptance_if_leader,
+        )
         from gemma_broker.config import BrokerConfig
         from gemma_broker.member_cache import StrictMemberSnapshotCache
         from gemma_broker.redis_store import RedisJobRepository
@@ -24061,22 +19901,29 @@ async def _initialize_combined_gemma_broker() -> Any | None:
         services = _services_config.get("services", {})
         member_configs, endpoints = build_member_configs(services, broker_config)
         member_forward_timeouts: list[float] = []
+        member_transport_timeouts: dict[str, float] = {}
         for name in broker_config.ordered_members:
             service_config = services.get(name)
-            if not isinstance(service_config, dict) or service_config.get("enabled") is not True:
+            if not isinstance(service_config, dict):
                 raise ValueError(f"COMBINED_GEMMA_MEMBER_CONFIG_INVALID:{name}")
+            # A disabled GPU member remains in the broker topology with its
+            # initial fail-closed cache snapshot; the refresh loop reports it
+            # as absent/disabled without probing it on every two-second tick.
             member_config = member_configs[name]
             forward_timeout = float(member_config.get("forward_timeout", 600))
             if forward_timeout <= 0:
                 raise ValueError(f"COMBINED_GEMMA_FORWARD_TIMEOUT_INVALID:{name}")
             member_forward_timeouts.append(forward_timeout)
+            member_transport_timeouts[name] = forward_timeout + 60.0
 
         def _request_for_member(member, request_body):
             payload = dict(request_body)
             model = member_configs.get(member.name, {}).get("model")
             if isinstance(model, str) and model:
                 payload["model"] = model
-            return payload
+            return apply_member_reasoning(
+                payload, member_configs.get(member.name, {}).get("broker_reasoning")
+            )
 
         cache = StrictMemberSnapshotCache(member_configs, freshness_ms=int(broker_config.freshness_seconds * 1000))
         repository = RedisJobRepository(
@@ -24085,9 +19932,12 @@ async def _initialize_combined_gemma_broker() -> Any | None:
             aging_seconds=broker_config.aging_interval_seconds,
             leadership_clock=time.time,
         )
-        recovered_claims = repository.recover_stale_pre_acceptance_claims(
-            now=time.monotonic(),
-            max_age_seconds=120.0,
+        recovery_owner = f"gpu-manager-embedded:{os.getpid()}:{time.time_ns()}"
+        recovery_leader, recovered_claims = recover_pre_acceptance_if_leader(
+            repository,
+            owner=recovery_owner,
+            leader_ttl_seconds=broker_config.leader_ttl_seconds,
+            recovery_now=time.monotonic(),
         )
         if recovered_claims:
             logger.warning(
@@ -24106,16 +19956,28 @@ async def _initialize_combined_gemma_broker() -> Any | None:
             endpoint_for_member=lambda member: endpoints.get(member.name, ""),
             request_for_member=_request_for_member,
             timeout=broker_request_timeout,
+            # Each member gets its own forward_timeout: the max above (which counts
+            # disabled GPU members) stays the outer reconcile/compat bound only.
+            timeout_for_member=lambda member: member_transport_timeouts.get(member.name),
         )
+        from gemma_broker.kv_affinity import KvAffinityTransport, build_kv_affinity
+        kv_affinity = build_kv_affinity(services, broker_config.ordered_members, session)
+        if kv_affinity:  # services.json <member>.kv_affinity.enabled, default off
+            transport = KvAffinityTransport(transport, kv_affinity)
         runtime = build_runtime(
             config=broker_config, repository=repository, members_provider=cache.snapshots,
             transport=transport,
             clock=time.monotonic,
             request_timeout=broker_request_timeout,
             compat_timeout=broker_request_timeout,
+            dispatch_owner=recovery_owner,
         )
         await runtime.dispatch_loop.start()
         _combined_gemma_member_cache = cache
+        _combined_gemma_member_hot.clear()
+        _combined_gemma_member_hot.update(
+            configs=member_configs, endpoints=endpoints, timeouts=member_transport_timeouts,
+            block=copy.deepcopy(raw_block), sig=_combined_gemma_member_signature(_services_config))
         _combined_gemma_broker = runtime
         runtime.schedule_background(_combined_gemma_refresh_loop())
         await _refresh_combined_gemma_member_snapshots()
@@ -24443,6 +20305,13 @@ async def _drain_combined_gemma_member_before_stop(
             "Combined Gemma member %s still has durable leases; refusing stop",
             service_name,
         )
+    else:
+        affinity = getattr(getattr(broker, "transport", None), "kv_affinity", {}).get(service_name)
+        if affinity is not None:  # save-before-evict; fail-open, never changes the drain result
+            try:
+                await affinity.save_all()
+            except Exception as exc:
+                logger.warning("KV save-before-evict failed for %s: %s", service_name, exc)
     return drained
 
 
@@ -24470,7 +20339,12 @@ async def _rejoin_combined_gemma_member_after_start(
                     f"Combined Gemma member not found: {service_name}"
                 )
             state = getattr(getattr(current, "state", None), "value", None)
-            if state == "unhealthy":
+            # DRAINING with no live drain waiter (a timed-out drain, or a
+            # controller restart mid-drain) is otherwise terminal: nothing
+            # completes it and reconcile skips it. Re-entering the drain is
+            # idempotent and completes to OFFLINE once leases reach zero.
+            if state in ("unhealthy", "draining"):
+                from_state = state
                 if broker is None or not hasattr(broker, "drain_member"):
                     raise RuntimeError(
                         "Embedded Combined Gemma member drain unavailable for "
@@ -24497,13 +20371,16 @@ async def _rejoin_combined_gemma_member_after_start(
                     )
                 expected_state_version = int(current.state_version)
                 logger.info(
-                    "Embedded Combined Gemma member normalized from unhealthy "
+                    "Embedded Combined Gemma member normalized from %s "
                     "to offline before rejoin: %s",
+                    from_state,
                     service_name,
                 )
-            if state == "ready_accepting" and current.accepting is True:
+            if (state == "ready_accepting" and current.accepting is True) or state == "ready_busy":
                 return True
-            if state == "offline":
+            # FAULTED is a quarantine only this fenced rejoin may lift
+            # (contract: FAULTED -> JOINING); refusing it left it terminal (B5)
+            if state in ("offline", "faulted"):
                 expected = (
                     int(current.state_version)
                     if expected_state_version is None
@@ -24552,7 +20429,7 @@ async def _rejoin_combined_gemma_member_after_start(
                         f"Combined Gemma member disappeared: {service_name}"
                     )
                 state = getattr(getattr(current, "state", None), "value", None)
-                if state == "ready_accepting" and current.accepting is True:
+                if (state == "ready_accepting" and current.accepting is True) or state == "ready_busy":
                     logger.info(
                         "Embedded Combined Gemma member rejoined after start: %s",
                         service_name,
@@ -24781,6 +20658,23 @@ async def _external_combined_gemma_rejoin_loop() -> None:
             logger.warning("External Combined Gemma rejoin monitor tick failed", exc_info=True)
 
 
+def _combined_gemma_member_names() -> frozenset[str]:
+    """Names of the Gemma routing group's broker members, from controller config."""
+    broker_config = (_services_config or {}).get("combined_gemma_broker", {})
+    members = broker_config.get("ordered_members") if isinstance(broker_config, Mapping) else None
+    if not isinstance(members, (list, tuple)):
+        return frozenset()
+    return frozenset(name for name in members if isinstance(name, str) and name)
+
+
+def _scoped_token_backends() -> frozenset[str]:
+    """X-Backend values the scoped token may name: broker members plus the
+    cloud-free local routing groups listed in ``scoped_token_routing_groups``."""
+    extra = (_services_config or {}).get("scoped_token_routing_groups")
+    extra = extra if isinstance(extra, (list, tuple)) else ()
+    return _combined_gemma_member_names() | {g for g in extra if isinstance(g, str) and g}
+
+
 def _combined_gemma_ingress_service_name(service_name: str | None) -> str | None:
     """Canonicalize only the logical broker group, preserving concrete pins."""
     if (
@@ -24843,7 +20737,7 @@ async def _external_combined_gemma_ingress(
 
 async def _maybe_handle_combined_gemma_ingress(
     *, service_name: str | None, method: str, path: str, body: bytes | None, headers,
-    request: web.Request | None = None,
+    request: web.Request | None = None, allow_member_pin: bool = False,
 ):
     """Route only logical ``Gemma`` ingress to the durable broker.
 
@@ -24853,8 +20747,18 @@ async def _maybe_handle_combined_gemma_ingress(
     """
     if not _combined_gemma_broker_enabled():
         return None
-    if service_name != _COMBINED_GEMMA_ROUTING_GROUP:
+    # The logical group always becomes a broker job. A pin on one of its own
+    # members does too, but only when the caller opted in (the scoped Gemma gate);
+    # every other caller keeps the existing direct pin behaviour.
+    if service_name != _COMBINED_GEMMA_ROUTING_GROUP and not (
+        allow_member_pin and service_name in _combined_gemma_member_names()
+    ):
         return None
+    if service_name != _COMBINED_GEMMA_ROUTING_GROUP:
+        # The pin may have come from ?service=; the broker reads X-Backend.
+        from multidict import CIMultiDict
+        headers = CIMultiDict(headers)
+        headers["X-Backend"] = service_name
     try:
         deployment = _combined_gemma_deployment_config()
         if deployment["mode"] == "external":
@@ -24891,19 +20795,132 @@ async def _maybe_handle_combined_gemma_ingress(
     return await _combined_gemma_broker.handle_proxy(**proxy_kwargs)
 
 
+_LLM_PROXY_PATHS = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/embeddings",
+        "/v1/models",
+        "/v1/audio/transcriptions",
+        "/v1/audio/speech",
+        "/v1/rerank",
+    }
+)
+_PROXY_PERSISTED_SECRET_HEADERS = frozenset(
+    {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+)
+
+
+def _proxy_persisted_headers(headers):
+    """Keep end-to-end forwarding metadata, but never persist caller credentials."""
+    return {
+        key: value
+        for key, value in headers.items()
+        if isinstance(key, str)
+        and key.lower() not in _PROXY_PERSISTED_SECRET_HEADERS
+        and key.lower() not in _FORWARD_LLM_STRIPPED_HEADERS
+    }
+
+
+def _proxy_queue_admission_error(service_name, routing_group=""):
+    """Refuse durable admission unless Redis and a recent target consumer exist."""
+    if not service_name:
+        return web.json_response(
+            {"error": "explicit service binding required", "code": "service_binding_required"},
+            status=400,
+        )
+    if queue_engine is None:
+        return web.json_response(
+            {"error": "queue unavailable", "code": "queue_unavailable"}, status=503
+        )
+    redis_client = getattr(queue_engine, "r", None)
+    try:
+        if redis_client is None or not redis_client.ping():
+            raise RuntimeError("redis health check failed")
+        stream_specs = queue_engine._stream_specs(
+            service_name, routing_group=routing_group or None
+        )
+        lanes_enabled = bool(getattr(queue_engine, "priority_lanes_enabled", False))
+        writable_specs = [
+            (stream, lane)
+            for stream, lane in stream_specs
+            if lane is not None or not lanes_enabled
+        ]
+        if not writable_specs:
+            raise RuntimeError("target queue has no writable streams")
+        group_name = getattr(queue_engine, "GROUP", "")
+        for stream, _lane in writable_specs:
+            groups = redis_client.xinfo_groups(stream)
+            matching = next(
+                (item for item in groups if item.get("name") == group_name), None
+            )
+            if matching is None:
+                raise RuntimeError("target consumer group unavailable")
+            consumers = redis_client.xinfo_consumers(stream, group_name)
+            if not any(
+                int(item.get("idle", 2**63 - 1)) < 120_000
+                for item in consumers
+            ):
+                raise RuntimeError("target writable stream has no live consumer")
+    except Exception:
+        return web.json_response(
+            {"error": "target queue is not healthy or has no live consumer", "code": "queue_not_admitting"},
+            status=503,
+        )
+    return None
+
+
 async def handle_llm_proxy(request: web.Request):
     """Proxy /v1/* to llama.cpp backend. Supports ?service=name or X-Backend header for routing."""
     path = request.path
     method = request.method
     llm.total_requests += 1
 
+    if path not in _LLM_PROXY_PATHS:
+        return web.json_response(
+            {"error": "not found", "code": "not_found"}, status=404
+        )
+
+    # Admission middleware may have parsed the request body; helpers receive the
+    # bytes already consumed by this handler. Honcho is a distinct logical-group
+    # principal and must not inherit KDA's default pin.
     body = None
     if request.can_read_body:
         body = await request.read()
+    honcho_authorized = _honcho_gemma_request_is_authorized(request, body)
+    kda_authorized = _scoped_gemma_request_is_authorized(request)
+    _kv = getattr(getattr(_combined_gemma_broker, "transport", None), "kv_affinity", None)
+    if isinstance(_kv, dict) and _kv:  # KvAffinityTransport is installed only when the flag is on
+        # KV affinity scope = the verified token's role, never client input; None -> no affinity.
+        from api_auth import bearer_matches
+        request["kv_principal"] = ("honcho" if honcho_authorized else "kda" if kda_authorized
+                                   else "api" if bearer_matches(request, _api_token()) else None)
+
+    forwarded_headers = request.headers
+    default_member = None
+    if honcho_authorized:
+        # Honcho is intentionally unpinned. A concrete member header is rejected
+        # by admission; do not allow validator upgrades or header routing here.
+        from multidict import CIMultiDict
+        forwarded_headers = CIMultiDict(request.headers)
+        forwarded_headers.popall("X-Backend", None)
+    elif _scoped_gemma_pin_is_unpinned(request) and kda_authorized:
+        default_member = _scoped_gemma_default_member(request, body)
+        if default_member is None:
+            return web.json_response(
+                {"error": "scoped token without a member pin is limited to its default model",
+                 "code": "scoped_default_model_mismatch"},
+                status=403,
+            )
+        from multidict import CIMultiDict
+        forwarded_headers = CIMultiDict(request.headers)
+        forwarded_headers["X-Backend"] = default_member
 
     # Validate model capabilities before routing
     task_hint = request.headers.get("X-Task-Hint", "")
-    requested_model = request.query.get("service") or request.headers.get("X-Backend") or ""
+    requested_model = (
+        request.query.get("service") or forwarded_headers.get("X-Backend") or ""
+    )
     if not requested_model and body:
         try:
             body_json = json.loads(body)
@@ -24911,7 +20928,7 @@ async def handle_llm_proxy(request: web.Request):
         except Exception:
             pass
 
-    if _model_validator and (task_hint or requested_model):
+    if _model_validator and (task_hint or requested_model) and not honcho_authorized:
         result = _model_validator.validate(
             requested_model,
             task_hint=task_hint,
@@ -24929,23 +20946,37 @@ async def handle_llm_proxy(request: web.Request):
                 )
 
     # Check for service override (query param or header)
-    service_name = request.query.get("service") or request.headers.get("X-Backend")
+    service_name = request.query.get("service") or forwarded_headers.get("X-Backend")
     # If validator upgraded the model, override service_name
-    if not service_name and requested_model and requested_model != (request.query.get("service") or request.headers.get("X-Backend")):
+    if not service_name and requested_model and requested_model != (request.query.get("service") or forwarded_headers.get("X-Backend")):
         service_name = requested_model
 
     service_name = _combined_gemma_ingress_service_name(service_name)
+
+    if not service_name:
+        return web.json_response(
+            {"error": "explicit service binding required", "code": "service_binding_required"},
+            status=400,
+        )
 
     _combined_response = await _maybe_handle_combined_gemma_ingress(
         service_name=service_name,
         method=method,
         path=path,
         body=body,
-        headers=request.headers,
+        headers=forwarded_headers,
         request=request,
+        allow_member_pin=(kda_authorized and not honcho_authorized),
     )
     if _combined_response is not None:
         return _combined_response
+    if honcho_authorized or default_member is not None:
+        # Fail closed: never let a header-less scoped request reach direct routing.
+        return web.json_response(
+            {"error": "combined_gemma_broker_unavailable",
+             "code": "combined_gemma_broker_unavailable", "retry_after": 5},
+            status=503,
+        )
 
     # If X-Backend is a routing group name (not a service), resolve to a service via routing engine
     _routing_group_from_header = ""
@@ -24969,11 +21000,24 @@ async def handle_llm_proxy(request: web.Request):
                     service_name = _resolved
                 else:
                     logger.warning(f"PROXY: X-Backend '{service_name}' is a routing group but no service available")
-                    service_name = ""
+                    return web.json_response(
+                        {"error": "unknown service", "code": "unknown_service"},
+                        status=404,
+                    )
 
     if service_name:
         svc = _services_config.get("services", {}).get(service_name)
         if svc and svc.get("enabled") and svc.get("type") == "llm_backend":
+            if svc.get("port") is None:
+                return web.json_response(
+                    {
+                        "error": "This member has no local backend port; use the combined router with model=gemma / X-Backend Gemma and its existing member-pin interface.",
+                        "code": "llm_backend_requires_combined_route",
+                        "service": service_name,
+                    },
+                    status=422,
+                )
+
             gpu_id = svc.get("gpu_id")
 
             if not gpu_id:
@@ -25015,12 +21059,61 @@ async def handle_llm_proxy(request: web.Request):
                 except Exception:
                     pass
 
+            if not already_healthy:
+                # A cold GPU service means a model load / eviction: admit first.
+                _proxy_body_json = {}
+                try:
+                    _proxy_body_json = json.loads(body) if body else {}
+                except Exception:
+                    pass
+                if not isinstance(_proxy_body_json, dict):
+                    _proxy_body_json = {}
+                _admission_rejection, _admission_info = _admission_gate(
+                    service_name, _proxy_body_json
+                )
+                if _admission_rejection is not None:
+                    return _admission_rejection
+
+            # After the existing admission gate, offer explicitly idempotent
+            # requests to a live, capacity-matching peer. Requests received
+            # from another node are never forwarded a second time.
+            _node_api = request.app.get("gpu_manager_node_api")
+            if _node_api is not None and request.headers.get("X-Node-Forwarded") != "1":
+                _node_request = {
+                    "model": service_name,
+                    "required_vram_mib": svc.get("required_vram_mib", 0),
+                }
+                _node_response = await _node_api.forward_request(
+                    request, body or b"", model=_node_request["model"],
+                    required_vram_mib=_node_request["required_vram_mib"],
+                )
+                if _node_response is not None:
+                    return _node_response
+
+            if not already_healthy and _queue_owner_mode() == "durable":
+                # The per-GPU LLM queue below is consumed by the legacy
+                # scheduler loop, which the durable owner never starts: admit
+                # a cold bundle-backed service here instead of parking it.
+                _cold_refusal = await _admit_cold_llm_service_inline(service_name, gpu_id)
+                if _cold_refusal is None:
+                    already_healthy = True
+                elif _cold_refusal != "unbundled":
+                    logger.warning("PROXY (%s): cold admission refused: %s", service_name, _cold_refusal)
+                    return web.json_response(
+                        {"error": f"Service {service_name} not admitted: {_cold_refusal}", "retry_after": 30},
+                        status=503,
+                    )
+
             if already_healthy:
                 # An explicit service selection is a pin, not a suggestion.
                 # Shared routing-group requests still use the Redis queue, but
                 # `model`/`service`/`X-Backend` naming a concrete healthy service
                 # must execute on that backend.
-                if not _routing_group_from_header and requested_model == service_name:
+                if (
+                    not _routing_group_from_header
+                    and requested_model == service_name
+                    and not _scoped_gemma_request_is_authorized(request)
+                ):
                     logger.info(
                         "PROXY (%s): explicit healthy service; forwarding directly",
                         service_name,
@@ -25041,8 +21134,7 @@ async def handle_llm_proxy(request: web.Request):
                         # Fallback to direct forward if ID allocation fails
                         return await _forward_llm(method, path, body, request.headers, backend_url=f"http://localhost:{port}")
 
-                    _proxy_headers = {k: v for k, v in request.headers.items()
-                                      if k.lower() not in ("host", "content-length", "transfer-encoding")}
+                    _proxy_headers = _proxy_persisted_headers(request.headers)
                     _proxy_payload = {
                         "job_id": _proxy_job_id,
                         "prompt": "",
@@ -25062,6 +21154,11 @@ async def handle_llm_proxy(request: web.Request):
 
                     _proxy_loop = asyncio.get_event_loop()
                     _proxy_routing_group = svc.get("routing_group", "")
+                    _queue_error = _proxy_queue_admission_error(
+                        service_name, _proxy_routing_group
+                    )
+                    if _queue_error is not None:
+                        return _queue_error
                     logger.info(f"handle_llm_proxy: enqueueing job_id={_proxy_job_id} routing_group={_proxy_routing_group} service_name={service_name}")
                     _proxy_entry = await _proxy_loop.run_in_executor(
                         None, lambda args: queue_engine.enqueue(*args),
@@ -25143,7 +21240,7 @@ async def handle_llm_proxy(request: web.Request):
                 "method": method,
                 "path": path,
                 "body": body,
-                "headers": dict(request.headers),
+                "headers": _proxy_persisted_headers(request.headers),
             }
             gpu_state.enqueue(
                 bundle_name=f"llm:{service_name}",
@@ -25198,6 +21295,18 @@ async def handle_llm_proxy(request: web.Request):
             backend_url = f"http://{inst['host']}:{inst['port']}"
             return await _forward_remote(method, path, body, request.headers, backend_url)
 
+        if not svc:
+            return web.json_response(
+                {"error": "unknown service", "code": "unknown_service"}, status=404
+            )
+        if svc.get("enabled") is False:
+            # A pin names one member; never reroute it silently to the default group (audit A6).
+            return web.json_response(
+                {"error": f"service {service_name} is disabled", "code": "service_disabled",
+                 "service": service_name},
+                status=409,
+            )
+
     # Default: use configured LLM backend with health/queue logic
     # If queue engine is available and LLM is healthy, route through queue
     # Phase 5.2.53 Fix A: fail-fast when generation is pinned and LLM is offline.
@@ -25240,8 +21349,7 @@ async def handle_llm_proxy(request: web.Request):
             _dp_services_config = _load_services_config()
             _proxy_job_id = job_tracker.next_job_id()
             if _proxy_job_id:
-                _proxy_headers = {k: v for k, v in request.headers.items()
-                                  if k.lower() not in ("host", "content-length", "transfer-encoding")}
+                _proxy_headers = _proxy_persisted_headers(request.headers)
                 _default_svc_name = _COMBINED_GEMMA_ROUTING_GROUP  # the routing group, not a service
                 _dp_routing_group = _COMBINED_GEMMA_ROUTING_GROUP
                 # Phase 5.2.80 R3c: the empty-string placeholders below
@@ -25270,6 +21378,11 @@ async def handle_llm_proxy(request: web.Request):
                     "body_b64": __import__("base64").b64encode(body or b"").decode("ascii") if body else "",
                 }
                 _dp_loop = asyncio.get_event_loop()
+                _queue_error = _proxy_queue_admission_error(
+                    _default_svc_name, _dp_routing_group
+                )
+                if _queue_error is not None:
+                    return _queue_error
                 logger.info(f"handle_llm_proxy: enqueueing job_id={_proxy_job_id} routing_group={_dp_routing_group} service_name={_default_svc_name}")
                 _proxy_entry = await _dp_loop.run_in_executor(
                     None, lambda args: queue_engine.enqueue(*args),
@@ -25462,16 +21575,51 @@ async def _route_to_cloud(method, path, body, headers, provider_config):
 # ── ComfyUI Direct Handlers ────────────────────────────────────────
 
 async def handle_comfyui_status(request: web.Request):
-    """GET /comfyui/status"""
+    """GET /comfyui/status; readiness is the ComfyUI /system_stats contract."""
+    if session is None or session.closed:
+        return web.json_response(
+            {
+                "status": "unavailable",
+                "error": "comfyui_unavailable",
+                "start_path": "/vram/start-comfyui",
+            },
+            status=503,
+        )
     try:
+        async with session.get(f"{COMFYUI_URL}/system_stats") as health_resp:
+            if health_resp.status != 200:
+                return web.json_response(
+                    {
+                        "status": "unavailable",
+                        "error": "comfyui_unavailable",
+                        "health_status": health_resp.status,
+                        "start_path": "/vram/start-comfyui",
+                    },
+                    status=503,
+                )
         async with session.get(f"{COMFYUI_URL}/queue") as resp:
+            if resp.status != 200:
+                return web.json_response(
+                    {"status": "unavailable", "error": "comfyui_queue_unavailable"},
+                    status=502,
+                )
             queue = await resp.json()
         return web.json_response({
+            "status": "ready",
+            "health_path": "/system_stats",
             "running": len(queue.get("queue_running", [])),
             "pending": len(queue.get("queue_pending", [])),
         })
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=502)
+        logger.info("ComfyUI status probe unavailable: %s", type(e).__name__)
+        return web.json_response(
+            {
+                "status": "unavailable",
+                "error": "comfyui_unavailable",
+                "start_path": "/vram/start-comfyui",
+            },
+            status=503,
+        )
 
 
 async def handle_comfyui_free(request: web.Request):
@@ -26086,14 +22234,72 @@ async def handle_comfyui_stop(request: web.Request):
     return web.json_response({"error": "Failed to stop ComfyUI"}, status=500)
 
 
+async def _start_comfyui_via_controller() -> dict[str, Any]:
+    """Explicitly start the managed ComfyUI bundle, then prove its health.
+
+    The bundle lifecycle path is the only start authority. A successful
+    systemd/controller response is not enough: /system_stats must answer before
+    the manager commits the local running-state cache.
+    """
+    result = await _mcp_call_tool("start_bundle", {"bundle_name": "comfyui"})
+    if (
+        not isinstance(result, dict)
+        or result.get("success") is not True
+        or result.get("healthy") is not True
+    ):
+        logger.warning("Explicit ComfyUI controller start failed: %s", result)
+        return {
+            "success": False,
+            "state": "start_failed",
+            "error": "comfyui_start_failed",
+            "controller_result": result,
+        }
+    if vram is None:
+        return {
+            "success": False,
+            "state": "controller_unavailable",
+            "error": "comfyui_controller_unavailable",
+        }
+    try:
+        ready = await vram._wait_for_comfyui_ready(timeout=120)
+    except Exception as exc:
+        logger.warning("ComfyUI /system_stats readiness probe failed: %s", type(exc).__name__)
+        ready = False
+    if not ready:
+        return {
+            "success": False,
+            "state": "health_failed",
+            "error": "comfyui_system_stats_unavailable",
+        }
+    try:
+        committed = await vram.mark_comfyui_running_after_commit(
+            unit=vram._configured_comfyui_unit("comfyui")
+        )
+    except Exception as exc:
+        logger.error("ComfyUI running-state commit failed: %s", type(exc).__name__)
+        committed = False
+    if not committed:
+        return {
+            "success": False,
+            "state": "health_failed",
+            "error": "comfyui_running_state_unconfirmed",
+        }
+    return {"success": True, "state": "ready", "bundle": "comfyui"}
+
+
 async def handle_comfyui_start(request: web.Request):
-    """POST /vram/start-comfyui — Start ComfyUI after LLM work is done."""
-    if not vram:
-        return web.json_response({"error": "VRAM manager not initialized"}, status=500)
-    success = await vram.start_comfyui(reason="api_request")
-    if success:
-        return web.json_response({"status": "comfyui_started", **vram.status()})
-    return web.json_response({"error": "Failed to start ComfyUI"}, status=500)
+    """POST /vram/start-comfyui — explicitly request the managed bundle."""
+    result = await _start_comfyui_via_controller()
+    if not result.get("success"):
+        return web.json_response(
+            {
+                "status": "unavailable",
+                "error": result.get("error", "comfyui_start_failed"),
+                "state": result.get("state"),
+            },
+            status=503,
+        )
+    return web.json_response({"status": "comfyui_ready", "health_path": "/system_stats"})
 
 
 async def handle_vram_evict_for(request: web.Request):
@@ -27535,6 +23741,22 @@ async def session_init():
 
 # ── Peer Monitor ──────────────────────────────────────────────────
 
+_PEER_MODEL_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,95}")
+
+
+def _peer_model_label(value) -> str | None:
+    """A peer's /v1/models id, kept only if it looks like a model name.
+
+    The id comes from another host's HTTP response and ends up in the
+    dashboard, so anything outside a strict charset (or over 96 chars) is
+    dropped rather than escaped. A path keeps its last segment.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().rsplit("/", 1)[-1]
+    return text if _PEER_MODEL_LABEL_RE.fullmatch(text) else None
+
+
 class PeerMonitor:
     """Periodically health-checks all remote peers in the mesh."""
 
@@ -27553,11 +23775,12 @@ class PeerMonitor:
                 "localhost", "127.0.0.1", "::1"
             }
             remote_processes = []
+            agent_live = False
 
             if is_local:
                 is_up = await self._check_local_service(name)
                 if is_up:
-                    vram_data = await _poll_vram()
+                    vram_data = await _poll_vram_background()
                     slots, tps = await self._get_llama_slots(host, port)
                 else:
                     vram_data = {}
@@ -27574,6 +23797,7 @@ class PeerMonitor:
                 if is_up and agent_port:
                     agent_data = await self._get_remote_agent_data(host, agent_port)
                     if agent_data:
+                        agent_live = True
                         vram_info = agent_data.get("vram", {})
                         # Remote agent returns "system_ram" (not "memory")
                         mem_info = agent_data.get("memory", agent_data.get("system_ram", {}))
@@ -27614,6 +23838,11 @@ class PeerMonitor:
                 "vram_live_mib": vram_data.get("used_vram_mib"),
                 "vram_live_total_mib": vram_data.get("total_vram_mib"),
                 "processes": remote_processes,
+                # Additive, display-only (dashboard host cards). The configured
+                # "model" above stays as-is for every other reader.
+                "model_live": None if is_local else _peer_model_label(remote_model),
+                "on_this_host": self._is_this_host(host),
+                "stats_live": bool(is_up) and (agent_live or bool(vram_data)),
             }
 
         for name, prov in self.providers_config.get("providers", {}).items():
@@ -27627,6 +23856,29 @@ class PeerMonitor:
                     "models": list(prov.get("models", {}).keys()),
                     "is_cloud": True,
                 }
+
+    def _is_this_host(self, host: str) -> bool:
+        """True when a peer's address is assigned to this machine (display only).
+
+        Binding port 0 on an address succeeds only for a local address; the
+        socket is closed at once and nothing listens. Cached per host.
+        """
+        cache = self.__dict__.setdefault("_this_host_cache", {})
+        if host in cache:
+            return cache[host]
+        result = False
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            result = True
+        elif isinstance(host, str) and re.fullmatch(r"[0-9.]{7,15}", host or ""):
+            import socket
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind((host, 0))
+                result = True
+            except OSError:
+                result = False
+        cache[host] = result
+        return result
 
     async def _check_remote_health(self, host: str, port: int) -> bool:
         """Simple TCP + HTTP health check for remote llama.cpp instances."""
@@ -27795,6 +24047,10 @@ class PeerMonitor:
 # ── VRAM Poller & WebSocket ────────────────────────────────────────
 
 VRAM_POLL_INTERVAL = 1.0  # seconds — for dashboard live updates
+# With no dashboard websocket attached the pusher loop only refreshes VRAM every
+# Nth tick (each refresh is a `sudo amdgpu_top`, one PAM session in the journal).
+# On-demand consumers still refresh through _poll_vram() under _VRAM_POLL_TTL.
+VRAM_IDLE_POLL_EVERY = max(1, int(os.environ.get("GPU_MANAGER_VRAM_IDLE_POLL_EVERY", "5")))
 _ws_clients: set[web.WebSocketResponse] = set()
 _vram_cache: dict = {}
 _queue_cache: dict = {}
@@ -27976,6 +24232,12 @@ def _parse_amdgpu_top(json_text: str) -> dict:
     total_used = 0
     total_gtt = 0
     total_gtt_used = 0
+    # Discrete-only aggregates: an APU's VRAM is a BIOS carve-out of system
+    # RAM, so adding it to the discrete total overstates GPU capacity.  The
+    # legacy totals above stay all-device for existing consumers.
+    dgpu_vram = 0
+    dgpu_used = 0
+    apu_vram = 0
     per_device = []  # per-device process lists for merging into _detect_gpus
 
     for dev in devices:
@@ -27985,6 +24247,8 @@ def _parse_amdgpu_top(json_text: str) -> dict:
         # Extract card name from /dev/dri/card1 -> card1
         card_name = card_path.rsplit("/", 1)[-1] if "/" in card_path else ""
         device_name = info.get("DevicePath", {}).get("DeviceName", "")
+        # amdgpu_top reports libdrm's classification: "APU" or "dGPU".
+        is_apu = str(info.get("GPU Type") or "").strip().upper() == "APU"
 
         # VRAM totals from this device
         vram_info = dev.get("VRAM", {})
@@ -27997,6 +24261,11 @@ def _parse_amdgpu_top(json_text: str) -> dict:
         total_used += dev_used_vram
         total_gtt += dev_total_gtt
         total_gtt_used += dev_used_gtt
+        if is_apu:
+            apu_vram += dev_total_vram
+        else:
+            dgpu_vram += dev_total_vram
+            dgpu_used += dev_used_vram
 
         # Parse per-process fdinfo
         fdinfo = dev.get("fdinfo", {})
@@ -28040,6 +24309,7 @@ def _parse_amdgpu_top(json_text: str) -> dict:
             "pci": pci,
             "card": card_name,
             "device_name": device_name,
+            "integrated": is_apu,
             "processes": dev_processes,
             "vram_total_mib": dev_total_vram,
             "vram_used_mib": dev_used_vram,
@@ -28055,6 +24325,10 @@ def _parse_amdgpu_top(json_text: str) -> dict:
         "usage_pct": round(total_used / total_vram * 100, 1) if total_vram else 0,
         "total_gtt_mib": total_gtt,
         "used_gtt_mib": total_gtt_used,
+        "dgpu_total_vram_mib": dgpu_vram,
+        "dgpu_used_vram_mib": dgpu_used,
+        "dgpu_usage_pct": round(dgpu_used / dgpu_vram * 100, 1) if dgpu_vram else 0,
+        "apu_vram_mib": apu_vram,
         "processes": all_processes,
         "process_count": len(all_processes),
         "devices": per_device,
@@ -28101,6 +24375,106 @@ def _read_sysfs_int(path: str | None) -> int | None:
         return None
 
 
+_GFX_ARCH_MAP_ENV = "GPU_MANAGER_GFX_ARCH_MAP"
+
+
+def _kfd_gfx_arch(gfx_target_version: int) -> str | None:
+    """Convert a KFD ``gfx_target_version`` (major*10000 + minor*100 + step) into ``gfxNNN``."""
+    if gfx_target_version <= 0:
+        return None
+    major, rest = divmod(gfx_target_version, 10000)
+    minor, step = divmod(rest, 100)
+    return f"gfx{major}{minor}{step:x}"
+
+
+def _drm_render_minor(card: str, sys_root: str = "/sys") -> int | None:
+    """Return the render-node minor (128+) that belongs to a DRM card, read-only."""
+    drm_dir = os.path.join(sys_root, "class", "drm", card, "device", "drm")
+    try:
+        entries = sorted(os.listdir(drm_dir))
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.startswith("renderD") and entry[len("renderD"):].isdigit():
+            return int(entry[len("renderD"):])
+    return None
+
+
+def _kfd_gfx_arch_for_render_minor(render_minor: int | None, sys_root: str = "/sys") -> str | None:
+    """Find the KFD topology node bound to *render_minor* and return its gfx arch."""
+    if render_minor is None:
+        return None
+    nodes_dir = os.path.join(sys_root, "class", "kfd", "kfd", "topology", "nodes")
+    try:
+        node_names = sorted(os.listdir(nodes_dir))
+    except OSError:
+        return None
+    for node in node_names:
+        text = _read_sysfs_text(os.path.join(nodes_dir, node, "properties"))
+        if not text:
+            continue
+        props = {}
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                props[parts[0]] = parts[1]
+        try:
+            if int(props.get("drm_render_minor", "0")) != render_minor:
+                continue
+            return _kfd_gfx_arch(int(props.get("gfx_target_version", "0")))
+        except ValueError:
+            continue
+    return None
+
+
+def _load_gfx_arch_map() -> dict:
+    """Optional hints from the JSON file named by GPU_MANAGER_GFX_ARCH_MAP.
+
+    Shape: {"device_ids": {"<pci device id>": "gfxNNN"}, "name_hints": {"<substring>": "gfxNNN"},
+    "bf16_unsupported": ["gfxNNN"]}.
+    Empty when the variable is unset or the file cannot be read.
+    """
+    path = os.environ.get(_GFX_ARCH_MAP_ENV, "").strip()
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _gfx_arch_bf16_unsupported() -> set:
+    """Architectures the operator's data marks as lacking native BF16 (empty by default)."""
+    values = _load_gfx_arch_map().get("bf16_unsupported") or []
+    return {str(item) for item in values} if isinstance(values, list) else set()
+
+
+def _gfx_arch_for_card(card: str, gpu_name: str, sys_root: str = "/sys") -> str | None:
+    """Return the gfx architecture of *card*, or None when it cannot be determined."""
+    arch = _kfd_gfx_arch_for_render_minor(_drm_render_minor(card, sys_root), sys_root)
+    if arch:
+        return arch
+    hints = _load_gfx_arch_map()
+    dev_id_raw = None
+    for dev_path in (f"/sys/class/drm/{card}/device/device", _sysfs_attr_path(card, "device")):
+        if dev_path and os.path.isfile(dev_path):
+            dev_id_raw = _read_sysfs_text(dev_path)
+            if dev_id_raw:
+                break
+    if dev_id_raw:
+        dev_id_clean = dev_id_raw.lower()
+        for dev_id, hinted in (hints.get("device_ids") or {}).items():
+            if str(dev_id).lower() in dev_id_clean:
+                return str(hinted)
+    upper_name = gpu_name.upper()
+    for needle, hinted in (hints.get("name_hints") or {}).items():
+        if str(needle).upper() in upper_name:
+            return str(hinted)
+    return None
+
+
 def is_junction_critical(telemetry: Mapping) -> bool:
     """Return whether junction temperature has reached its reported limit.
 
@@ -28130,6 +24504,23 @@ def junction_critical_threshold_known(telemetry: Mapping) -> bool:
         return True
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+def _read_card_pci_uevent(card: str) -> str:
+    """Return the PCI device uevent text for a DRM *card*.
+
+    ``/sys/class/drm/cardN/uevent`` is the DRM minor's own uevent
+    (MAJOR/MINOR/DEVNAME) and carries no PCI identity; the PCI_ID and
+    PCI_SLOT_NAME lines live in ``cardN/device/uevent``.  Prefer the first
+    candidate that actually carries PCI identity, so a direct-path fixture
+    that holds PCI lines keeps working, and return "" when none does.
+    """
+    card_path = f"/sys/class/drm/{card}"
+    for path in (f"{card_path}/device/uevent", f"{card_path}/uevent"):
+        text = _read_sysfs_text(path if os.path.exists(path) else None) or ""
+        if "PCI_SLOT_NAME=" in text or "PCI_ID=" in text:
+            return text
+    return ""
 
 
 def _detect_gpus() -> list:
@@ -28163,7 +24554,7 @@ def _detect_gpus() -> list:
         if not gpu_name:
             gpu_name = _read_sysfs_text(_sysfs_attr_path(card, "name")) or ""
         if not gpu_name:
-            uevent = _read_sysfs_text(_sysfs_attr_path(card, "uevent")) or ""
+            uevent = _read_card_pci_uevent(card)
             device_id = None
             for line in uevent.splitlines():
                 if line.startswith("PCI_ID="):
@@ -28197,7 +24588,7 @@ def _detect_gpus() -> list:
                     vram_total = raw // (1024 * 1024)
                     break
 
-        uevent = _read_sysfs_text(_sysfs_attr_path(card, "uevent")) or ""
+        uevent = _read_card_pci_uevent(card)
         pci_address = None
         for line in uevent.splitlines():
             if line.startswith("PCI_SLOT_NAME="):
@@ -28297,11 +24688,51 @@ def _detect_gpus() -> list:
             "temp_mem_crit_c": mem_crit_c,
         }
 
+        # Hardware recognition and capability traits (ROCm/Vulkan/CPU, BF16 constraints)
+        gfx_arch = None
+        device_vendor = "AMD"
+        device_status = "observed"
+        native_bf16 = False
+        compute_apis = ["rocm", "vulkan"]
+        supported_precisions = ["fp32", "fp16", "int8", "int4"]
+        unsupported_precisions = ["bf16"]
+
+        # Detect architecture from read-only kernel topology (KFD gfx target version
+        # of this card's DRM render node). Operator-supplied hints are used only
+        # when the kernel does not report it; none are compiled into this file.
+        gfx_arch = _gfx_arch_for_card(card, gpu_name)
+
+        if gfx_arch and gfx_arch in _gfx_arch_bf16_unsupported():
+            native_bf16 = False
+            unsupported_precisions = ["bf16"]
+            supported_precisions = ["fp32", "fp16", "int8", "int4"]
+        elif is_igpu:
+            native_bf16 = False
+            compute_apis = ["vulkan"]
+
+        vram_used_mib = None
+        if not is_igpu:
+            for attr in ("mem_info_vram_used", "mem_info_vis_vram_used"):
+                raw = _read_sysfs_int(_sysfs_attr_path(card, attr))
+                if raw is not None:
+                    vram_used_mib = raw // (1024 * 1024)
+                    break
+
+        vram_free_mib = max(0, vram_total - (vram_used_mib or 0)) if vram_total else 0
+
         gpu_entry = {
             "card": card,
             "gpu_type": gpu_type,
             "gpu_name": gpu_name,
+            "vendor": device_vendor,
+            "gfx_arch": gfx_arch,
+            "status": device_status,
+            "compute_apis": compute_apis,
+            "native_bf16": native_bf16,
+            "supported_precisions": supported_precisions,
+            "unsupported_precisions": unsupported_precisions,
             "vram_total_mib": vram_total,
+            "vram_free_mib": vram_free_mib,
             "pci_address": pci_address,
             # Keep this top-level compatibility field: older /vram clients
             # read it directly instead of traversing telemetry.
@@ -28309,17 +24740,12 @@ def _detect_gpus() -> list:
             "telemetry": telemetry,
         }
 
-        if not is_igpu:
-            for attr in ("mem_info_vram_used", "mem_info_vis_vram_used"):
-                raw = _read_sysfs_int(_sysfs_attr_path(card, attr))
-                if raw is not None:
-                    used_mib = raw // (1024 * 1024)
-                    gpu_entry["vram_used_mib"] = used_mib
-                    if vram_total:
-                        gpu_entry["vram_usage_pct"] = round(
-                            used_mib / vram_total * 100, 1
-                        )
-                    break
+        if vram_used_mib is not None:
+            gpu_entry["vram_used_mib"] = vram_used_mib
+            if vram_total:
+                gpu_entry["vram_usage_pct"] = round(
+                    vram_used_mib / vram_total * 100, 1
+                )
 
         gpus.append(gpu_entry)
 
@@ -28436,6 +24862,20 @@ def _enrich_process_with_identity(processes: list) -> list:
     return processes
 
 
+async def _poll_vram_background(max_age_s: float | None = None) -> dict:
+    """Reuse idle-pusher telemetry while it is within the idle polling window.
+
+    ``max_age_s`` lets a slow background caller (e.g. the orphan reaper, which
+    scans every ``ORPHAN_REAPER_INTERVAL_S`` = 30 s) reuse the shared cache for
+    longer than the idle-pusher's own refresh cadence without forcing an
+    expensive probe on every tick. ``None`` keeps the 5 s idle-pusher default.
+    """
+    window = (VRAM_IDLE_POLL_EVERY * VRAM_POLL_INTERVAL if max_age_s is None else max_age_s)
+    if _vram_cache and (time.monotonic() - _vram_cache_ts) < window:
+        return _vram_cache
+    return await _poll_vram()
+
+
 async def _poll_vram() -> dict:
     """Run amdgpu_top and return parsed VRAM data.
 
@@ -28476,6 +24916,48 @@ def _normalize_pci_address(value: str | None) -> str | None:
         f"{domain}:{match.group('bus')}:{match.group('device')}."
         f"{match.group('function')}"
     )
+
+
+def _is_generic_gpu_name(name: str | None) -> bool:
+    text = str(name or "").strip()
+    return not text or text == "Unknown AMD GPU" or text.startswith("AMD GPU (")
+
+
+def _annotate_gpu_identity(gpus: list, gpu_devices: Mapping | None) -> list:
+    """Attach the configured ``gpu_id`` (and a readable name) to /vram rows.
+
+    Scheduler state, bundles and the dashboard key GPUs by configured id
+    (e.g. ``gpu_a``) while sysfs rows are keyed by ``card``.  Match by
+    PCI address first, then by the configured ``card``.  A configured PCI
+    address that disagrees with the row's PCI address never falls back to the
+    card match.  A configured ``name`` replaces only a generic detected name.
+    """
+    devices = gpu_devices if isinstance(gpu_devices, Mapping) else {}
+    for gpu in gpus or []:
+        if not isinstance(gpu, dict):
+            continue
+        row_pci = _normalize_pci_address(gpu.get("pci_address"))
+        card = str(gpu.get("card") or "")
+        matched_gid = None
+        for gid, cfg in devices.items():
+            if not isinstance(cfg, Mapping):
+                continue
+            cfg_pci = _normalize_pci_address(cfg.get("pci"))
+            if cfg_pci and row_pci:
+                if cfg_pci == row_pci:
+                    matched_gid = gid
+                    break
+                continue
+            if card and str(cfg.get("card") or "") == card:
+                matched_gid = gid
+                break
+        if matched_gid is None:
+            continue
+        gpu["gpu_id"] = str(matched_gid)
+        cfg_name = str((devices.get(matched_gid) or {}).get("name") or "").strip()
+        if cfg_name and _is_generic_gpu_name(gpu.get("gpu_name")):
+            gpu["gpu_name"] = cfg_name
+    return gpus
 
 
 def _get_vram_entry_for_gpu(vram_data: dict, gpu_id: str | None) -> dict | None:
@@ -28525,6 +25007,11 @@ def _gpu_vram_ceiling_mib(gpu_id: str | None) -> int | None:
         for value in (ceiling, physical - reserve if physical and reserve else 0)
         if value > 0
     ]
+    # The RX 6950 XT drives the desktop. Preserve at least 1,536 MiB for
+    # Xorg/KWin/display regardless of an unsafe larger configured value. A stricter
+    # configured ceiling still wins through min().
+    if gpu_id == "rx6950xt":
+        candidates.append(14832)
     return min(candidates) if candidates else None
 
 
@@ -28585,6 +25072,9 @@ async def _poll_vram_once() -> dict:
                     break
             if matched:
                 gpu["processes"] = matched["processes"]
+                # Additive flag only: gpu_type stays as _detect_gpus set it,
+                # so admission and capacity inputs are unchanged.
+                gpu["integrated"] = bool(matched.get("integrated"))
                 if matched.get("vram_used_mib") is not None and not gpu.get("vram_used_mib"):
                     gpu["vram_used_mib"] = matched["vram_used_mib"]
                 total_mib = matched.get("vram_total_mib") or 0
@@ -28595,6 +25085,12 @@ async def _poll_vram_once() -> dict:
                         gpu["vram_usage_pct"] = round(used_mib / total_mib * 100, 1)
             else:
                 gpu["processes"] = []
+        try:
+            _annotate_gpu_identity(
+                gpus, (_load_services_config() or {}).get("gpu_devices", {})
+            )
+        except Exception as e:
+            logger.debug(f"GPU identity annotation failed: {e}")
         result["gpus"] = gpus
         # Augment with Vulkan/GEM-fd tenant data — visible to fdinfo
         # but not to amdgpu_top's per-process VRAM line. This is
@@ -28944,7 +25440,7 @@ def _build_mcp_tools():
             },
             {
                 "name": "start_comfyui",
-                "description": "Start ComfyUI for image/video generation.",
+                "description": "Explicitly start the managed ComfyUI bundle; reports ready only after /system_stats succeeds.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -29154,6 +25650,20 @@ def _build_mcp_tools():
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
+                    "required": [],
+                },
+            },
+            {
+                "name": "get_service_catalog",
+                "description": "Read-only service catalog: public ids, healthy slots, recommended concurrency and effective limits (same data as GET /v1/catalog).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "public_id": {
+                            "type": "string",
+                            "description": "Optional public id (e.g. llm.chat); omit for the whole catalog.",
+                        },
+                    },
                     "required": [],
                 },
             },
@@ -29407,7 +25917,7 @@ async def _mcp_call_tool(name: str, arguments: dict) -> dict:
         return await _mcp_preload_via_live_controller(arguments)
 
     elif name == "evict_llm":
-        success = await vram.evict_llm(reason="mcp_tool")
+        success = await _evict_llm_unless_protected_busy(vram, reason="mcp_tool")
         return {"success": success, "evicted": vram._llm_evicted}
 
     elif name == "restore_llm":
@@ -29419,8 +25929,7 @@ async def _mcp_call_tool(name: str, arguments: dict) -> dict:
         return {"success": success, "comfyui_stopped": vram._comfyui_stopped}
 
     elif name == "start_comfyui":
-        success = await vram.start_comfyui(reason="mcp_tool")
-        return {"success": success, "comfyui_running": not vram._comfyui_stopped}
+        return await _start_comfyui_via_controller()
 
     elif name == "comfyui_unload_models":
         # Call POST /free on the running ComfyUI to unload all models
@@ -29987,6 +26496,19 @@ async def _mcp_call_tool(name: str, arguments: dict) -> dict:
         except Exception:
             return _services_config
 
+    elif name == "get_service_catalog":
+        from urllib.parse import quote
+
+        public_id = arguments.get("public_id") or None
+        path = "/v1/catalog" + (f"/{quote(str(public_id), safe='')}" if public_id else "")
+        result = await _mcp_http("GET", path)
+        if result.get("_http_status") in {200, 404}:
+            result.pop("_http_status", None)
+            return result
+        # The stdio MCP process has no embedded broker: serve the static projection.
+        catalog = _build_service_catalog(_load_services_config(), None, _cliproxy_max_input_chars())
+        return _service_catalog_response(catalog, public_id)[1]
+
     elif name == "restart_service":
         svc_name = arguments.get("service_name")
         if not svc_name:
@@ -30112,14 +26634,16 @@ async def _mcp_call_tool(name: str, arguments: dict) -> dict:
         gpu_id = arguments.get("gpu_id")
         since = arguments.get("since")
         limit = min(int(arguments.get("limit", OOM_HISTORY_DEFAULT_LIMIT)), OOM_HISTORY_MAX_LIMIT)
-        events = _recent_oom_events(limit=limit)
+        # Filter the whole bounded ring first; applying the limit before the
+        # gpu_id/since filters would drop matching history behind other GPUs.
+        events = _recent_oom_events(limit=OOM_HISTORY_MAX_LIMIT)
         if gpu_id:
             events = [e for e in events if e.get("gpu_id") == gpu_id]
         if since:
             events = [e for e in events if e.get("ts", 0) >= since]
         return {
             "schema_version": 1,
-            "events": events[:limit],
+            "events": events[-limit:] if limit > 0 else [],
             "count": len(events),
             "filter": {"gpu_id": gpu_id, "since": since, "limit": limit},
         }
@@ -30448,6 +26972,14 @@ async def run_mcp_server():
     logger.info("MCP server stopped")
 
 
+def _vram_loop_should_poll(ws_clients_present: bool, cache_present: bool,
+                           idle_ticks: int, every: int | None = None) -> bool:
+    """Decide whether the pusher loop refreshes VRAM on this tick."""
+    if ws_clients_present or not cache_present:
+        return True
+    return idle_ticks >= (VRAM_IDLE_POLL_EVERY if every is None else every)
+
+
 async def _vram_pusher_loop():
     """Background task: poll VRAM every second and push to WebSocket clients."""
     global _vram_cache, _queue_cache, _service_health_cache, _service_health_counter
@@ -30460,9 +26992,15 @@ async def _vram_pusher_loop():
     # after gpu-manager startup. Keep autonomous full-GPU probes out of the
     # process-wide startup window; explicit operator/API probes remain available.
     await asyncio.sleep(GPU_PROBE_STARTUP_GRACE_S)
+    idle_ticks = VRAM_IDLE_POLL_EVERY
     while True:
         try:
-            vram_data = await _poll_vram()
+            if _vram_loop_should_poll(bool(_ws_clients), bool(_vram_cache), idle_ticks):
+                vram_data = await _poll_vram()
+                idle_ticks = 1
+            else:
+                vram_data = _vram_cache
+                idle_ticks += 1
             _vram_cache = vram_data
             queue_data = scheduler.get_queue_status() if scheduler else {}
 
@@ -30598,6 +27136,30 @@ def _stat_services_config() -> tuple | None:
     return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
+def _quarantine_invalid_config(config: dict) -> dict:
+    """Dry-run the config; drop invalid entries, log them, keep the rest.
+
+    A bad gpu_devices/template/service entry must never take the service
+    down or discard the valid entries around it.
+    """
+    try:
+        _ok, errors, cleaned = dry_run_config(config)
+        cleaned = dict(cleaned)
+        services = cleaned.get("services")
+        if isinstance(services, dict):
+            bad = {k: v for k, v in services.items() if not isinstance(v, dict)}
+            if bad:
+                errors.append(f"services: non-object entries {sorted(bad)}")
+                cleaned["services"] = {k: v for k, v in services.items() if k not in bad}
+                cleaned["_quarantined_services"] = bad
+        for err in errors:
+            logger.warning("CONFIG QUARANTINE: %s", err)
+        return cleaned
+    except Exception:
+        logger.exception("CONFIG QUARANTINE: dry run failed; using config as parsed")
+        return config
+
+
 def _load_services_config() -> dict:
     """Load services config from disk, falling back to defaults.
 
@@ -30670,6 +27232,7 @@ def _load_services_config() -> dict:
                 "services config top level must be a JSON object, "
                 f"got {type(new_config).__name__}"
             )
+        new_config = _quarantine_invalid_config(new_config)
         _validate_production_parallel_invariant(new_config)
         candidate_errors, candidate_warnings = _validate_config_for_observability(
             new_config
@@ -30731,6 +27294,16 @@ def _load_services_config() -> dict:
             logger.debug(f"bundle cache invalidation failed: {e}")
 
     return copy.deepcopy(_services_config_cache)
+
+
+def _first_boot_config_failed() -> bool:
+    """True when services.json exists but no valid copy was ever loaded (audit C4).
+
+    The loader then runs on the empty default config; the HTTP server must not
+    serve on that, so main() exits and systemd retries until the file is fixed.
+    """
+    _load_services_config()
+    return _services_config_cache_is_default and _stat_services_config() is not None
 
 
 def _pinned_service_blocks_idle_restore(pinned_service: str | None) -> bool:
@@ -31093,6 +27666,189 @@ def _get_bundle_for_service(service_name: str, bundles: dict | None = None) -> d
     return None
 
 
+# ── Plan 4.7: evict_only_when_idle bundles (strata-rx) ─────────────────
+# A bundle with ``evict_only_when_idle`` is never unloaded while it serves a
+# request. Only a non-idle requester with a higher configured priority may
+# replace it, and only after it goes idle. The occupant's CONFIG priority is
+# compared, not gs.bundle_priority (that records the requester's priority).
+_EVICT_ONLY_WHEN_IDLE_WAIT_SECONDS = 120.0
+_EVICT_ONLY_WHEN_IDLE_POLL_SECONDS = 2.0
+
+
+def _bundle_evict_only_when_idle(bundle_cfg: Mapping | None) -> bool:
+    return bool(isinstance(bundle_cfg, Mapping) and bundle_cfg.get("evict_only_when_idle"))
+
+
+def _protected_bundles_on_gpu(
+    gpu_id: str,
+    bundles: Mapping,
+    skip_bundle_name: str | None = None,
+) -> list[str]:
+    """evict_only_when_idle bundles currently loaded on *gpu_id*."""
+    gs = _gpu_states.get(gpu_id) if isinstance(_gpu_states, dict) else None
+    if gs is None:
+        return []
+    names: list[str] = []
+    for name in [getattr(gs, "loaded_bundle", None), *list(getattr(gs, "loaded_bundles", None) or [])]:
+        if isinstance(name, str) and name.startswith("llm:"):
+            name = name[len("llm:"):]
+        if (
+            name
+            and name != skip_bundle_name
+            and name not in names
+            and _bundle_evict_only_when_idle(bundles.get(name))
+        ):
+            names.append(name)
+    return names
+
+
+def _protected_occupant_refusal(
+    requester_name: str | None,
+    requester_cfg: Mapping | None,
+    occupant_name: str,
+    occupant_cfg: Mapping,
+) -> str | None:
+    """Why *requester* may never evict *occupant*, or None when it may (once idle)."""
+    requester_cfg = requester_cfg or {}
+    if requester_cfg.get("idle"):
+        return f"idle bundle {requester_name} never evicts {occupant_name}"
+    try:
+        req_priority = int(requester_cfg.get("priority", 5))
+        occ_priority = int(occupant_cfg.get("priority", 0))
+    except (TypeError, ValueError):
+        return f"unparseable priority for {requester_name} or {occupant_name}"
+    if req_priority <= occ_priority:
+        return (
+            f"{requester_name} priority {req_priority} <= {occupant_name} "
+            f"priority {occ_priority}"
+        )
+    return None
+
+
+async def _bundle_busy(bundle_name: str, bundles: Mapping | None = None) -> bool:
+    """True while *bundle_name* serves a request or cannot prove it is idle.
+
+    Fails closed (busy) on a timeout, a non-200 or an unparseable /slots body.
+    A refused connection means no process is listening, so nothing can be
+    interrupted and the bundle counts as idle.
+    """
+    if bundles is None:
+        bundles = _resolve_bundles()
+    cfg = bundles.get(bundle_name) or {}
+    for gid in _bundle_physical_gpu_set(bundle_name, bundles=bundles):
+        gs = _gpu_states.get(gid) if isinstance(_gpu_states, dict) else None
+        if gs is not None and int(getattr(gs, "worker_in_flight", 0) or 0) > 0:
+            return True
+    services_cfg = (_load_services_config() or {}).get("services", {})
+    for svc_name in cfg.get("services", []):
+        if capacity_tracker is not None and capacity_tracker._active.get(svc_name, 0) > 0:
+            return True
+        port = (services_cfg.get(svc_name) or {}).get("port")
+        if not port:
+            return True
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=3)) as session:
+                async with session.get(f"http://127.0.0.1:{int(port)}/slots") as resp:
+                    if resp.status != 200:
+                        return True
+                    slots = await resp.json(content_type=None)
+        except ClientConnectorError:
+            continue
+        except Exception:
+            return True
+        if not isinstance(slots, list):
+            return True
+        if any(isinstance(slot, Mapping) and slot.get("is_processing") for slot in slots):
+            return True
+    return False
+
+
+async def _protected_occupant_busy_on_gpu(
+    gpu_id: str,
+    skip_bundle_name: str | None = None,
+) -> str | None:
+    """Name of a busy evict_only_when_idle bundle on *gpu_id*, else None."""
+    bundles = _resolve_bundles()
+    for occupant in _protected_bundles_on_gpu(gpu_id, bundles, skip_bundle_name):
+        if await _bundle_busy(occupant, bundles):
+            return occupant
+    return None
+
+
+async def _evict_llm_unless_protected_busy(vram, reason: str, target_gpu: str | None = None,
+                                           skip_bundle_name: str | None = None,
+                                           admission_authorized: bool = False) -> bool:
+    """``vram.evict_llm`` that refuses while an evict_only_when_idle bundle serves a request.
+
+    Plan 4.7: every eviction path goes through here; VRAMLifecycleManager is a
+    frozen template, so the guard lives in the facade.
+    """
+    gpus = [target_gpu] if target_gpu else sorted(_gpu_states or {})
+    for gpu_id in gpus:
+        occupant = await _protected_occupant_busy_on_gpu(gpu_id, skip_bundle_name)
+        if occupant:
+            logger.warning(
+                "VRAM: refusing LLM eviction on %s (%s): %s is serving a request",
+                gpu_id, reason, occupant,
+            )
+            return False
+    return await vram.evict_llm(
+        reason=reason, target_gpu=target_gpu, skip_bundle_name=skip_bundle_name,
+        admission_authorized=admission_authorized,
+    )
+
+
+def _bundle_resident_on_all_gpus(bundle_name: str, bundles: Mapping) -> bool:
+    gpus = _bundle_physical_gpu_set(bundle_name, bundles=bundles)
+    if not gpus:
+        return False
+    for gid in gpus:
+        gs = _gpu_states.get(gid) if isinstance(_gpu_states, dict) else None
+        if gs is None or getattr(gs, "state", None) in ("loading", "evicting", "draining"):
+            return False
+        loaded = [getattr(gs, "loaded_bundle", None), *list(getattr(gs, "loaded_bundles", None) or [])]
+        if bundle_name not in loaded:
+            return False
+    return True
+
+
+_COLD_LLM_ADMIT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def _admit_cold_llm_service_inline(service_name: str, gpu_id: str) -> str | None:
+    """Admit a cold bundle-backed LLM from the proxy. None = loaded, else why not."""
+    bundles = _resolve_bundles()
+    service_bundle = _get_bundle_for_service(service_name, bundles=bundles)
+    if not service_bundle:
+        return "unbundled"
+    priority = int(service_bundle.get("priority", 0) or 0)
+    bundle_name = service_bundle["bundle_name"]
+    llm.active_requests += 1  # keep the idle manager from swapping mid-load
+    try:
+        # One load per GPU at a time: a request arriving mid-load waits, then
+        # finds the bundle resident and skips admission.
+        async with _COLD_LLM_ADMIT_LOCKS.setdefault(gpu_id, asyncio.Lock()):
+            if _bundle_resident_on_all_gpus(bundle_name, bundles):
+                return None
+            for target_gpu in sorted(_bundle_physical_gpu_set(bundle_name, bundles=bundles) or {gpu_id}):
+                gs = _gpu_states.get(target_gpu) if isinstance(_gpu_states, dict) else None
+                for name in [getattr(gs, "loaded_bundle", None), *list(getattr(gs, "loaded_bundles", None) or [])]:
+                    name = str(name or "").removeprefix("llm:")
+                    if not name or name == bundle_name:
+                        continue
+                    occupant = bundles.get(name)
+                    if occupant and occupant.get("idle"):
+                        continue
+                    # evict_llm stops only LLM units: never load next to an unknown,
+                    # equal or higher-priority tenant (generation backends, strata).
+                    if not occupant or int(occupant.get("priority", 0) or 0) >= priority:
+                        return f"GPU {target_gpu} holds {name} at equal or higher priority"
+            admitted, _ = await _admit_bundle_backed_llm_service(service_name, priority=priority)
+    finally:
+        llm.active_requests -= 1
+    return None if admitted else "bundle admission failed"
+
+
 async def _admit_bundle_backed_llm_service(
     service_name: str,
     priority: int,
@@ -31103,9 +27859,28 @@ async def _admit_bundle_backed_llm_service(
     if not service_bundle:
         return False, None
     bundle_name = service_bundle["bundle_name"]
+    if _bundle_evict_only_when_idle(service_bundle) and _bundle_resident_on_all_gpus(
+        bundle_name, bundles
+    ):
+        # Already loaded: a repeat admission must not unload it mid-answer.
+        return True, service_bundle
+    for target_gpu in sorted(_bundle_physical_gpu_set(bundle_name, bundles=bundles)):
+        for occupant in _protected_bundles_on_gpu(target_gpu, bundles, bundle_name):
+            refusal = _protected_occupant_refusal(
+                bundle_name, service_bundle, occupant, bundles.get(occupant) or {}
+            )
+            if refusal is None and await _bundle_busy(occupant, bundles):
+                refusal = f"{occupant} is serving a request"
+            if refusal is not None:
+                logger.warning(
+                    "LLM queue bundle admission refused on GPU %s for %s: %s",
+                    target_gpu, bundle_name, refusal,
+                )
+                return False, service_bundle
     async def _admit_operation() -> bool:
         for target_gpu in sorted(_bundle_physical_gpu_set(bundle_name, bundles=bundles)):
-            if not await vram.evict_llm(
+            if not await _evict_llm_unless_protected_busy(
+                vram,
                 reason=f"llm_queue_bundle_admission:{bundle_name}",
                 target_gpu=target_gpu,
                 admission_authorized=True,
@@ -31302,7 +28077,10 @@ def _transition_linked_bundle_state(
             gs.bundle_priority = priority
             gs.state = "loaded"
             gs.set_current_priority(priority, source=source)
-            gs.touch_activity(source=source)
+            # The 30 s authoritative reconcile re-asserts resident bundles;
+            # re-stamping there would reset the idle-unload clock forever.
+            if name not in current:
+                gs.touch_activity(source=source)
         elif new_roster:
             # Preserve a canonical owner only when it independently survived
             # this linked-group rollback. Never invent ownership from list
@@ -32155,6 +28933,13 @@ class BundleAdmissionDeferred(RuntimeError):
     """Temporary lifecycle contention; no backend attempt has occurred."""
 
 
+def _admission_waits(reason) -> bool:
+    """Queued callers (worker reserve, per-GPU bundle queue, ACE-Step) wait on
+    a busy/foreign-held GPU instead of failing; direct callers still refuse."""
+    r = str(reason)
+    return r.startswith(("worker_reserve", "gpu-queue:")) or r == "acestep_job"
+
+
 async def _run_bundle_transition(
     bundle_name: str,
     operation: Callable[[], Any],
@@ -32178,7 +28963,7 @@ async def _run_bundle_transition(
         reason=reason,
     )
     if resource_guard_enabled and resource_lease is None:
-        if reason.startswith("worker_reserve:"):
+        if _admission_waits(reason):
             raise BundleAdmissionDeferred(f"resource ownership unavailable: {resource_ids}")
         return False
     try:
@@ -32212,7 +28997,7 @@ async def _run_bundle_transition(
             reason,
             admission_reason,
         )
-        if reason.startswith("worker_reserve:"):
+        if _admission_waits(reason):
             raise BundleAdmissionDeferred(f"bundle transition busy: {admission_reason}")
         return False
     if admission_reason == "stale_transition":
@@ -32314,6 +29099,139 @@ async def _evict_then_load_bundle(
         desired_state=BundleDesiredState.RUNNING,
         reason=reason,
     )
+
+
+# ── Catalog 5e: warm-pool pre-load (flag GPU_MANAGER_WARM_POOL_PRELOAD) ──
+# Queue look-ahead: the main dispatcher loads pending_groups[0]; this preloads
+# the bundle of a LATER pending group whose durable head job is still queued,
+# onto GPUs no higher-ranked group needs and no job is running on. It loads
+# through _evict_then_load_bundle with scheduler-path semantics (only
+# worker_reserve: reasons defer); protected services are never evicted there
+# (evict_llm unloads bundles + priority<10 services, VRAM freeing skips protected).
+# shortcut: on the live topology (idle member on both GPUs, protected service on one) it only
+# fires when a finished generation bundle still holds every target GPU; widen
+# (e.g. to idle-member slots) only with an explicit no-thrash design.
+_warm_pool_memory = _warm_pool.WarmPoolMemory()
+
+
+async def _warm_pool_gpu_blocker(gid: str, bundles: dict, pending_bundles: set) -> str | None:
+    gs = _get_gpu_state(gid)
+    reason = _warm_pool.gpu_blocker(
+        gs,
+        bundles=bundles,
+        gpu_has_idle_member=_get_idle_bundle(gid, bundles) is not None,
+        pending_bundles=pending_bundles,
+    )
+    if reason:
+        return reason
+    try:
+        orch = getattr(scheduler, "_placement_orchestrator", None) if scheduler is not None else None
+        if orch is not None and orch.is_idle_held(gid):
+            return "idle_hold"
+    except Exception:
+        return "idle_hold_unknown"
+    for occupant in _warm_pool.loaded_names(gs):
+        if _bundle_worker_in_flight(occupant, bundles) > 0 or _auto_evict_bundle_blockers(
+            occupant, bundles=bundles
+        ):
+            return "occupant_busy"
+        try:
+            if await asyncio.to_thread(_bundle_tracker_in_flight_jobs, occupant, bundles):
+                return "occupant_tracker_in_flight"
+        except Exception:
+            return "occupant_tracker_unknown"
+    return None
+
+
+async def _warm_pool_fit_blocker(bundle: str, bundles: dict) -> str | None:
+    snapshot = _vram_cache or None
+    if not _fit_validator._snapshot_ok(snapshot):
+        return "fit_no_live_vram_snapshot"
+    owners = {bundle, *_get_linked_bundles(bundle, bundles=bundles)}
+    try:
+        findings = await asyncio.to_thread(
+            _fit_validator.evaluate, _load_services_config(), snapshot, owners=owners
+        )
+    except Exception as exc:
+        return f"fit_validator_error:{type(exc).__name__}"
+    errors = sorted({f"{f['rule']}:{f['component']}" for f in findings if f.get("severity") == "error"})
+    return f"fit_refused:{','.join(errors)}" if errors else None
+
+
+async def _warm_pool_load(bundle: str, group: str, priority) -> bool:
+    try:
+        loaded = await _evict_then_load_bundle(bundle, reason=f"warm_pool:{group}", priority=priority)
+    except Exception as exc:
+        logger.warning("warm_pool: preload %s raised %s: %s", bundle, type(exc).__name__, exc)
+        return False
+    logger.info("warm_pool: preload %s %s", bundle, "loaded" if loaded else "refused by the load path")
+    return bool(loaded)
+
+
+async def _warm_pool_preload_tick() -> dict | None:
+    """Start at most one look-ahead preload; returns what it started (tests/telemetry)."""
+    mem = _warm_pool_memory
+    if mem.busy() or _bundle_transition_is_active():
+        return None
+    # Grace, dwell hold and idle never preload: only live demand does.
+    if not str((_last_next_decision or {}).get("next_decision", "")).startswith("demand:"):
+        return None
+    pending = [g.get("group") for g in (_last_pending_groups or []) if isinstance(g, Mapping) and g.get("group")]
+    if len(pending) < 2 or any(_active_group_still_draining(g) for g in pending):
+        return None
+    bundles = _resolve_bundles()
+    resolved = {g: _resolve_scheduler_bundle_for_group(g) for g in pending}
+    pending_bundles = {b for b, _p, err in resolved.values() if b and not err}
+    claimed: set = set()  # GPUs a higher-ranked pending group needs
+    for idx, group in enumerate(pending):
+        bundle, priority, err = resolved[group]
+        gpus = set(_bundle_physical_gpu_set(bundle, bundles=bundles)) if bundle and not err else set()
+        overlap = gpus & claimed
+        claimed |= gpus or set(_resolve_group_target_gpus(group) or [])
+        if idx == 0 or not gpus or _bundle_resident_on_all_gpus(bundle, bundles):
+            continue
+        head = _scheduler_precheck_head_jobs(group).get("head_job_ids") or []
+        if not head:
+            continue
+        job_id = str(head[0])
+        reason = mem.hysteresis(job_id, bundle)
+        if not reason and overlap:
+            reason = "gpu_needed_by_higher_pending_group"
+        for gid in ([] if reason else sorted(gpus)):
+            reason = await _warm_pool_gpu_blocker(gid, bundles, pending_bundles)
+            if reason:
+                reason = f"{gid}:{reason}"
+                break
+        if not reason:
+            reason = await _warm_pool_fit_blocker(bundle, bundles)
+        if reason:
+            mem.log_once(logger, job_id, reason, "warm_pool: skip %s for job %s (group %s): %s",
+                         bundle, job_id, group, reason)
+            continue
+        mem.record(job_id, bundle)
+        mem.log_once(logger, job_id, "preload", "warm_pool: preload %s on %s for queued job %s (group %s)",
+                     bundle, sorted(gpus), job_id, group)
+        mem.task = asyncio.create_task(_warm_pool_load(bundle, group, priority))
+        return {"group": group, "bundle": bundle, "job_id": job_id}
+    return None
+
+
+async def _active_resident_unit(gpu_id: str) -> str | None:
+    """First active unit in gpu_devices.<gpu>.resident_units (foreign tenants such as Breccia)."""
+    gdev = ((_load_services_config().get("gpu_devices") or {}).get(gpu_id)) or {}
+    for unit in gdev.get("resident_units") or []:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "is-active", "--quiet", unit,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await asyncio.wait_for(proc.wait(), timeout=3) == 0:
+                return unit
+        except Exception:
+            return unit  # cannot tell: fail closed, never risk the tenant's VRAM
+    return None
+
+
 async def _evict_then_load_bundle_unlocked(
     bundle_name: str,
     reason: str = "queue_path",
@@ -32375,7 +29293,26 @@ async def _evict_then_load_bundle_unlocked(
         # Priority-aware pre-check: only refuse if a HIGHER-priority bundle
         # is already loaded on the GPU. The idle LLM is what we are SUPPOSED
         # to evict, so we deliberately do NOT block on VRAM amount here.
+        sched_obj = globals().get("scheduler")
+        placement_orch = getattr(sched_obj, "_placement_orchestrator", None) if sched_obj is not None else None
+
         for gid in target_gpus:
+            resident = await _active_resident_unit(gid)
+            if resident:
+                if _admission_waits(reason):
+                    raise BundleAdmissionDeferred(f"resident tenant {resident} holds {gid}")
+                # shortcut: other entry points refuse (job fails) instead of a queued WAIT; resident tenants are never stopped here.
+                logger.warning(
+                    f"queue_path: GPU {gid} holds resident tenant '{resident}' - "
+                    f"refusing to load bundle {bundle_name} (resident units are never stopped)"
+                )
+                return False
+            if placement_orch is not None and placement_orch.is_idle_held(gid):
+                logger.warning(
+                    f"queue_path: GPU {gid} is held by active idle hold - refusing to evict for bundle {bundle_name}"
+                )
+                return False
+
             gs = _get_gpu_state(gid)
             if (
                 gs is not None
@@ -32389,6 +29326,34 @@ async def _evict_then_load_bundle_unlocked(
                     f"{effective_priority}) - refusing to evict for bundle {bundle_name}"
                 )
                 return False
+
+        # Plan 4.7: an evict_only_when_idle occupant is replaced only by a
+        # higher-priority non-idle bundle, and only once it is idle.
+        for gid in target_gpus:
+            for occupant in _protected_bundles_on_gpu(gid, bundles, bundle_name):
+                refusal = _protected_occupant_refusal(
+                    bundle_name, bundle, occupant, bundles.get(occupant) or {}
+                )
+                if refusal is not None:
+                    logger.warning(
+                        f"queue_path: GPU {gid} keeps '{occupant}' - {refusal}; "
+                        f"refusing to evict for bundle {bundle_name}"
+                    )
+                    return False
+                deadline = time.monotonic() + _EVICT_ONLY_WHEN_IDLE_WAIT_SECONDS
+                while await _bundle_busy(occupant, bundles):
+                    if _admission_waits(reason):
+                        raise BundleAdmissionDeferred(
+                            f"{occupant} on {gid} is serving a request"
+                        )
+                    if time.monotonic() >= deadline:
+                        logger.warning(
+                            f"queue_path: '{occupant}' on GPU {gid} still busy after "
+                            f"{_EVICT_ONLY_WHEN_IDLE_WAIT_SECONDS:.0f}s - refusing to "
+                            f"evict for bundle {bundle_name}"
+                        )
+                        return False
+                    await asyncio.sleep(_EVICT_ONLY_WHEN_IDLE_POLL_SECONDS)
 
         # Begin a backend-local drain only after the priority precheck passes.
         # The logical Gemma routing group remains live through CPU/secondary GPU members.
@@ -32448,7 +29413,8 @@ async def _evict_then_load_bundle_unlocked(
         try:
             for gid in target_gpus:
                 try:
-                    ev_ok = await vram.evict_llm(
+                    ev_ok = await _evict_llm_unless_protected_busy(
+                        vram,
                         reason=f"{reason}:{bundle_name}",
                         target_gpu=gid,
                         skip_bundle_name=bundle_name,
@@ -32602,6 +29568,8 @@ async def _load_bundle(
             q = _get_bundle_request_queue(bundle_name)
             await q.resolve_all(success=False)
             return False
+    await asyncio.to_thread(_fit_validator.warn_if_unfit, logger, config, _vram_cache or None,
+                            [bundle_name], project_root=PROJECT_ROOT)
 
     # BUGFIX: Mark GPU as loading so the watchdog does not race the load.
     _gs_obj = _get_gpu_state(gpu_id) if gpu_id else None
@@ -33213,6 +30181,18 @@ async def _unload_bundle(bundle_name: str) -> bool:
     return all_ok
 
 
+def _active_bundle_children(bundle_name: str, bundles: dict) -> set[str]:
+    """Find linked child bundles whose own GPU has accepted worker activity."""
+    children = set(_get_linked_bundles(bundle_name, bundles=bundles))
+    active = set()
+    for name in children:
+        gpu_id = (bundles.get(name) or {}).get("gpu_id")
+        state = _get_gpu_state(gpu_id) if gpu_id else None
+        if int(getattr(state, "worker_in_flight", 0) or 0) > 0:
+            active.add(name)
+    return active
+
+
 def _linked_bundle_unload_order(
     bundle_name: str,
     bundles: dict | None = None,
@@ -33260,6 +30240,12 @@ async def _teardown_bundle_graph(
             exc,
         )
         return False
+
+    active_children = _active_bundle_children(bundle_name, bundles)
+    transition_members = _exclude_active_child_transitions(
+        bundle_name, transition_members, active_children=active_children
+    )
+    teardown_order = [name for name in teardown_order if name not in active_children]
 
     async def _unload_graph() -> bool:
         for name in teardown_order:
@@ -33331,6 +30317,12 @@ async def _run_bundle_eviction_for_vram(
                 return False
         return True
 
+    active_children = _active_bundle_children(bundle_name, bundles)
+    transition_members = _exclude_active_child_transitions(
+        bundle_name, transition_members, active_children=active_children
+    )
+    unload_order = [name for name in unload_order if name not in active_children]
+
     return await _run_bundle_group_transition(
         transition_members,
         _unload_graph,
@@ -33374,7 +30366,8 @@ async def _run_standalone_llm_eviction(
         return False
 
     async def _evict() -> bool:
-        return await vram_manager.evict_llm(
+        return await _evict_llm_unless_protected_busy(
+            vram_manager,
             reason=reason,
             target_gpu=work_gpu,
             skip_bundle_name=skip_bundle_name,
@@ -33403,19 +30396,23 @@ async def _rollback_bundle_graph(
     if bundles is None:
         bundles = _resolve_bundles()
     preserve = set(preserve or set())
+    active_children = _active_bundle_children(bundle_name, bundles)
+    preserve.update(active_children)
     order = _linked_bundle_unload_order(bundle_name, bundles)
     attempted: list[str] = []
     preserved: list[str] = []
     errors: list[str] = []
 
-    # Never unload a graph while a worker still owns an accepted request.
-    # This is a bounded refusal barrier, not a force-timeout: on timeout the
-    # rollback reports the blocker and leaves every bundle running.
+    # Drain only this root's own accepted work. A linked child has an independent
+    # owner and is preserved below rather than delaying or being torn down by
+    # this rollback.
     deadline = time.monotonic() + DRAIN_TIMEOUT
-    in_flight = _bundle_worker_in_flight(bundle_name, bundles)
+    root_gpu_id = (bundles.get(bundle_name) or {}).get("gpu_id")
+    root_state = _get_gpu_state(root_gpu_id) if root_gpu_id else None
+    in_flight = int(getattr(root_state, "worker_in_flight", 0) or 0)
     while in_flight > 0 and time.monotonic() < deadline:
         await asyncio.sleep(0.1)
-        in_flight = _bundle_worker_in_flight(bundle_name, bundles)
+        in_flight = int(getattr(root_state, "worker_in_flight", 0) or 0)
     if in_flight > 0:
         errors.append(f"rollback drain blocked by {in_flight} in-flight worker(s)")
         return {
@@ -33547,6 +30544,7 @@ async def _terminalize_pre_forward_job(
     consumer_name: str,
     status: str,
     reason: str,
+    error_type: str | None = None,
 ) -> None:
     """Terminalize and ACK a job that exits before backend forward.
 
@@ -33558,7 +30556,9 @@ async def _terminalize_pre_forward_job(
         raise RuntimeError("cannot terminalize pre-forward job: job tracker unavailable")
     await _run_terminalization_step(
         "job_tracker.update_status",
-        lambda: tracker.update_status(job_id, status, error=reason),
+        lambda: tracker.update_status(
+            job_id, status, error=reason, **({"error_type": error_type} if error_type else {})
+        ),
     )
 
     if entry_id:
@@ -33574,6 +30574,11 @@ async def _terminalize_pre_forward_job(
                 service_name, consumer_name, entry_id, **kwargs
             ),
         )
+
+
+READINESS_GATE_DEFAULT_TIMEOUT_S = 120.0
+READINESS_GATE_MIN_POLL_HTTP_TIMEOUT_S = 10.0
+READINESS_GATE_LOG_BODY_CHARS = 512
 
 
 async def _readiness_cancel_requested(job_id: str) -> bool:
@@ -33623,11 +30628,20 @@ async def _wait_service_readiness_gate(
             reason=f"readiness gate missing port for service '{readiness_service_name}'",
         )
         return False
-    deadline = time.monotonic() + max(0.0, float(readiness_timeout_s))
+    # An unset or non-positive timeout means "use the default", never "wait
+    # forever" and never "fail on the first poll".
+    timeout_s = float(readiness_timeout_s or 0)
+    if timeout_s <= 0:
+        timeout_s = READINESS_GATE_DEFAULT_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
     readiness_path = readiness_path or svc_cfg.get("health_path") or "/health"
     poll_interval = max(0.01, float(readiness_poll_interval_s or 0.1))
+    poll_http_timeout = max(READINESS_GATE_MIN_POLL_HTTP_TIMEOUT_S, poll_interval)
     url = f"http://127.0.0.1:{int(port)}{readiness_path}"
     required_fields = _normalize_readiness_required_fields(readiness_required_fields)
+    last_status: int | None = None
+    last_body = ""
+    last_reason = ""
     while True:
         if await _readiness_cancel_requested(job_id):
             await _terminalize_pre_forward_job(
@@ -33641,17 +30655,28 @@ async def _wait_service_readiness_gate(
             )
             return False
         try:
-            get_result = session_obj.get(url, timeout=ClientTimeout(total=min(3.0, poll_interval)))
+            get_result = session_obj.get(url, timeout=ClientTimeout(total=poll_http_timeout))
             if asyncio.iscoroutine(get_result):
                 get_result = await get_result
             async with get_result as resp:
                 status_code = int(getattr(resp, "status", 0) or 0)
+                last_status = status_code
                 payload = None
                 if required_fields or predicate_field:
                     try:
                         payload = await resp.json()
                     except Exception:
                         payload = None
+                if payload is not None:
+                    try:
+                        last_body = json.dumps(payload, default=str)[:READINESS_GATE_LOG_BODY_CHARS]
+                    except Exception:
+                        last_body = repr(payload)[:READINESS_GATE_LOG_BODY_CHARS]
+                else:
+                    try:
+                        last_body = (await resp.text())[:READINESS_GATE_LOG_BODY_CHARS]
+                    except Exception:
+                        last_body = ""
                 evaluator_kwargs = {
                     "status": status_code,
                     "payload": payload,
@@ -33679,6 +30704,7 @@ async def _wait_service_readiness_gate(
                         reason,
                     )
                     return True
+                last_reason = str(reason)
                 logger.debug(
                     "Worker-%d: readiness gate not yet satisfied for %s (%s)",
                     worker_id,
@@ -33686,6 +30712,7 @@ async def _wait_service_readiness_gate(
                     reason,
                 )
         except Exception as exc:
+            last_reason = f"poll exception: {exc!r}"
             logger.debug(
                 "Worker-%d: readiness poll exception for %s: %s",
                 worker_id,
@@ -33694,6 +30721,17 @@ async def _wait_service_readiness_gate(
             )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            logger.error(
+                "Worker-%d: readiness_gate_timeout for %s after %ss: url=%s "
+                "last_status=%s last_reason=%s last_body=%s",
+                worker_id,
+                readiness_service_name,
+                timeout_s,
+                url,
+                last_status,
+                last_reason,
+                last_body,
+            )
             await _terminalize_pre_forward_job(
                 job_id=job_id,
                 entry_id=entry_id,
@@ -33701,7 +30739,12 @@ async def _wait_service_readiness_gate(
                 routing_group=routing_group,
                 consumer_name=consumer_name,
                 status="failed",
-                reason=f"readiness gate timed out after {readiness_timeout_s}s",
+                reason=(
+                    f"readiness_gate_timeout: {readiness_service_name}{readiness_path} "
+                    f"not ready after {timeout_s}s (last_status={last_status}, "
+                    f"last_reason={last_reason})"
+                ),
+                error_type="readiness_gate_timeout",
             )
             return False
         await asyncio.sleep(min(poll_interval, remaining))
@@ -33897,6 +30940,7 @@ def _save_state(shutdown: bool = False):
             ),
             "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "gpu_states": gpu_states_dict,
+            "llm_request_metrics": llm.counters(),
         }
         _apply_runtime_semantics(state)
 
@@ -34946,6 +31990,8 @@ async def handle_service_revision_activate(request: web.Request):
             },
             status=409,
         )
+    await asyncio.to_thread(_fit_validator.warn_if_unfit, logger, candidate, _vram_cache or None,
+                            [f"{name}@r{revision}"], service=name, project_root=PROJECT_ROOT)
     try:
         active = catalog.activate(
             name,
@@ -36241,6 +33287,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0a0a0f; color: #e0e0e0; min-height: 100vh; }
 .header { background: #12121a; border-bottom: 1px solid #2a2a3a; padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
 .header h1 { font-size: 18px; color: #ff8c00; font-weight: 700; }
+/* Tailnet link row: same flex row / bold "here" / muted rules as board-overview. */
+.links { margin-left: auto; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.links a { color: #ff8c00; text-decoration: none; }
+.links a:hover { text-decoration: underline; }
+.links .here { font-weight: 600; color: #e0e0e0; }
+.links .muted { color: #888; font-size: 12px; }
 .gpu-badge { background: #1a1a2e; padding: 6px 14px; border-radius: 6px; font-size: 13px; }
 .health-dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle; }
 .gpu-badge .pct { color: #ff8c00; font-weight: 700; }
@@ -36575,6 +33627,16 @@ const __GM_AUTH = (() => {
     <span class="connected-dot off" id="ws-dot" title="WebSocket"></span>
     <span style="font-size:12px;color:#888;margin-left:4px;" id="ws-text">disconnected</span>
   </div>
+  <nav class="links" aria-label="Tailnet pages">
+    <a href="https://hermes.example.org:8443/">T3 home</a>
+    <a href="http://192.0.2.1:8152/">Boards</a>
+    <a href="http://192.0.2.1:8153/">Fleet</a>
+    <a href="http://192.0.2.1:8154/">Storage</a>
+    <a href="http://192.0.2.10:8156/">Pibook</a>
+    <a href="http://brewing.example.org:8098/">Brewing</a>
+    <span class="here" aria-current="page">gpu-manager</span>
+    <a href="https://hermes.example.org/kanban">Hermes kanban</a>
+  </nav>
 </div>
 <!-- Lifecycle detail panel (below header, collapsed by default) -->
 <div id="lifecycle-detail" style="display:none;background:#12121a;border-bottom:1px solid #2a2a3a;padding:12px 20px;font-size:13px">
@@ -36607,18 +33669,9 @@ const __GM_AUTH = (() => {
       <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Total</div><div class="value" id="card-total">--</div></div>
       <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Used</div><div class="value" style="color:#ff8c00" id="card-used">--</div></div>
       <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Free</div><div class="value" style="color:#4ade80" id="card-free">--</div></div>
-      <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Total RAM</div><div class="value" id="card-ram-total" style="color:#06b6d4">--</div></div>
-      <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Used RAM</div><div class="value" id="card-ram-used" style="color:#fbbf24">--</div></div>
-      <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Free RAM</div><div class="value" id="card-ram-free" style="color:#4ade80">--</div></div>
       <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Procs</div><div class="value" id="card-proc">--</div></div>
     </div>
-    <div class="vram-info-block" id="ram-info-block">
-      <span class="vram-info-label">RAM</span>
-      <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Total</div><div class="value" id="ram-total" style="color:#06b6d4">--</div></div>
-      <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Used</div><div class="value" id="ram-used" style="color:#fbbf24">--</div></div>
-      <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Free</div><div class="value" id="ram-free" style="color:#4ade80">--</div></div>
-      <div class="vram-card small" style="margin:0;padding:8px 10px"><div class="label">Usage</div><div class="value" id="ram-pct">--</div></div>
-    </div>
+    <!-- System RAM is shown once, in "System RAM Allocation" below (was repeated 3x). -->
   </div>
   <div id="vram-mesh-nodes" style="display:flex; gap:16px; margin-bottom:16px; flex-wrap:wrap"></div>
   <div id="vram-pressure" style="display:none; background:#3a1a1a; border:1px solid #f87171; border-radius:6px; padding:10px 16px; margin-bottom:16px; font-size:13px"></div>
@@ -37317,6 +34370,26 @@ function _findBundleForGpu(gpuId) {
   return null;
 }
 
+function _vramBundleHolder(gpu) {
+  // How much of this GPU's used VRAM its loaded bundle accounts for.
+  // Bundle -> its services -> their ports -> processes on this GPU with that
+  // service_port. Returns null when no bundle is loaded or none of its
+  // processes are seen, so callers fall back to the plain alarm.
+  if (!gpu) return null;
+  const gs = _findBundleForGpu(gpu.gpu_id || gpu.card);
+  if (!gs || !gs.loaded_bundle) return null;
+  const bundle = _findBundleByName(gs.loaded_bundle) || {};
+  const svcs = state.services?.services || {};
+  const ports = new Set((bundle.services || []).map(n => Number(svcs[n]?.port)).filter(Boolean));
+  let bundleMib = 0;
+  for (const p of (gpu.processes || [])) {
+    if (p.service_port && ports.has(Number(p.service_port))) bundleMib += (p.vram_mib || 0);
+  }
+  if (!bundleMib) return null;
+  const used = gpu.vram_used_mib || 0;
+  return { bundle: gs.loaded_bundle, idle: !!bundle.idle, bundleMib, otherMib: Math.max(0, used - bundleMib) };
+}
+
 function _findBundleByName(bundleName) {
   // Look up a bundle's config from state.bundles
   return state.bundles?.[bundleName] || null;
@@ -37484,11 +34557,22 @@ function renderBundlesTab() {
 function renderHeader() {
   const v = state.vram;
   if (!v || v.error) return;
-  const used = (v.used_vram_mib / 1024).toFixed(1);
-  const total = (v.total_vram_mib / 1024).toFixed(1);
-  document.getElementById('vram-pct').textContent = v.usage_pct;
+  // Prefer the discrete-only split: an iGPU carve-out is system RAM and
+  // inflates the header total (36 GiB for 2x16 GiB cards).
+  const dgpuOnly = (v.dgpu_total_vram_mib || 0) > 0;
+  const usedMib = dgpuOnly ? v.dgpu_used_vram_mib : v.used_vram_mib;
+  const totalMib = dgpuOnly ? v.dgpu_total_vram_mib : v.total_vram_mib;
+  const used = (usedMib / 1024).toFixed(1);
+  const total = (totalMib / 1024).toFixed(1);
+  document.getElementById('vram-pct').textContent = dgpuOnly ? v.dgpu_usage_pct : v.usage_pct;
   document.getElementById('vram-used').textContent = used;
   document.getElementById('vram-total').textContent = total;
+  const vramBadge = document.getElementById('vram-pct')?.parentElement;
+  if (vramBadge) {
+    vramBadge.title = dgpuOnly && v.apu_vram_mib
+      ? `Discrete GPUs only. iGPU carve-out (${(v.apu_vram_mib / 1024).toFixed(1)} GiB of system RAM) not counted.`
+      : 'All GPUs';
+  }
 
   const gs = document.getElementById('gpu-state');
   gs.textContent = state.gpu_state.replace(/_/g, ' ');
@@ -37771,15 +34855,30 @@ function renderVRAM() {
     ramContainer.innerHTML = ramPanelsHtml;
   }
 
-  // VRAM pressure alert
+  // VRAM pressure alert. A card filled by its own loaded bundle (e.g. an
+  // idle LLM sized to the card) is not pressure: say so once, calmly, and
+  // keep the alarm for VRAM the bundle does not account for.
   const pressureEl = document.getElementById('vram-pressure');
-  if (displayVram.usage_pct >= 95) {
-    pressureEl.textContent = '🔴 CRITICAL: VRAM nearly full — consider evicting models';
+  const pressureGpu = (_activeGpuId && v.gpus) ? v.gpus.find(g => g.card === _activeGpuId) : null;
+  const pressurePct = pressureGpu ? displayVram.usage_pct
+    : ((v.dgpu_total_vram_mib || 0) > 0 ? v.dgpu_usage_pct : displayVram.usage_pct);
+  const holder = (pressureGpu && !selectedIsIgpu) ? _vramBundleHolder(pressureGpu) : null;
+  const holderText = holder
+    ? ` · bundle ${holder.bundle} holds ${(holder.bundleMib / 1024).toFixed(1)} GiB, other ${(holder.otherMib / 1024).toFixed(1)} GiB`
+    : '';
+  if (pressurePct >= 85 && holder && holder.otherMib < 512) {
+    const gpuLabel = pressureGpu.gpu_name || pressureGpu.card;
+    pressureEl.textContent = `ℹ️ ${gpuLabel}: ${pressurePct}% used by design — ${holder.idle ? 'idle bundle' : 'bundle'} ${holder.bundle} is loaded and holds ${(holder.bundleMib / 1024).toFixed(1)} GiB; other VRAM ${holder.otherMib} MiB. Not pressure.`;
+    pressureEl.style.display = 'block';
+    pressureEl.style.background = '#14202e';
+    pressureEl.style.borderColor = '#3b82f6';
+  } else if (pressurePct >= 95) {
+    pressureEl.textContent = '🔴 CRITICAL: VRAM nearly full — consider evicting models' + holderText;
     pressureEl.style.display = 'block';
     pressureEl.style.background = '#3a1a1a';
     pressureEl.style.borderColor = '#f87171';
-  } else if (displayVram.usage_pct >= 85) {
-    pressureEl.textContent = '⚠️ HIGH: VRAM usage above 85% — monitor closely';
+  } else if (pressurePct >= 85) {
+    pressureEl.textContent = '⚠️ HIGH: VRAM usage above 85% — monitor closely' + holderText;
     pressureEl.style.display = 'block';
     pressureEl.style.background = '#3a2a0a';
     pressureEl.style.borderColor = '#fbbf24';
@@ -38555,6 +35654,61 @@ async function updateTab(tab) {
   _fetchProxyStatus();
 }
 
+function _meshEsc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[ch]);
+}
+
+function _meshHostChips(data) {
+  // VRAM tab host chips: one per machine. Mesh members whose address is on
+  // this machine (on_this_host) are services here, not other hosts, so they
+  // fold into the local chip; their cards still open their own panel.
+  const chips = [{key: 'local', label: (data.local_machine || 'Local') + ' (local)'}];
+  const seen = new Set();
+  for (const [name, node] of Object.entries(data.nodes || {})) {
+    if (node.is_cloud || node.is_local || node.on_this_host) continue;
+    const label = node.machine || name;
+    if (seen.has(label)) continue;
+    seen.add(label);
+    chips.push({key: name, label});
+  }
+  return chips;
+}
+
+function _meshCardView(name, node) {
+  // Mesh host card text. Says "down" in words, and never shows configured
+  // numbers (providers.json) as if they were measured.
+  const member = node.machine ? `${node.machine} · ${name}` : name;
+  const addr = `${node.host || '?'}${node.port ? ':' + node.port : ''}`;
+  const gpu = node.gpu && node.gpu !== 'unknown' ? node.gpu : '';
+  const cfgModel = node.model && node.model !== 'unknown' ? node.model : '';
+  const where = node.on_this_host ? 'this host' : '';
+  if (!node.healthy) {
+    return {
+      tone: 'down', label: member, value: 'down',
+      sub: `no answer on ${addr}`,
+      detail: [gpu, cfgModel ? `configured: ${cfgModel}` : '', where].filter(Boolean).join(' · '),
+      title: 'Health check failed. Sizes from the mesh config are not shown for a down member.',
+    };
+  }
+  const live = node.stats_live === true || (node.stats_live === undefined && !!node.vram_live_mib);
+  let value = 'up';
+  if (live && node.vram_live_mib) {
+    value = (node.vram_live_mib / 1024).toFixed(1) + ' / ' +
+      (node.vram_live_total_mib ? (node.vram_live_total_mib / 1024).toFixed(1) : '?') + ' GiB';
+  } else if (node.ram_used_gb) {
+    value = Number(node.ram_used_gb).toFixed(1) + ' GB RAM';
+  }
+  const model = node.model_live || cfgModel;
+  return {
+    tone: live ? 'live' : 'config', label: member, value,
+    sub: model || 'model not reported',
+    detail: [gpu, addr, where, live ? '' : 'size from config, not measured'].filter(Boolean).join(' · '),
+    title: live ? 'Measured by the host agent.' : 'Up (health ok). No host agent: the size is the configured estimate.',
+  };
+}
+
 async function updateVramTab() {
   try {
     const data = await fetchMeshData();
@@ -38562,44 +35716,32 @@ async function updateVramTab() {
     // Render sub-tabs
     const subtabBar = document.getElementById('vram-subtabs');
     if (subtabBar) {
-      const localName = (data.local_machine || 'Local');
-      let sthtml = `<span class="subtab" onclick="showVramNode('local')">${localName} (local)</span>`;
-      for (const [name, node] of Object.entries(data.nodes)) {
-        if (node.is_cloud || node.is_local) continue;
-        sthtml += `<span class="subtab" onclick="showVramNode('${name}')">${node.machine||name}</span>`;
-      }
-      subtabBar.innerHTML = sthtml;
+      // One chip per machine; peers on this machine fold into the local chip.
+      subtabBar.innerHTML = _meshHostChips(data).map(c =>
+        `<span class="subtab" onclick="showVramNode('${c.key}')">${_meshEsc(c.label)}</span>`).join('');
     }
 
-    // Render mesh overview cards (always visible)
+    // Render mesh overview cards (always visible): live first, down last.
     const container = document.getElementById('vram-mesh-nodes');
     if (container) {
       let html = '';
-      for (const [name, node] of Object.entries(data.nodes)) {
-        if (node.is_cloud) continue;
-        const gpu = node.gpu || 'none';
-        const vram_mib = node.vram_live_mib;
-        const vram_total = node.vram_live_total_mib;
-        let vram_str = 'N/A';
-        if (vram_mib) vram_str = (vram_mib/1024).toFixed(1) + ' / ' + (vram_total ? (vram_total/1024).toFixed(1) : '?') + ' GiB';
-        if (!vram_mib && vram_str === 'N/A') {
-          // Show memory if no VRAM
-          const ram = node.ram_used_gb;
-          vram_str = ram ? ram.toFixed(1) + ' GB RAM' : 'N/A';
-        }
-        const healthy = node.healthy;
-        const modelShort = (node.model || '').substring(0, 30);
-        // RAM info line (for all remote nodes with RAM data)
+      const toneColor = {live: '#4ade80', config: '#9ca3af', down: '#f87171'};
+      const entries = Object.entries(data.nodes || {}).filter(([, n]) => !n.is_cloud);
+      entries.sort((a, b) => (b[1].healthy ? 1 : 0) - (a[1].healthy ? 1 : 0));
+      for (const [name, node] of entries) {
+        const view = _meshCardView(name, node);
         let ramLine = '';
-        if (node.ram_total_gb && node.ram_used_gb) {
+        if (view.tone === 'live' && node.ram_total_gb && node.ram_used_gb) {
           const ramFree = (node.ram_total_gb - node.ram_used_gb).toFixed(1);
           const ramPct = (node.ram_used_gb / node.ram_total_gb * 100).toFixed(0);
           ramLine = `<div style="font-size:11px;color:#888;margin-top:4px">RAM: ${node.ram_used_gb.toFixed(1)}/${node.ram_total_gb.toFixed(1)} GB (${ramPct}%) · ${ramFree} free</div>`;
         }
-        html += `<div class="vram-card${node.is_local ? ' small' : ''}" style="cursor:pointer" onclick="showVramNode('${node.is_local?'local':name}')">
-          <div class="label">${node.machine || name} — ${gpu}</div>
-          <div class="value" style="font-size:${node.is_local?20:28}px;color:${healthy?'#4ade80':'#f87171'}">${vram_str}</div>
-          <div class="unit">${modelShort} ${node.is_local ? '(local)' : ''}</div>
+        const big = view.tone === 'down' ? 18 : (node.is_local ? 20 : 28);
+        html += `<div class="vram-card${node.is_local ? ' small' : ''}" style="cursor:pointer${view.tone === 'down' ? ';opacity:0.6' : ''}" title="${_meshEsc(view.title)}" onclick="showVramNode('${node.is_local?'local':name}')">
+          <div class="label">${_meshEsc(view.label)}</div>
+          <div class="value" style="font-size:${big}px;color:${toneColor[view.tone]}">${_meshEsc(view.value)}</div>
+          <div class="unit">${_meshEsc(view.sub)}</div>
+          <div style="font-size:11px;color:#888;margin-top:4px">${_meshEsc(view.detail)}</div>
           ${ramLine}
         </div>`;
       }
@@ -38968,10 +36110,17 @@ function renderGpuSubtabs(gpus) {
 
   // Check if subtabs already have correct content (avoid DOM churn)
   const existingTabs = gpuSubtabs.querySelectorAll('.gpu-subtab');
+  // Signature: name + loaded bundle + its state, so a bundle swap or a late
+  // gpu_id/name annotation re-renders the chip instead of leaving it stale.
+  const _gpuTabSig = (gpu, i) => {
+    const gs = _findBundleForGpu(gpu.gpu_id || gpu.card || `gpu${i}`);
+    return [gpu.gpu_name || '', gpu.gpu_id || '', gs?.loaded_bundle || '', _bundleStateLabel(gs), gpu.integrated ? 'igpu' : ''].join('|');
+  };
   const needsRebuild = existingTabs.length !== gpus.length ||
     Array.from(existingTabs).some((tab, i) => {
       const expectedGpuId = gpus[i]?.card || `gpu${i}`;
-      return !tab.getAttribute('onclick')?.includes(expectedGpuId);
+      return !tab.getAttribute('onclick')?.includes(expectedGpuId) ||
+        tab.dataset.sig !== _gpuTabSig(gpus[i], i);
     });
 
   // Persist selection: restore from sessionStorage if _activeGpuId is null
@@ -38997,7 +36146,15 @@ function renderGpuSubtabs(gpus) {
     gpus.forEach((gpu, idx) => {
       const gpuId = gpu.card || `gpu${idx}`;
       const isActive = _activeGpuId === gpuId;
-      html += `<span class="gpu-subtab ${isActive ? 'active' : ''}" onclick="showGpuDetail('${gpuId}')">${gpu.gpu_name || gpuId}${_bundleIndicatorHtml(gpuId)}</span>`;
+      // Bundle state is keyed by configured gpu_id, not by card.
+      const bundleKey = gpu.gpu_id || gpuId;
+      const sig = _gpuTabSig(gpu, idx).replace(/"/g, '&quot;');
+      // An unmanaged iGPU (no configured gpu_id, no bundle) is display-only:
+      // say that instead of a "No bundle" chip that reads like a fault.
+      const indicator = (gpu.integrated && !gpu.gpu_id && !_findBundleForGpu(bundleKey))
+        ? '<span class="bundle-indicator empty" title="Integrated GPU: not managed by GPU Manager, not counted in the header VRAM">iGPU · display</span>'
+        : _bundleIndicatorHtml(bundleKey);
+      html += `<span class="gpu-subtab ${isActive ? 'active' : ''}" data-sig="${sig}" onclick="showGpuDetail('${gpuId}')">${gpu.gpu_name || gpuId}${indicator}</span>`;
     });
     gpuSubtabs.innerHTML = html;
     gpuSubtabs.style.display = 'flex';
@@ -40583,6 +37740,12 @@ async def _oom_recovery_watchdog_loop():
                 except Exception as e:
                     logger.debug(f"[oom-watchdog] heartbeat write failed: {e}")
 
+            # ── Stale `evicting` flags: owner-aware and bounded ──
+            try:
+                _reap_stale_evicting_flags(now)
+            except Exception as _stale_evict_err:
+                logger.debug(f"[oom-watchdog] stale evicting sweep failed: {_stale_evict_err}")
+
             # ── Stall detection: GPUs stuck in 'detected' → permanent_failed ──
             for gpu_id, bs in list(_gpu_states.items()):
                 if bs.oom_state == "detected" and bs.oom_state_since > 0:
@@ -41342,6 +38505,10 @@ async def _admit_internal_generation_leaf(service_id, resource_id, job_id, trust
                 parent_priority_class=priority_class, callback_url=None, metadata=metadata,
             )
     if error or entry is None:
+        _reason = str((error or {}).get("reason") or "")
+        if _reason in {"workflow_asset_missing", "workflow_asset_invalid"}:
+            from pipeline_coordinator import TerminalLeafError
+            raise TerminalLeafError(_reason, str((error or {}).get("error") or ""))
         raise RuntimeError((error or {}).get("error", "generation entry build failed"))
     entry["job_id"] = job_id
     if source_artifact is not None:
@@ -41461,7 +38628,12 @@ def _build_production_coordinator_runtime(config):
 
 def create_app(debug_reservations=False, debug_oom_sim=False) -> web.Application:
     global scheduler, vram, _services_config
-    app = web.Application(middlewares=[_api_auth_middleware])
+    app = web.Application(middlewares=[_api_auth_middleware], client_max_size=32 * 1024 * 1024)
+    # External broker authentication is a separate release boundary. Scope
+    # this credential only to the controller's embedded logical Gemma route.
+    app[_KDA_GEMMA_SCOPED_GATE_APP_KEY] = _combined_gemma_broker_embedded
+    app[_KDA_GEMMA_MEMBER_PINS_APP_KEY] = _scoped_token_backends
+    app[_KDA_GEMMA_DEFAULT_PIN_APP_KEY] = lambda: _SCOPED_DEFAULT_PIN
     app["debug_reservations"] = debug_reservations
     app["debug_oom_sim"] = debug_oom_sim
 
@@ -41472,6 +38644,17 @@ def create_app(debug_reservations=False, debug_oom_sim=False) -> web.Application
 
     # Load services config
     _services_config = _load_services_config()
+
+    # Observe-only GPU attribution; keep the registration local to app startup.
+    from gpu_manager.gpu_guard import register_gpu_guard
+    _guard_services = _services_config.get("services", {})
+    _guard_managed_units = sorted({
+        str(item.get("systemd_unit")) for item in _guard_services.values()
+        if isinstance(item, Mapping) and item.get("systemd_unit")
+    }) if isinstance(_guard_services, Mapping) else []
+    _guard_config = _services_config.get("gpu_guard", {"enabled": False})
+    register_gpu_guard(app, config=_guard_config, managed_units=_guard_managed_units,
+                       desktop_allowlist=_guard_config.get("desktop_allowlist", ()))
 
     # Load providers config
     global _providers_config, _peer_monitor
@@ -41706,8 +38889,7 @@ def create_app(debug_reservations=False, debug_oom_sim=False) -> web.Application
         app.router.add_post("/v1/debug/simulate-oom", handle_debug_simulate_oom)
         app.router.add_get("/v1/debug/oom-state/{gpu_id}", handle_debug_oom_state)
 
-    app.router.add_get("/health/live", handle_liveness)
-    app.router.add_get("/health", handle_health)
+    _register_observability_routes(app)
     app.router.add_get("/status", handle_health)
     app.router.add_get("/v1/registry/diagnostics", handle_registry_diagnostics)
     app.router.add_get("/oom/recovery/status", handle_oom_recovery_status)
@@ -41725,6 +38907,10 @@ def create_app(debug_reservations=False, debug_oom_sim=False) -> web.Application
         from gemma_broker.api import register_api_routes
 
         register_api_routes(app, _combined_gemma_api_proxy)
+
+    # Node-authenticated protocol routes must precede the generic /v1 proxy.
+    node_api = add_node_routes(app)
+    node_api.event_sink = _record_transition_event
 
     # LLM proxy
     app.router.add_route("*", "/v1/{path:.*}", handle_llm_proxy)
@@ -41756,6 +38942,16 @@ def create_app(debug_reservations=False, debug_oom_sim=False) -> web.Application
     # ── Queue Metrics API ──
     app.router.add_get("/v1/metrics", handle_get_metrics)
     app.router.add_get("/v1/metrics/summary", handle_get_metrics_summary)
+    app.router.add_get("/v1/metrics/broker", handle_get_broker_metrics)
+    app.router.add_get("/v1/catalog", handle_service_catalog)
+    # Before /v1/catalog/{public_id}, which would otherwise claim "subscriptions".
+    app.router.add_get("/v1/catalog/subscriptions", handle_catalog_subscriptions)
+    app.router.add_get("/v1/catalog/{public_id}", handle_service_catalog)
+    app.router.add_post("/v1/catalog/{public_id}/subscribe", handle_catalog_subscribe)
+    app.router.add_post("/v1/catalog/subscriptions/{subscriber_id}/heartbeat",
+                        handle_catalog_heartbeat)
+    app.router.add_delete("/v1/catalog/subscriptions/{subscriber_id}", handle_catalog_release)
+    app.router.add_get("/v1/fit-report", handle_get_fit_report)
     app.router.add_get("/v1/metrics/{service}", handle_get_metrics_service)
     app.router.add_get("/v1/dead-letters", handle_get_dead_letters)
     app.router.add_post("/v1/dead-letters/purge", handle_purge_dead_letters)
@@ -41918,6 +39114,8 @@ async def ensure_services_running():
             f"maintenance={saved_state.get('maintenance_mode')}, "
             f"saved at {saved_state.get('last_updated')}"
         )
+
+    llm.restore_counters(saved_state.get("llm_request_metrics"))
 
     # Restore pinned_service from state (if saved, overrides default)
     if saved_state.get("pinned_service"):
@@ -42139,7 +39337,7 @@ async def _recover_forwarded_comfyui_job_after_restart(
         metadata = json.loads(job.get("metadata") or "{}")
     except (TypeError, json.JSONDecodeError):
         metadata = {}
-    timeout_s = max(60, min(7200, int(metadata.get("workflow_timeout_s", 900))))
+    timeout_s = generation_poll_deadline_s(metadata)
     deadline = time.time() + timeout_s
     job_tracker.update_status(
         job_id,
@@ -42256,10 +39454,99 @@ async def _peer_health_loop():
         await asyncio.sleep(15)
 
 
-async def _reconcile_inflight_after_restart() -> None:
-    """Return unresolved Redis PEL jobs to their logical routing streams."""
+def _active_recovery_job_ids() -> set[str]:
+    """Job ids whose upstream handle a live recovery task of this process owns."""
+    prefix = "gpu-manager:restart-recovery:"
+    ids: set[str] = set()
+    for task in list(_restart_recovery_tasks):
+        if task.done():
+            continue
+        name = task.get_name()
+        if name.startswith(prefix):
+            ids.add(name[len(prefix):])
+    return ids
+
+
+async def _reconcile_slots_after_restart() -> int:
+    """Release busy slot leases that a previous incarnation left behind.
+
+    A slot acquired before this process started has no live worker behind it.
+    Without this it would block new work until the time-based reaper expires it
+    (``forward_timeout`` + margin: hours for ComfyUI). A slot stays only when a
+    retained recovery task of this process owns the job's upstream handle. The
+    release is a compare-and-release, so a lease a worker acquires between
+    classification and release is never freed.
+    """
+    manager = async_slot_manager
+    if manager is None or job_tracker is None:
+        return 0
+    from datetime import datetime as _datetime, timezone as _timezone
+    process_started = _datetime.fromtimestamp(_PROCESS_STARTED_AT, tz=_timezone.utc)
+    recovery_ids = _active_recovery_job_ids()
+    released = 0
+    services = (_load_services_config() or {}).get('services', {}) or {}
+    for svc_name, svc_cfg in services.items():
+        if not svc_cfg.get('enabled') or not (
+            svc_cfg.get('type') in ('llm_backend', 'generation_backend')
+            or _is_internal_workflow_service(svc_cfg)
+        ):
+            continue
+        try:
+            slots = await manager.get_slots(svc_name)
+            for slot_id, slot in slots.items():
+                if not isinstance(slot, dict) or slot.get('status') != 'busy':
+                    continue
+                job_id = str(slot.get('job_id') or '')
+                job = (
+                    await asyncio.to_thread(job_tracker.get_job, job_id)
+                    if job_id else None
+                )
+                decision = classify_boot_slot(
+                    slot=slot,
+                    job=job,
+                    process_started_at=process_started,
+                    recovery_job_ids=recovery_ids,
+                )
+                if decision.action is not SlotAction.RELEASE:
+                    continue
+                if await manager.release_slot_if_unchanged(
+                    svc_name, int(slot_id), job_id, str(slot.get('started_at') or '')
+                ):
+                    released += 1
+                    logger.warning(
+                        "Restart reconcile: released orphaned slot %s/%s "
+                        "(job=%s, %s)",
+                        svc_name, slot_id, job_id or '-', decision.reason,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Restart reconcile: slot sweep failed for %s: %s", svc_name, exc
+            )
+    _queue_recovery_stats['slots_released_at_boot'] += released
+    return released
+
+
+async def _reconcile_inflight_after_restart() -> dict[str, int]:
+    """Reconcile pending-entry leases left behind by a previous incarnation.
+
+    Every pending entry is judged by ``classify_pel_entry``. An entry delivered
+    after this process started belongs to a live worker and is never touched.
+    An older one is acked (terminal), cancelled, handed to forwarded-job
+    recovery (never requeued: that would resubmit the prompt), held inside its
+    restart backoff window, requeued atomically, or, once its bounded requeue
+    budget is spent, dead-lettered. Safe to run repeatedly. The returned
+    counters tell the sweep loop whether another pass is needed (``waiting`` or
+    ``failed_groups`` > 0).
+    """
+    summary = {
+        "preserved": 0, "waiting": 0, "requeued": 0, "dead_lettered": 0,
+        "acked_terminal": 0, "cancelled": 0, "forwarded": 0, "failed_groups": 0,
+    }
     if async_queue is None or job_tracker is None:
-        return
+        return summary
+    _queue_recovery_stats["reconcile_sweeps"] += 1
+    uptime_ms = int((time.time() - _PROCESS_STARTED_AT) * 1000)
+    recovery_ids = _active_recovery_job_ids()
     cfg = _load_services_config() or {}
     groups = set()
     for svc_name, svc in (cfg.get('services', {}) or {}).items():
@@ -42311,30 +39598,50 @@ async def _reconcile_inflight_after_restart() -> None:
                 job_id = payload.get('job_id', '')
                 if isinstance(job_id, bytes):
                     job_id = job_id.decode()
+                raw_requeues = payload.get('_restart_requeue_count', 0)
+                if isinstance(raw_requeues, bytes):
+                    raw_requeues = raw_requeues.decode()
+                try:
+                    requeues = max(0, int(raw_requeues or 0))
+                except (TypeError, ValueError):
+                    requeues = 0
                 job = await asyncio.to_thread(job_tracker.get_job, job_id) if job_id else None
-                status = (job or {}).get('status', '')
-                cancellation_intent = str((job or {}).get('cancellation_intent', '')).lower() in {
-                    '1', 'true', 'yes', 'on'
-                }
-                if status in {'completed', 'failed', 'cancelled'} or cancellation_intent:
-                    if cancellation_intent and status != 'cancelled':
+                decision = classify_pel_entry(
+                    job=job,
+                    idle_ms=int(item.get('idle_ms', 0) or 0),
+                    uptime_ms=uptime_ms,
+                    requeues_so_far=requeues,
+                    recovery_active=bool(job_id) and job_id in recovery_ids,
+                )
+                action = decision.action
+
+                if action in (PelAction.ACK_TERMINAL, PelAction.ACK_CANCELLED):
+                    if action is PelAction.ACK_CANCELLED:
+                        # Only a non-terminal job is ever rewritten to cancelled;
+                        # the classifier releases a real terminal outcome as is.
                         await asyncio.to_thread(
                             job_tracker.update_status, job_id, 'cancelled',
                             error='cancelled before restart reconciliation',
                         )
+                        summary["cancelled"] += 1
+                        _queue_recovery_stats["pel_cancelled"] += 1
+                    else:
+                        summary["acked_terminal"] += 1
+                        _queue_recovery_stats["pel_acked_terminal"] += 1
                     await async_queue.ack(group, 'restart-reconciler', entry_id,
                                           routing_group=group)
                     logger.info(
                         f"Restart reconcile: removed terminal/cancelled PEL job {job_id} "
-                        f"from {group} (status={status}, cancellation_intent={cancellation_intent})"
+                        f"from {group} ({decision.reason})"
                     )
                     continue
-                comfyui_prompt_id = str((job or {}).get('comfyui_prompt_id') or '').strip()
-                if comfyui_prompt_id:
+
+                if action is PelAction.RECOVER_FORWARDED:
                     # A persisted prompt id proves the worker already crossed the
                     # forward boundary. Never requeue the original payload (that
                     # would submit a duplicate prompt); hand the existing handle
                     # to a retained recovery task and ACK this PEL entry.
+                    comfyui_prompt_id = str((job or {}).get('comfyui_prompt_id') or '').strip()
                     await asyncio.to_thread(
                         job_tracker.update_status,
                         job_id,
@@ -42356,35 +39663,119 @@ async def _reconcile_inflight_after_restart() -> None:
                         group, 'restart-reconciler', entry_id or '',
                         routing_group=group,
                     )
+                    summary["forwarded"] += 1
+                    _queue_recovery_stats["forwarded_recovered"] += 1
                     logger.warning(
                         f"Restart reconcile: recovering already-forwarded "
                         f"ComfyUI job {job_id} (prompt_id={comfyui_prompt_id}) "
                         "without duplicate submission"
                     )
                     continue
-                idle_ms = int(item.get('idle_ms', 0) or 0)
-                if idle_ms < 30000:
-                    logger.info(
-                        f"Restart reconcile: preserving active PEL job {job_id} "
-                        f"from {group} (idle_ms={idle_ms})"
-                    )
+
+                if action in (PelAction.PRESERVE_ACTIVE, PelAction.PRESERVE_BACKOFF):
+                    summary["preserved"] += 1
+                    _queue_recovery_stats["pel_preserved"] += 1
+                    if decision.reason != "delivered_by_current_process":
+                        # Not owned by a live worker: revisit after its window.
+                        summary["waiting"] += 1
+                        logger.info(
+                            f"Restart reconcile: preserving PEL job {job_id} "
+                            f"from {group} ({decision.reason}, wait_ms={decision.wait_ms})"
+                        )
                     continue
-                if await async_queue.yield_pending(group, entry_id,
-                                                   routing_group=group):
+
+                # REQUEUE / DEAD_LETTER: one atomic, bounded queue operation.
+                requeue = getattr(async_queue, 'requeue_after_restart', None)
+                if callable(requeue):
+                    result = await requeue(
+                        group, entry_id, routing_group=group,
+                        max_requeues=RESTART_REQUEUE_MAX,
+                    )
+                elif action is PelAction.DEAD_LETTER:
+                    # Older adapters have no bounded requeue: one nack with a
+                    # budget of one moves the entry to the dead-letter stream.
+                    ok = await async_queue.nack(
+                        group, entry_id, routing_group=group, max_retries=1
+                    )
+                    result = {'outcome': 'dead_lettered' if ok else 'error', 'count': requeues}
+                else:
+                    ok = await async_queue.yield_pending(
+                        group, entry_id, routing_group=group
+                    )
+                    result = {'outcome': 'requeued' if ok else 'error', 'count': requeues + 1}
+                outcome = result.get('outcome')
+                if outcome == 'requeued':
+                    summary["requeued"] += 1
+                    _queue_recovery_stats["pel_requeued"] += 1
                     if job_id:
                         await asyncio.to_thread(
                             job_tracker.update_status, job_id, 'queued',
                             reconciled_after_restart='1',
+                            restart_requeue_count=result.get('count', requeues + 1),
                             error='requeued after GPU Manager restart',
                         )
                     logger.info(
                         f"Restart reconcile: requeued unresolved job {job_id} "
-                        f"from {group}"
+                        f"from {group} (restart requeue #{result.get('count')})"
+                    )
+                elif outcome == 'dead_lettered':
+                    summary["dead_lettered"] += 1
+                    _queue_recovery_stats["pel_dead_lettered"] += 1
+                    if job_id:
+                        await asyncio.to_thread(
+                            job_tracker.update_status, job_id, 'failed',
+                            error=(
+                                f"dead-lettered after {result.get('count', requeues)} "
+                                "restart requeues"
+                            ),
+                            error_type='restart_requeue_exhausted',
+                            dead_lettered='1',
+                        )
+                    logger.error(
+                        f"Restart reconcile: dead-lettered poison job {job_id} "
+                        f"from {group} after {result.get('count', requeues)} restart requeues"
+                    )
+                elif outcome == 'error':
+                    # Redis refused the move: keep the entry and retry next sweep.
+                    summary["waiting"] += 1
+                    logger.warning(
+                        f"Restart reconcile: could not requeue job {job_id} from {group}; "
+                        "will retry on the next sweep"
                     )
         except Exception as exc:
+            summary["failed_groups"] += 1
             logger.warning(
                 f"Restart reconcile: failed for logical group {group}: {exc}"
             )
+    return summary
+
+
+async def _reconcile_inflight_loop() -> None:
+    """Run boot reconciliation, then re-sweep until nothing is left waiting.
+
+    The first pass handles every orphan that is already eligible. Entries held
+    inside their restart backoff window, and groups whose Redis read failed, are
+    revisited every ``RECONCILE_SWEEP_INTERVAL_S`` for at most
+    ``RECONCILE_SWEEP_WINDOW_S``; the lease reapers own anything still
+    unresolved after that.
+    """
+    deadline = time.monotonic() + RECONCILE_SWEEP_WINDOW_S
+    while True:
+        try:
+            await _reconcile_slots_after_restart()
+            summary = await _reconcile_inflight_after_restart()
+            if not summary["waiting"] and not summary["failed_groups"]:
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Restart reconcile sweep failed")
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Restart reconcile: sweep window elapsed; lease reapers own the remainder"
+            )
+            return
+        await asyncio.sleep(RECONCILE_SWEEP_INTERVAL_S)
 
 
 async def _reconcile_authoritative_bundle_state() -> None:
@@ -42731,7 +40122,7 @@ def _start_background_tasks(app: web.Application):
             _worker_supervisor_task = register_background_task(app, "worker_supervisor", worker_supervisor.run())
             app["worker_supervisor"] = _worker_supervisor_task  # weak ref for shutdown access
             logger.info("Dynamic Worker Pool: supervisor started")
-            register_background_task(app, "reconcile_inflight_after_restart", _reconcile_inflight_after_restart())
+            register_background_task(app, "reconcile_inflight_after_restart", _reconcile_inflight_loop())
 
         # The consumer uses the coordinator's own durable parent stream and is
         # registered in the same app task registry for bounded shutdown.
@@ -42895,28 +40286,6 @@ async def on_startup(app: web.Application):
         await _init_oom_redis()
     except Exception as e:
         logger.warning(f"[oom-redis] _init_oom_redis from on_startup raised: {e}")
-
-    # ── OD prompt-enhance project bootstrap (idempotent, best-effort) ──
-    # Walk every generation template; for each one with prompt_enhance.enabled,
-    # ensure the corresponding OD project exists.  The helper short-circuits
-    # on subsequent calls via the module-level _OD_PROJECT_BOOTSTRAP_DONE flag,
-    # so this only costs one HTTP round-trip per process lifetime.  OD being
-    # down at startup is fine — the per-call path falls through to the direct
-    # caption adapter and we'll lazily retry on the next user request.
-    try:
-        cfg = _load_services_config() or {}
-        for _tmpl in (cfg.get("generation_templates") or {}).values():
-            _pe = _tmpl.get("prompt_enhance") or {}
-            if _pe.get("enabled") and _pe.get("project_id"):
-                await _ensure_od_project(
-                    _pe["project_id"], _pe.get("design_system_id")
-                )
-    except Exception as _od_boot_err:
-        logger.warning(
-            "[od-bootstrap] startup project ensure raised: %s", _od_boot_err
-        )
-
-
 async def on_cleanup(app: web.Application):
     global _controller_shutdown_in_progress
     _controller_shutdown_in_progress = True
@@ -43028,6 +40397,13 @@ def main():
         logger.info("Starting GPU Manager in MCP stdio mode")
         asyncio.run(run_mcp_server())
         return
+
+    if _first_boot_config_failed():
+        logger.critical(
+            "services config %s exists but failed to load/validate; refusing to serve on "
+            "the empty default config (see the warning above)", SERVICES_CONFIG_PATH,
+        )
+        sys.exit(78)  # EX_CONFIG
 
     LISTEN_PORT = args.listen
     if args.backend is not None:

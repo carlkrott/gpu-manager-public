@@ -1,5 +1,5 @@
 {
-  "file_count": 122,
+  "file_count": 251,
   "files": [
     {
       "disposition": "utility",
@@ -39,6 +39,14 @@
     },
     {
       "disposition": "core",
+      "path": "deployment/oom_inflight_deploy.sh"
+    },
+    {
+      "disposition": "core",
+      "path": "deployment/oom_inflight_preflight.py"
+    },
+    {
+      "disposition": "core",
       "path": "examples/combined-gemma/README.md"
     },
     {
@@ -75,6 +83,14 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/acceptance_full_pipeline.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/admission_affirmation.py"
+    },
+    {
+      "disposition": "core",
       "path": "scripts/api_auth.py"
     },
     {
@@ -106,6 +122,10 @@
       "path": "scripts/combined_gemma_broker_service.py"
     },
     {
+      "disposition": "core",
+      "path": "scripts/comfyui_liveness.py"
+    },
+    {
       "disposition": "utility",
       "path": "scripts/comfyui_workflow_sanitize.py"
     },
@@ -116,6 +136,10 @@
     {
       "disposition": "core",
       "path": "scripts/coordinator_provider_bridge.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/copy_gpu_manager_state_backup.py"
     },
     {
       "disposition": "core",
@@ -180,6 +204,14 @@
     {
       "disposition": "core",
       "path": "scripts/gemma_broker/events.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/gate_limits.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gemma_broker/kv_affinity.py"
     },
     {
       "disposition": "core",
@@ -267,6 +299,74 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/gpu_manager/bundle_model.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/bundle_queue.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/config_policy.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/fit_validator.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/gpu_guard.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/gpu_topology.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/job_models.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/memory_policy.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/oom_detection.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/oom_retry.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/oom_telemetry.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/reservations.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/scheduler_helpers.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/scheduler_state.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/service_events.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/vram_lifecycle.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/gpu_manager/warm_pool.py"
+    },
+    {
+      "disposition": "core",
       "path": "scripts/gpu_manager_contracts.py"
     },
     {
@@ -276,6 +376,14 @@
     {
       "disposition": "core",
       "path": "scripts/gpu_manager_semantics.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/hardware_recognition.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/idle_targets.py"
     },
     {
       "disposition": "core",
@@ -315,6 +423,10 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/node_leases.py"
+    },
+    {
+      "disposition": "core",
       "path": "scripts/pipeline_coordinator.py"
     },
     {
@@ -324,6 +436,10 @@
     {
       "disposition": "core",
       "path": "scripts/pipeline_provider_runtime.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/placement_orchestrator.py"
     },
     {
       "disposition": "core",
@@ -343,6 +459,14 @@
     },
     {
       "disposition": "core",
+      "path": "scripts/queue_recovery.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "scripts/r139_cleanup_queue_gemma.py"
+    },
+    {
+      "disposition": "core",
       "path": "scripts/registry_reconcile.py"
     },
     {
@@ -352,6 +476,10 @@
     {
       "disposition": "core",
       "path": "scripts/reseal_service_package.py"
+    },
+    {
+      "disposition": "core",
+      "path": "scripts/retire_provider_instance.py"
     },
     {
       "disposition": "core",
@@ -402,6 +530,10 @@
       "path": "scripts/stage_dispatch.py"
     },
     {
+      "disposition": "utility",
+      "path": "scripts/trim_coordinator_stream.py"
+    },
+    {
       "disposition": "core",
       "path": "scripts/verify_provider_callback.py"
     },
@@ -431,6 +563,10 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_acceptance_full_pipeline.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_api_auth.py"
     },
     {
@@ -439,7 +575,35 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_backup_registry_layout.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_hot_config.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_pin_503_regressions.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_pinned_full_and_orphans.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_broker_portability.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_vision_routing.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_broker_window_redis.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_catalog_subscribe.py"
     },
     {
       "disposition": "core",
@@ -447,7 +611,39 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_cold_llm_inline_admission.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_combined_broker_scoped_gate.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_combined_gemma_example.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_comfyui_readiness_gate.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_compat_failed_replay.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_config_first_boot_fail_closed.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_coordinator_http_cancel.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_cross_bundle_interruption.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_dead_leader_fast_reconcile_redis.py"
     },
     {
       "disposition": "core",
@@ -455,7 +651,23 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_evict_bundle_drain_and_owner.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_export_public_source.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_fit_validator.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_gfx_arch_detection.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_health_hygiene.py"
     },
     {
       "disposition": "core",
@@ -463,7 +675,59 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_idempotency_cancelled_retry.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_idle_health.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_idle_restore_http.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_idle_ttl_release.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_image_restore_requeue.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_isolation.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_kv_affinity.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_llm_chat_alias_gate.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_llm_proxy_portless_members.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_llmchat_transport_gaps.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_model_validator_registry.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_oom_inflight_deploy.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_oom_inflight_readiness.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_pinned_slot_release_race.py"
     },
     {
       "disposition": "core",
@@ -471,7 +735,39 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_preacceptance_requeue_bound.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_probe_health_models.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_proxy_admission_and_redaction.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_public_payload.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_qc_image_inspect.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_queue_drain_priority.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_quota_wall_cloud_members.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_r139_cleanup_queue_gemma.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_reaper_no_resurrect.py"
     },
     {
       "disposition": "core",
@@ -487,7 +783,227 @@
     },
     {
       "disposition": "core",
+      "path": "tests/publication/test_restore_relief_gaps.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_retire_provider_instance.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_retired_controller_removal.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_retired_image_provider.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_scoped_gate_member_pins.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_scoped_token_backends.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_service_catalog.py"
+    },
+    {
+      "disposition": "core",
       "path": "tests/publication/test_source_closure.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_stale_orphan_redis.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_stream_result_tool_calls.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_terminal_lease.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/publication/test_workflow_asset_terminal.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_broker_router_catalog.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_bundle_model_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_bundle_queue_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_config_policy_binding.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "tests/test_copy_gpu_manager_state_backup.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "tests/test_cpu_probe_busy.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_dashboard_link_row.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_draining_member_rejoin.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_enum_class_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_evict_only_when_idle.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_capacity_excludes_igpu.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_guard.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_guard_wiring.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_identity_annotation.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_gpu_topology_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_haiku_55_member.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_idle_restart_health_port.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_job_models_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_memory_policy_binding.py"
+    },
+    {
+      "disposition": "utility",
+      "path": "tests/test_mesh_host_cards.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_no_interrupt.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_detection_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_mcp_tools.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_retry_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_oom_telemetry_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_orphan_reaper_idle_probe.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_poll_vram_background_throttle.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_queue_engine_credential_persistence.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_reservations_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_runtime_state_boot_generation.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_scheduler_helpers_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_scheduler_state_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_service_events_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vision_policy_fail_closed.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vram_glance_accuracy.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vram_idle_poll.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_vram_lifecycle_binding.py"
+    },
+    {
+      "disposition": "core",
+      "path": "tests/test_warm_pool_preload.py"
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/krea2_multigpu.json"
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-benchmark.json"
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-distorch-896-bars-masked-qualification.json"
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-distorch-896-masked-qualification.json"
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-distorch-896-qualification.json"
+    },
+    {
+      "disposition": "core",
+      "path": "workflows/qwen-image-edit-2511-q5-dualgpu.json"
     }
   ],
   "schema_version": "gpumanager.public-files.v1"

@@ -30,13 +30,16 @@ class BrokerConfig:
     lifecycle_mutation_enabled: bool
     sse_enabled: bool
     candidate_mode: bool
+    # Slots a cloud (openai_compatible) member gets when it sets no parallel.
+    slots_per_cloud_member: int = 2
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, candidate: bool) -> "BrokerConfig":
         if not isinstance(data, dict):
             raise ConfigError("CONFIG_OBJECT_REQUIRED")
         expected = {field.name for field in fields(cls)}
-        if set(data) != expected:
+        optional = {"slots_per_cloud_member"}
+        if not expected - optional <= set(data) <= expected:
             raise ConfigError(
                 f"CONFIG_FIELDS_INVALID:missing={sorted(expected-set(data))}:unknown={sorted(set(data)-expected)}"
             )
@@ -88,6 +91,9 @@ class BrokerConfig:
             raise ConfigError("CANDIDATE_REDIS_NAMESPACE_REQUIRED")
         if not mode and not namespace.startswith("prod:combined-gemma:"):
             raise ConfigError("PRODUCTION_REDIS_NAMESPACE_REQUIRED")
+        cloud_slots = data.get("slots_per_cloud_member", 2)
+        if isinstance(cloud_slots, bool) or not isinstance(cloud_slots, int) or cloud_slots <= 0:
+            raise ConfigError("POSITIVE_INTEGER_REQUIRED:slots_per_cloud_member")
         if data["sse_enabled"] is not False:
             raise ConfigError("SSE_DISABLED_REQUIRED")
         if mode and data["lifecycle_mutation_enabled"] is not False:
@@ -109,4 +115,5 @@ class BrokerConfig:
             lifecycle_mutation_enabled=data["lifecycle_mutation_enabled"],
             sse_enabled=data["sse_enabled"],
             candidate_mode=mode,
+            slots_per_cloud_member=cloud_slots,
         )

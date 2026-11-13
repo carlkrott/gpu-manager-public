@@ -77,6 +77,19 @@ def _now(value: float | None) -> float:
     return time.time() if value is None else float(value)
 
 
+def _boot_ticks() -> int | None:
+    """Clock ticks elapsed since the current boot, or None when unknown.
+
+    Process start times in /proc/<pid>/stat are measured in these ticks, so no
+    process of the current boot can report a generation above this value.
+    """
+    try:
+        uptime = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+        return int(uptime * os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
 def _desired(value: RuntimeDesiredState | str) -> RuntimeDesiredState:
     try:
         return value if isinstance(value, RuntimeDesiredState) else RuntimeDesiredState(value)
@@ -424,6 +437,7 @@ class FileRuntimeStateStore(RuntimeStateStore):
             if not isinstance(raw_records, Mapping):
                 raise ValueError("records must be an object")
             expected_fields = {field.name for field in fields(RuntimeInstanceRecord)}
+            boot_ticks = _boot_ticks()
             loaded: dict[str, RuntimeInstanceRecord] = {}
             for instance_id, raw in raw_records.items():
                 if not isinstance(raw, Mapping) or set(raw) != expected_fields:
@@ -434,6 +448,19 @@ class FileRuntimeStateStore(RuntimeStateStore):
                 record = RuntimeInstanceRecord(**values)
                 if record.instance_id != instance_id or record.transition_fence < 0:
                     raise ValueError(f"invalid record identity for {instance_id!r}")
+                if boot_ticks and record.process_generation > boot_ticks:
+                    # Written by a previous boot: no live process can carry this
+                    # start time, so it would reject every new observation as
+                    # "older".  Drop it; the next observation re-establishes it.
+                    record = replace(
+                        record,
+                        process_generation=0,
+                        state=RuntimeControlState.UNKNOWN,
+                        process_ready=False,
+                        model_ready=False,
+                        accepting=False,
+                        last_error="runtime generation rebased: prior boot epoch",
+                    )
                 loaded[str(instance_id)] = record
             self._records = loaded
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:

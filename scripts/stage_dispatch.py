@@ -421,7 +421,7 @@ class KreaPipelineExecutor(PipelineExecutor):
         """Run prompt enhancement. Returns {enhanced_prompt: str}."""
         # The provider is validated at pipeline load time.
         # In tests / hermetic mode this is a fake; in live it routes to
-        # the open-design adapter via the provider_runtime dispatch.
+        # the configured adapter via the provider_runtime dispatch.
         return StageResult(
             stage_id=stage_id,
             kind="prompt_enhance",

@@ -39,8 +39,11 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import random
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Any, Awaitable, Callable, Iterable, Protocol, cast, runtime_checkable
 
@@ -74,6 +77,52 @@ from .redis_store import (
 
 
 logger = logging.getLogger("gemma_broker.runtime")
+
+# Minimum wait after a dispatch pass that reserved nothing (see
+# DispatchLoop._back_off_reservation).
+NO_RESERVATION_BACKOFF_SECONDS = 0.25
+
+# ----------------------------------------------------------------------
+# Quota-wall body pattern table (case-insensitive)
+# ----------------------------------------------------------------------
+import re as _re
+
+_QUOTA_BODY_PATTERNS: list[tuple[str, _re.Pattern[str]]] = [
+    # Google / Vertex / AI Studio patterns
+    ("resets_at",            _re.compile(r"resets?[_\s]?at", _re.I)),
+    ("resets_in_seconds",    _re.compile(r"resets?[_\s]?in[_\s]?(\d+)[_\s]?s", _re.I)),
+    ("quotaResetDelay",      _re.compile(r"quota[_\s]?reset[_\s]?delay", _re.I)),
+    # OpenAI / generic patterns
+    ("usage_limit_reached",   _re.compile(r"usage[_\s]?limit[_\s]?reached", _re.I)),
+    ("usage_limit",          _re.compile(r"usage[_\s]?limit", _re.I)),
+    ("quota",                _re.compile(r"\bquota\b", _re.I)),
+    ("weekly_limit",         _re.compile(r"weekly[_\s]?limit", _re.I)),
+    ("rate_limit_reached",   _re.compile(r"rate[_\s]?limit[_\s]?reached", _re.I)),
+    ("RESOURCE_EXHAUSTED",   _re.compile(r"RESOURCE_EXHAUSTED", _re.I)),
+    # fleet-llm-router labels upstream 429s this way; \bquota\b misses it (underscore).
+    ("quota_or_rate_limit",  _re.compile(r"quota_or_rate_limit", _re.I)),
+]
+
+_RETRY_AFTER_SECONDS = _re.compile(r"^\s*(\d+)\s*$")
+
+
+def _retry_after_seconds(value: str | None) -> int | None:
+    """Retry-After header (delta seconds or HTTP-date) -> whole seconds."""
+    if not value:
+        return None
+    m = _RETRY_AFTER_SECONDS.match(value)
+    if m:
+        return int(m.group(1))
+    try:
+        from email.utils import parsedate_to_datetime
+        delta = (parsedate_to_datetime(value.strip()) - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return None
+    return max(0, int(delta))
+_RETRY_AFTER_HTTP_DATE = _re.compile(r"^\s*,?\s*(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)", _re.I)
+_RESET_IN_PATTERN = _re.compile(r"resets?[_\s]?in[_\s]?(\d+)\s*(s|sec|seconds|m|min|minutes|h|hours)?", _re.I)
+_RESET_AT_PATTERN = _re.compile(r"resets?[_\s]?at[:\s]+(.+)", _re.I)
+_QUOTA_RESET_DELAY = _re.compile(r"quota[_\s]?reset[_\s]?delay[:\s]+(\d+)", _re.I)
 
 
 # ----------------------------------------------------------------------
@@ -118,13 +167,15 @@ class _RepositoryProtocol(Protocol):
         *,
         now: float,
         ordered_members: list[MemberSnapshot],
-        requirements: Any,
+        requirements: Any = None,
         leader_owner: str,
         fencing_token: int,
         backend_url: str | None = None,
         member_lookup: Callable[[str], MemberSnapshot] | None = None,
+        requirements_for: Callable[[Any], Any] | None = None,
     ) -> Any: ...
     def cancel_queued(self, job_id: str, *, completed_at: float) -> JobRecord: ...
+    def fail_queued(self, job: JobRecord) -> JobRecord: ...
     def begin_member_rejoin(
         self,
         member_name: str,
@@ -323,12 +374,22 @@ class BufferedAiohttpTransport:
         endpoint_for_member: Callable[[Any], str] | None = None,
         request_for_member: Callable[[Any, dict[str, Any]], dict[str, Any]] | None = None,
         timeout: float = 30.0,
+        timeout_for_member: Callable[[Any], float | None] | None = None,
     ) -> None:
         self._session = session
         self._owned_session = False
         self._endpoint_for_member = endpoint_for_member or _default_endpoint_for_member
         self._request_for_member = request_for_member
         self._timeout = float(timeout)
+        # Per-member budget (forward_timeout + buffer); `timeout` is the fallback.
+        self._timeout_for_member = timeout_for_member
+
+    def _member_timeout(self, member: Any) -> float:
+        if self._timeout_for_member is not None:
+            value = self._timeout_for_member(member)
+            if value is not None and value > 0:
+                return float(value)
+        return self._timeout
 
     async def send(
         self,
@@ -348,6 +409,7 @@ class BufferedAiohttpTransport:
         # boundary, while this transport still buffers and returns one normal
         # JSON response to the broker caller.
         payload = dict(body)
+        payload.pop("_kv_session_id", None)  # broker-internal affinity key (kv_affinity.SESSION_FIELD)
         if self._request_for_member is not None:
             payload = self._request_for_member(member, payload)
         payload["stream"] = True
@@ -355,18 +417,25 @@ class BufferedAiohttpTransport:
             async with session.post(
                 url,
                 json=payload,
-                timeout=aiohttp_total_timeout(self._timeout),
+                timeout=aiohttp_total_timeout(self._member_timeout(member)),
                 headers={"Accept": "text/event-stream"},
             ) as response:
                 if not 200 <= response.status < 300:
                     text = await response.text()
-                    raise RuntimeError(
-                        f"TRANSPORT_HTTP_{response.status}:{text[:256]}"
+                    # The quota-wall path reads "Retry-After: N" from the error string.
+                    retry_after = _retry_after_seconds(
+                        response.headers.get("Retry-After")
                     )
-                # The backend stream handler waits for its first result before
-                # emitting the response headers. Entering the response is
-                # therefore a proven acceptance boundary for this request.
-                on_accepted()
+                    hint = f"Retry-After: {retry_after} " if retry_after is not None else ""
+                    raise RuntimeError(
+                        f"TRANSPORT_HTTP_{response.status}:{hint}{text[:256]}"
+                    )
+                # llama-server emits headers with its first result, but a proxy
+                # (fleet-llm-router) sends 2xx headers before the upstream has
+                # produced anything and can then stream only an error event.
+                # Acceptance is therefore the first real (non-error) chunk: an
+                # error-only stream fails pre-acceptance, so the job requeues and
+                # the member is cooled instead of completing with no choices.
                 model = payload.get("model")
                 return await self._read_streamed_chat_response(
                     response,
@@ -374,6 +443,7 @@ class BufferedAiohttpTransport:
                         isinstance(model, str)
                         and model.casefold().startswith("minimax-")
                     ),
+                    on_first_chunk=on_accepted,
                 )
         finally:
             pass
@@ -383,6 +453,7 @@ class BufferedAiohttpTransport:
         response: Any,
         *,
         split_leading_think: bool = False,
+        on_first_chunk: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Buffer an internal OpenAI SSE response into one terminal object."""
         first_chunk: dict[str, Any] | None = None
@@ -400,8 +471,15 @@ class BufferedAiohttpTransport:
                 return
             if not isinstance(chunk, dict):
                 return
+            if chunk.get("error") and not chunk.get("choices"):
+                # Keep the whole error object so the quota classifier sees its body.
+                raise RuntimeError(
+                    f"TRANSPORT_STREAM_ERROR:{json.dumps(chunk['error'])[:512]}"
+                )
             if first_chunk is None:
                 first_chunk = chunk
+                if on_first_chunk is not None:
+                    on_first_chunk()
             if isinstance(chunk.get("usage"), dict):
                 usage = chunk["usage"]
             for choice in chunk.get("choices") or []:
@@ -602,8 +680,19 @@ def map_member_ready(
         freshness_ms=freshness_ms,
         previous=previous,
     )
-    # Reject any snapshot whose semantic_health is False; map to UNHEALTHY.
-    if not snapshot.semantic_health:
+    # A fresh CPU probe timeout under an active dispatcher lease proves only
+    # that work is busy, not that the backend is healthy or has free capacity.
+    # Preserve that reducer result only for this exact capacity-only shape;
+    # every other semantic-health failure remains strictly unhealthy.
+    busy_cpu_timeout = (
+        probes.get("probe_error") == "probe_timeout"
+        and (bool(config.get("cpu_only")) or not config.get("gpu_id"))
+        and int(probes.get("dispatcher_leases", 0) or 0) > 0
+        and snapshot.state is MemberState.READY_BUSY
+        and snapshot.reason_codes == (ReasonCode.MEMBER_NO_CAPACITY,)
+        and snapshot.snapshot_age_ms <= freshness_ms
+    )
+    if not snapshot.semantic_health and not busy_cpu_timeout:
         from dataclasses import replace as _replace
 
         return _replace(
@@ -646,12 +735,15 @@ class DispatchLoop:
         leader_ttl_seconds: float,
         heartbeat_seconds: float,
         clock: Callable[[], float],
+        wall_clock: Callable[[], float] = time.time,
+        readiness_freshness_seconds: float | None = None,
         poll_interval_seconds: float = 0.01,
         dispatch_concurrency_cap: int | None = None,
         shutdown_timeout_seconds: float = 5.0,
         startup_recovery_grace_seconds: float | None = None,
         requirements_factory: Callable[[dict[str, Any]], Any] | None = None,
         event_producer: BoundedEventProducer | None = None,
+        safety_margin_tokens: int = 1024,
     ) -> None:
         if not owner:
             raise ValueError("owner is required")
@@ -673,14 +765,23 @@ class DispatchLoop:
             startup_recovery_grace_seconds <= 0
         ):
             raise ValueError("startup_recovery_grace_seconds must be positive")
+        if readiness_freshness_seconds is not None and readiness_freshness_seconds <= 0:
+            raise ValueError("readiness_freshness_seconds must be positive")
         self._repository = repository
         self._transport = transport
+        self._safety_margin_tokens = int(safety_margin_tokens)
         self._members_provider = members_provider
         self._dispatcher = dispatcher
         self._owner = owner
         self._leader_ttl_seconds = float(leader_ttl_seconds)
         self._heartbeat_seconds = float(heartbeat_seconds)
         self._clock = clock
+        self._wall_clock = wall_clock
+        self._readiness_freshness_seconds = (
+            None
+            if readiness_freshness_seconds is None
+            else float(readiness_freshness_seconds)
+        )
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._explicit_dispatch_concurrency_cap = dispatch_concurrency_cap
         self._dispatch_concurrency_cap = self._resolve_dispatch_concurrency_cap()
@@ -725,6 +826,13 @@ class DispatchLoop:
         self._preaccept_cooldown_until_monotonic: dict[str, float] = {}
         self._preaccept_cooldown_base_seconds: float = 1.0
         self._preaccept_cooldown_cap_seconds: float = 60.0
+        # Quota-wall state (Step 2e-impl): long cooldown for HTTP 429 with quota/usage-limit body.
+        self._quota_wall_until_monotonic: dict[str, float] = {}
+        self._quota_wall_reason: dict[str, str] = {}  # reason class: retry_after | reset_hint | default
+        self._quota_wall_failure_count: dict[str, int] = {}
+        self._quota_wall_last_logged_reason: dict[str, str] = {}
+        self._quota_wall_base_seconds: float = 900.0   # 15 min
+        self._quota_wall_cap_seconds: float = 7200.0  # 2 h
         # Step 2e-2 — tunables. Defaults match the spec; they may be wired
         # in from ``BrokerConfig`` (services.json) at composition time. They
         # are NOT constructor kwargs to preserve the closed contract used by
@@ -747,7 +855,7 @@ class DispatchLoop:
 
     @property
     def metrics(self) -> dict[str, Any]:
-        now = time.monotonic()
+        now = self._clock()
         return {
             "dispatched_count": self._dispatched,
             "fencing_token": self._fencing_token,
@@ -760,12 +868,41 @@ class DispatchLoop:
                 for name, until in self._preaccept_cooldown_until_monotonic.items()
                 if until > now
             },
+            "quota_walls": {
+                name: {
+                    "reason": self._quota_wall_reason.get(name, "default"),
+                    "remaining_seconds": max(0.0, until - now),
+                }
+                for name, until in self._quota_wall_until_monotonic.items()
+                if until > now
+            },
             "startup_recovery": {
                 "enabled": self._startup_recovery_grace_seconds is not None,
                 "complete": self._startup_recovery_complete,
                 "recovered_count": self._startup_recovered_count,
             },
         }
+
+    def active_dispatch_suppression(self, member_name: str) -> dict[str, Any] | None:
+        """Describe an active dispatch cooldown/quota wall for readiness writers."""
+        now = self._clock()
+        quota_until = self._quota_wall_until_monotonic.get(member_name, 0.0)
+        if quota_until > now:
+            return {
+                "kind": "quota_wall",
+                "reason": self._quota_wall_reason.get(member_name, "default"),
+                "deadline_monotonic": quota_until,
+                "remaining_seconds": quota_until - now,
+            }
+        cooldown_until = self._preaccept_cooldown_until_monotonic.get(member_name, 0.0)
+        if cooldown_until > now:
+            return {
+                "kind": "preaccept_cooldown",
+                "reason": "dispatch_pre_acceptance_failure",
+                "deadline_monotonic": cooldown_until,
+                "remaining_seconds": cooldown_until - now,
+            }
+        return None
 
     def _try_startup_recovery(self) -> None:
         reconcile = getattr(
@@ -804,11 +941,105 @@ class DispatchLoop:
                 len(recovered),
             )
 
+    def _prior_leader_dead(self) -> bool:
+        """True when this process just took the fence from a provably dead owner.
+
+        Assumes one broker process per Redis namespace (one systemd unit), so
+        the immediately superseded fence is the only one that can still hold
+        leases. Owners look like ``name:pid:nonce``; anything we cannot prove
+        dead (alive, other host, unparsable, EPERM) keeps the startup grace.
+        """
+        minted = getattr(self._repository, "last_minted_leadership", None)
+        if not minted:
+            return False
+        token, prev_owner, prev_token = minted
+        if token != self._fencing_token or prev_token != token - 1 or prev_owner == self._owner:
+            return False
+        parts = prev_owner.rsplit(":", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            return False
+        pid = int(parts[1])
+        if pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _recover_dead_leader_now(self) -> None:
+        # shortcut: no wait for backend busy slots; llama queues an orphaned
+        # request behind the slot instead of double-booking it.
+        self._try_startup_recovery()
+        recover_claims = getattr(
+            self._repository, "recover_stale_pre_acceptance_claims", None
+        )
+        if callable(recover_claims):
+            try:
+                # Before our first dispatch every claim is the dead owner's.
+                recovered = recover_claims(now=self._clock(), max_age_seconds=1e-3)
+            except RepositoryUnavailable as exc:
+                logger.warning("dead-leader claim recovery deferred: %s", exc)
+                recovered = ()
+            if recovered:
+                logger.warning(
+                    "requeued %d pre-acceptance claims of a dead prior leader",
+                    len(recovered),
+                )
+
+    async def _run_renewing_leadership(self, fn: Callable[[], None]) -> None:
+        """Run a slow repository scan off-loop while the fence keeps renewing.
+
+        The scans walk every job key client-side (27 s live on 10-23); run
+        inline they outlast the leader TTL and the fence is re-minted.
+        """
+        task = asyncio.ensure_future(asyncio.to_thread(fn))
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=self._heartbeat_seconds)
+            if done:
+                break
+            try:
+                self._repository.renew_leadership(
+                    owner=self._owner,
+                    fencing_token=int(self._fencing_token),
+                    now=self._clock(),
+                    ttl_seconds=self._leader_ttl_seconds,
+                )
+            except (LeadershipLost, RepositoryUnavailable) as exc:
+                # The scan's own fenced writes fail and defer; the main loop
+                # reacquires.
+                logger.warning("renewal during recovery scan failed: %s", exc)
+                await task
+                break
+        task.result()
+
+    def _members_eligible(
+        self, members: Iterable[MemberSnapshot]
+    ) -> list[MemberSnapshot]:
+        """Return members outside both pre-acceptance cooldown AND quota wall."""
+        now = self._clock()
+        # Expire and clean stale entries
+        for name, until in list(self._preaccept_cooldown_until_monotonic.items()):
+            if until <= now:
+                self._preaccept_cooldown_until_monotonic.pop(name, None)
+        for name, until in list(self._quota_wall_until_monotonic.items()):
+            if until <= now:
+                self._quota_wall_until_monotonic.pop(name, None)
+                self._quota_wall_reason.pop(name, None)
+        return [
+            member
+            for member in members
+            if self._preaccept_cooldown_until_monotonic.get(member.name, 0.0) <= now
+            and self._quota_wall_until_monotonic.get(member.name, 0.0) <= now
+        ]
+
     def _members_outside_preaccept_cooldown(
         self,
         members: Iterable[MemberSnapshot],
     ) -> list[MemberSnapshot]:
-        now = time.monotonic()
+        now = self._clock()
         expired = [
             name
             for name, until in self._preaccept_cooldown_until_monotonic.items()
@@ -830,7 +1061,7 @@ class DispatchLoop:
             self._preaccept_cooldown_base_seconds * (2 ** min(count - 1, 16)),
         )
         self._preaccept_cooldown_until_monotonic[member_name] = (
-            time.monotonic() + delay
+            self._clock() + delay
         )
         self._dispatch_one_fail_counters["pre_acceptance_requeue"] += 1
         logger.warning(
@@ -844,6 +1075,211 @@ class DispatchLoop:
     def _clear_preaccept_failure(self, member_name: str) -> None:
         self._preaccept_failure_counts.pop(member_name, None)
         self._preaccept_cooldown_until_monotonic.pop(member_name, None)
+
+    # ------------------------------------------------------------------
+    # Quota-wall helpers (Step 2e-impl)
+    # ------------------------------------------------------------------
+
+    def _classify_preaccept_failure(
+        self, error: str | None, body: str | None = None
+    ) -> tuple[str, str | None]:
+        """Classify a pre-acceptance failure as 'quota_wall' or 'transient'.
+
+        Args:
+            error: the exception string from the dispatcher (e.g. 'ClientResponseError:...429...')
+            body: optional JSON/body text from the 429/503 response
+
+        Returns:
+            ('quota_wall', reason_class) or ('transient', None)
+            reason_class is payment_required, retry_after, or the matching
+            _QUOTA_BODY_PATTERNS name (provider-neutral body patterns).
+        """
+        import json as _json
+
+        if error is not None and "TRANSPORT_HTTP_402" in error:
+            # Payment required: the plan/credit is gone, retrying soon cannot help.
+            return ("quota_wall", "payment_required")
+        if error is not None and "TRANSPORT_HTTP_429" in error and _re.search(
+            r"Retry-After[:\s]+\d+", error
+        ):
+            # The provider said when to come back; honour it instead of cooling briefly.
+            return ("quota_wall", "retry_after")
+        # A 2xx stream whose only event is an error (router passthrough) carries
+        # the upstream body; judge it like a 429 body.
+        is_quota_status = error is not None and (
+            "TRANSPORT_HTTP_429" in error or "TRANSPORT_STREAM_ERROR" in error
+        )
+        body_text = body or ""
+
+        # Try to extract a JSON body from the error string or body
+        body_data: dict[str, Any] = {}
+        if body_text:
+            try:
+                body_data = _json.loads(body_text)
+            except Exception:
+                # Transport errors prefix the provider body with status text.
+                # Decode the full JSON value so nested quota evidence survives.
+                start = body_text.find("{")
+                if start >= 0:
+                    try:
+                        body_data, _ = _json.JSONDecoder().raw_decode(body_text[start:])
+                    except Exception:
+                        pass
+
+        # If the error string contains a JSON payload, decode the complete value.
+        if not body_data and error:
+            start = error.find("{")
+            if start >= 0:
+                try:
+                    body_data, _ = _json.JSONDecoder().raw_decode(error[start:])
+                except Exception:
+                    pass
+
+        # Check for quota/usage-limit body patterns
+        quota_class: str | None = None
+        if body_data:
+            body_str = _json.dumps(body_data)
+            for name, pat in _QUOTA_BODY_PATTERNS:
+                if pat.search(body_str):
+                    quota_class = name
+                    break
+        elif is_quota_status:
+            # 429 but no body parsed -> check if error text contains quota keywords
+            for name, pat in _QUOTA_BODY_PATTERNS:
+                if pat.search(error or ""):
+                    quota_class = name
+                    break
+
+        if not is_quota_status:
+            # 502/503 with RESOURCE_EXHAUSTED or quota in body -> quota wall
+            if quota_class and ("502" in (error or "") or "503" in (error or "")):
+                return ("quota_wall", quota_class)
+            return ("transient", None)
+
+        if not quota_class:
+            # Bare 429 (no quota body) -> transient
+            return ("transient", None)
+
+        return ("quota_wall", quota_class)
+
+    def _parse_retry_after(self, retry_after_str: str | None) -> int | None:
+        """Parse a Retry-After header value to seconds.
+
+        Handles:
+          - Plain integer seconds: "120"
+          - HTTP-date: "Wed, 01 Jan 2025 00:00:00 GMT" (parsed as delta from now)
+        Returns None if unparseable.
+        """
+        if not retry_after_str:
+            return None
+        val = retry_after_str.strip()
+        m = _RETRY_AFTER_SECONDS.match(val)
+        if m:
+            return int(m.group(1))
+        # HTTP-date: parse as absolute time and compute delta
+        try:
+            from email.utils import parsedate_to_datetime
+            abs_time = parsedate_to_datetime(val)
+            delta = (abs_time - datetime.now(timezone.utc)).total_seconds()
+            return max(0, int(delta))
+        except Exception:
+            return None
+
+    def _parse_reset_hint(
+        self, body: str | None
+    ) -> tuple[int | None, str]:
+        """Parse 'resets in X' or 'resets_at' from a JSON body string.
+
+        Returns (seconds_remaining, reason_class).
+        """
+        if not body:
+            return (None, "default")
+        for name, pat in _QUOTA_BODY_PATTERNS:
+            if not pat.search(body):
+                continue
+            # Found a quota pattern — look for a reset hint
+            m = _RESET_IN_PATTERN.search(body)
+            if m:
+                num = int(m.group(1))
+                unit = (m.group(2) or "s").lower()
+                multipliers = {"h": 3600, "hr": 3600, "hrs": 3600,
+                              "m": 60, "min": 60, "mins": 60,
+                              "s": 1, "sec": 1, "secs": 1}
+                secs = num * multipliers.get(unit, 1)
+                return (int(secs), name)
+            m = _RESET_AT_PATTERN.search(body)
+            if m:
+                # Try to parse absolute time
+                try:
+                    from email.utils import parsedate_to_datetime
+                    abs_time = parsedate_to_datetime(m.group(1).strip())
+                    delta = (abs_time - datetime.now(timezone.utc)).total_seconds()
+                    return (max(0, int(delta)), name)
+                except Exception:
+                    pass
+            m = _QUOTA_RESET_DELAY.search(body)
+            if m:
+                return (int(m.group(1)), name)
+            return (None, name)
+        return (None, "default")
+
+    def _record_quota_wall(
+        self, member_name: str, reason_class: str, reset_seconds: int | None
+    ) -> None:
+        """Enter quota-wall state for a member.
+
+        Log INFO once per reason-class transition (not per job).
+        Doubling starts at 900 s, caps at 7200 s.
+        An explicit Retry-After below 60 s is honoured as-is (test e1 needs 7 s).
+        """
+        was_in_wall = member_name in self._quota_wall_until_monotonic
+        prev_reason = self._quota_wall_reason.get(member_name)
+
+        if reset_seconds is not None:
+            # Honour explicit Retry-After below cap, clamped otherwise
+            delay = reset_seconds if reset_seconds < 60 else min(reset_seconds, self._quota_wall_cap_seconds)
+        else:
+            count = self._quota_wall_failure_count.get(member_name, 0) + 1
+            self._quota_wall_failure_count[member_name] = count
+            delay = min(self._quota_wall_cap_seconds, self._quota_wall_base_seconds * (2 ** min(count - 1, 3)))
+
+        self._quota_wall_until_monotonic[member_name] = self._clock() + delay
+        self._quota_wall_reason[member_name] = reason_class
+
+        # Log once per reason-class transition (INFO, not per job)
+        if not was_in_wall or prev_reason != reason_class:
+            self._quota_wall_last_logged_reason[member_name] = reason_class
+            logger.info(
+                "BROKER_QUOTA_WALL: member=%s reason_class=%s delay_seconds=%.1f",
+                member_name, reason_class, delay,
+            )
+
+    def _clear_quota_wall(self, member_name: str) -> None:
+        """Clear quota-wall state on successful dispatch (member used again)."""
+        if member_name in self._quota_wall_until_monotonic:
+            logger.info("BROKER_QUOTA_WALL_CLEARED: member=%s", member_name)
+        self._quota_wall_until_monotonic.pop(member_name, None)
+        self._quota_wall_reason.pop(member_name, None)
+        self._quota_wall_failure_count.pop(member_name, None)
+
+    def _members_outside_quota_wall(
+        self, members: Iterable[MemberSnapshot]
+    ) -> list[MemberSnapshot]:
+        """Return members whose quota wall has expired or is not set."""
+        now = self._clock()
+        expired = [
+            name
+            for name, until in self._quota_wall_until_monotonic.items()
+            if until <= now
+        ]
+        for name in expired:
+            self._quota_wall_until_monotonic.pop(name, None)
+            self._quota_wall_reason.pop(name, None)
+        return [
+            member
+            for member in members
+            if self._quota_wall_until_monotonic.get(member.name, 0.0) <= now
+        ]
 
     def _record_fail_event(
         self,
@@ -1032,6 +1468,9 @@ class DispatchLoop:
             return
 
         self._startup_recovery_started_at_monotonic = time.monotonic()
+        if self._prior_leader_dead():
+            logger.warning("prior dispatch leader is dead; reconciling its leases now")
+            await self._run_renewing_leadership(self._recover_dead_leader_now)
         last_renewal = self._clock()
         try:
             while not self._stopping.is_set():
@@ -1046,7 +1485,16 @@ class DispatchLoop:
                     and now_monotonic
                     >= self._startup_recovery_retry_not_before_monotonic
                 ):
-                    self._try_startup_recovery()
+                    await self._run_renewing_leadership(self._try_startup_recovery)
+                    last_renewal = self._clock()
+                reconcile_unreleased = getattr(
+                    self._dispatcher, "reconcile_unreleased", None
+                )
+                if callable(reconcile_unreleased):
+                    try:
+                        await reconcile_unreleased()
+                    except Exception as exc:
+                        logger.warning("unreleased-lease reconcile failed: %s", exc)
                 now = self._clock()
                 # Renew leadership on a heartbeat cadence.  Dispatch tasks are
                 # deliberately independent of this loop so a full dispatch
@@ -1143,28 +1591,145 @@ class DispatchLoop:
         finally:
             self._fencing_token = None
 
+    def _requirements_for(self, head: Any) -> Any:
+        requirements = self._requirements_factory(head.request_body)
+        pin = getattr(head, "pinned_member", None)
+        if pin and hasattr(requirements, "pinned_member"):
+            requirements = replace(requirements, pinned_member=pin)
+        return requirements
+
+    def _fail_unavailable_pinned_head(self, head: Any, members: list[MemberSnapshot]) -> bool:
+        """Fail a queued pin only when its target is actually undispatchable."""
+        pin = getattr(head, "pinned_member", None)
+        if not pin or not self._fencing_token:
+            return False
+        requirements = self._requirements_for(head)
+        # An absent target may be temporarily filtered by cooldown/quota wall.
+        raw_members = self._authoritative_members()
+        raw_target = next((member for member in raw_members if member.name == pin), None)
+        eligible = next((member for member in members if member.name == pin), None)
+        # A ready, compatible member with no slot is busy, not unavailable.
+        if raw_target is not None and raw_target.state is MemberState.READY_ACCEPTING and raw_target.accepting:
+            if evaluate(requirements, raw_target, safety_margin_tokens=self._safety_margin_tokens).compatible:
+                if eligible is not None and (eligible.compatible_free_slots or 0) > 0:
+                    return False
+                if raw_target.configured_slots > 0 and raw_target.dispatcher_leases >= raw_target.configured_slots:
+                    return False
+                if raw_target.compatible_free_slots is not None and raw_target.compatible_free_slots <= 0:
+                    return False
+        # A GPU member whose slots are all leased publishes READY_BUSY. That is
+        # saturation, not unavailability: keep the pin queued while the member
+        # is outside cooldown/quota wall and every slot is visibly in use.
+        if (
+            raw_target is not None
+            and eligible is not None
+            and raw_target.gpu_id is not None
+            and raw_target.state is MemberState.READY_BUSY
+            and evaluate(requirements, raw_target, safety_margin_tokens=self._safety_margin_tokens).compatible
+            and (
+                (raw_target.configured_slots > 0
+                 and raw_target.dispatcher_leases >= raw_target.configured_slots)
+                or (raw_target.compatible_free_slots is not None
+                    and raw_target.compatible_free_slots <= 0)
+                or (raw_target.backend_slots_busy is not None
+                    and raw_target.configured_slots > 0
+                    and raw_target.backend_slots_busy >= raw_target.configured_slots)
+            )
+        ):
+            return False
+        # The strict cache can also publish a fresh, capacity-only CPU
+        # probe-timeout snapshot as READY_BUSY. Preserve that queued pin only
+        # while the exact exception shape remains fresh and dispatchable; the
+        # eligible view excludes active cooldowns and quota walls.
+        if (
+            raw_target is not None
+            and eligible is not None
+            and raw_target.state is MemberState.READY_BUSY
+            and self._readiness_freshness_seconds is not None
+        ):
+            try:
+                age = self._wall_clock() - raw_target.observed_at
+                fresh = 0 <= age <= self._readiness_freshness_seconds
+            except (AttributeError, TypeError, ValueError):
+                fresh = False
+            reasons = {
+                getattr(reason, "value", reason) for reason in raw_target.reason_codes
+            }
+            if (
+                fresh
+                and raw_target.gpu_id is None
+                and raw_target.semantic_health is False
+                and raw_target.accepting is False
+                and raw_target.systemd_active is True
+                and bool(raw_target.main_pid)
+                and raw_target.dispatcher_registered is True
+                and raw_target.dispatcher_leases > 0
+                and raw_target.backend_slots_total is None
+                and raw_target.backend_slots_busy is None
+                and raw_target.compatible_free_slots == 0
+                and reasons == {ReasonCode.MEMBER_NO_CAPACITY.value}
+                and evaluate(requirements, raw_target, safety_margin_tokens=self._safety_margin_tokens).compatible
+            ):
+                return False
+        # Missing, non-ready, incompatible-route, or suppression-filtered pins
+        # have no path to reservation and should not remain queued indefinitely.
+        current = self._repository.get(head.job_id)
+        if current is None or current.state is not JobState.QUEUED:
+            return False
+        failed = replace(
+            current,
+            state=JobState.FAILED,
+            completed_at=self._clock(),
+            reason_code=ReasonCode.NO_ELIGIBLE_MEMBER,
+            error="pinned_member_unavailable",
+            state_version=current.state_version + 1,
+        )
+        # Terminalize and leave the priority queue in one step; a bare
+        # replace_job left the id in the zset (live orphans, queue depth 2).
+        fail_queued = getattr(self._repository, "fail_queued", None)
+        if fail_queued is not None:
+            fail_queued(failed)
+        else:
+            self._repository.replace_job(failed)
+        return True
+
+    def _back_off_reservation(self) -> None:
+        # Floor the wait: the live poll interval is 10 ms, and a pass that
+        # reserves nothing re-reads the 64-job window from Redis each time.
+        self._reservation_retry_not_before_monotonic = max(
+            self._reservation_retry_not_before_monotonic,
+            time.monotonic()
+            + max(self._poll_interval_seconds, NO_RESERVATION_BACKOFF_SECONDS),
+        )
+
     async def _dispatch_one(self) -> bool:
         try:
-            members = self._members_outside_preaccept_cooldown(
+            members = self._members_eligible(
                 self._authoritative_members()
             )
         except RepositoryUnavailable as exc:
             self._dispatch_one_fail_counters["repo_unavailable"] += 1
             self._record_fail_event("repo_unavailable", error=str(exc))
             return False
-        if not members:
-            return False
         head = None
         try:
             async with self._reservation_lock:
-                head = self._peek_head()
+                # The window skips ids whose record is no longer QUEUED. A
+                # head-only peek raises on such a stale zset head, which would
+                # hold every job behind it (live 2026-10-11, failed orphan).
+                window = self._peek_window()
+                head = window[0] if window else None
                 if head is None:
+                    self._back_off_reservation()
                     return False
-                requirements = self._requirements_factory(head.request_body)
+                if self._fail_unavailable_pinned_head(head, members):
+                    return False
+                # The repository reserves the first windowed job some member
+                # can serve; a full pinned head must not block the queue.
                 reservation = self._repository.reserve_next(
                     now=self._clock(),
                     ordered_members=members,
-                    requirements=requirements,
+                    requirements_for=self._requirements_for,
                     leader_owner=self._owner,
                     fencing_token=int(self._fencing_token or 0),
                 )
@@ -1173,10 +1738,9 @@ class DispatchLoop:
             head_id = getattr(head, "job_id", None) if head else None
             now_mono = time.monotonic()
             self._reservation_stale_consecutive += 1
-            self._reservation_retry_not_before_monotonic = max(
-                self._reservation_retry_not_before_monotonic,
-                now_mono + self._poll_interval_seconds,
-            )
+            # Same floor as an empty pass: an image job whose only vision
+            # members are full raises here on every pass (plan 5.1).
+            self._back_off_reservation()
             if (
                 self._reservation_stale_consecutive == 1
                 or now_mono - self._reservation_stale_last_log_at_monotonic >= 1.0
@@ -1189,8 +1753,8 @@ class DispatchLoop:
                 )
                 self._reservation_stale_last_log_at_monotonic = now_mono
             # Reservation staleness is unrelated to fence loss. Keep the
-            # cumulative counter, but gate new reservation attempts until the
-            # normal poll interval has elapsed.
+            # cumulative counter, but gate new reservation attempts for the
+            # no-reservation backoff.
             self._fence_stale_consecutive = 0
             self._dispatch_one_fail_counters["reservation_stale"] += 1
             self._record_fail_event("reservation_stale", error=str(exc))
@@ -1246,6 +1810,19 @@ class DispatchLoop:
             return False
         if reservation is None:
             self._dispatch_one_fail_counters["no_reservation"] += 1
+            # The advisory pre-check said a job was dispatchable but nothing
+            # was reserved: wait one poll interval instead of re-spawning at
+            # once (live 2026-10-11: 85% CPU hot loop).
+            self._back_off_reservation()
+            if head is not None:
+                try:
+                    self._fail_unavailable_pinned_head(
+                        head,
+                        self._members_eligible(self._authoritative_members()),
+                    )
+                except (RepositoryUnavailable, LeadershipLost, ReservationStale):
+                    # Unknown repository/fence state must remain fail-closed.
+                    pass
             return False
         try:
             # Step 2e-1 — clear the streak immediately before dispatching
@@ -1259,9 +1836,26 @@ class DispatchLoop:
                 outcome.state is JobState.QUEUED
                 and outcome.reason_code is ReasonCode.PRE_ACCEPTANCE_REQUEUE
             ):
-                self._record_preaccept_failure(reservation.member.name)
+                classification, reason_class = self._classify_preaccept_failure(outcome.error)
+                if classification == "quota_wall":
+                    # Extract Retry-After from the error string if present
+                    retry_after: int | None = None
+                    import re as _re3
+                    ra = _re3.search(r"Retry-After[:\s]+(\d+)", outcome.error or "")
+                    if ra:
+                        retry_after = int(ra.group(1))
+                    elif reason_class in ("resets_in_seconds", "resets_at", "quotaResetDelay"):
+                        retry_after, _ = self._parse_reset_hint(outcome.error)
+                    self._record_quota_wall(
+                        reservation.member.name, reason_class or "default", retry_after
+                    )
+                    self._clear_preaccept_failure(reservation.member.name)
+                else:
+                    self._record_preaccept_failure(reservation.member.name)
+                    self._clear_quota_wall(reservation.member.name)
             else:
                 self._clear_preaccept_failure(reservation.member.name)
+                self._clear_quota_wall(reservation.member.name)
             return True
         except RepositoryUnavailable as exc:
             self._dispatch_one_fail_counters["repo_unavailable"] += 1
@@ -1293,30 +1887,44 @@ class DispatchLoop:
         sleep instead of hot-spinning when the queue is empty or all members
         are temporarily unavailable.
         """
-        head = self._peek_head()
-        if head is None:
+        window = self._peek_window()
+        if not window:
             return False
         try:
-            members = self._members_outside_preaccept_cooldown(
+            members = self._members_eligible(
                 self._authoritative_members()
             )
         except RepositoryUnavailable:
             return False
         if not members:
             return False
+        for job in window:
+            try:
+                requirements = self._requirements_for(job)
+            except Exception:
+                # Let the normal dispatch path classify/log malformed
+                # requests; a bad job must not hot-spin the idle check.
+                continue
+            if any(
+                member.state is MemberState.READY_ACCEPTING
+                and member.accepting
+                and (member.compatible_free_slots or 0) > 0
+                and evaluate(requirements, member, safety_margin_tokens=self._safety_margin_tokens).compatible
+                for member in members
+            ):
+                return True
+        return False
+
+    def _peek_window(self) -> list[JobRecord]:
+        """Dispatch-order candidates the reservation scan may consider."""
+        peek_window = getattr(self._repository, "peek_window", None)
+        if peek_window is None:
+            head = self._peek_head()
+            return [] if head is None else [head]
         try:
-            requirements = self._requirements_factory(head.request_body)
+            return list(peek_window(now=self._clock()))
         except Exception:
-            # Let the normal dispatch path classify/log malformed requests;
-            # do not turn an input error into an idle hot loop.
-            return False
-        return any(
-            member.state is MemberState.READY_ACCEPTING
-            and member.accepting
-            and (member.compatible_free_slots or 0) > 0
-            and evaluate(requirements, member).compatible
-            for member in members
-        )
+            return []
 
     def _peek_head(self) -> JobRecord | None:
         peek = getattr(self._repository, "peek_next", None)
@@ -1797,6 +2405,7 @@ class BrokerRuntime:
             self._repository,
             members=self._safe_members,
             clock=self._clock,
+            safety_margin_tokens=self.config.context_safety_margin,
         )
         # The compat wrapper is exposed for callers that need to proxy a
         # single OpenAI-shaped request. The runtime intercepts every call
@@ -1833,14 +2442,85 @@ class BrokerRuntime:
             leader_ttl_seconds=self.config.leader_ttl_seconds,
             heartbeat_seconds=self.config.heartbeat_seconds,
             clock=self._clock,
+            wall_clock=time.time,
+            readiness_freshness_seconds=self.config.freshness_seconds,
             startup_recovery_grace_seconds=self._request_timeout,
             event_producer=self.event_producer,
+            safety_margin_tokens=self.config.context_safety_margin,
         )
+        self.api_service.member_admission = self._pinned_member_admission
+        self.api_service.member_capacity = self._pinned_member_capacity
 
         # close()/stop() bookkeeping.
         self._closed = False
         self._close_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
+
+    def _pinned_member_admission(self, member_name: str) -> bool:
+        """Check durable readiness and dispatch suppression, excluding capacity."""
+        try:
+            eligible = self.dispatch_loop._members_eligible(
+                self.dispatch_loop._authoritative_members()
+            )
+        except Exception as exc:
+            raise RepositoryUnavailable(ReasonCode.REDIS_STATE_UNKNOWN.value) from exc
+        return any(member.name == member_name for member in eligible)
+
+    def _pinned_member_capacity(self, member_name: str) -> bool:
+        """Re-read proved free capacity for a pinned member from the mirror.
+
+        The durable member mirror is the authority the reservation Lua reads, and
+        ``release_member_lease`` recomputes ``compatible_free_slots`` from the
+        live lease set the instant a lease is released. The observer snapshot
+        only catches up on its own refresh tick, so an embedded pinned submit
+        landing inside that window used to refuse a member whose slot was
+        already free. A genuinely busy member still reports zero here and is
+        refused without any wait.
+        """
+        getter = getattr(
+            self._repository,
+            "get_reservation_member",
+            None,
+        ) or self._repository.get_member
+        stored = getter(member_name)
+        if stored is None:
+            return False
+        state = getattr(stored.state, "value", stored.state)
+        if state == "ready_accepting":
+            return bool(stored.accepting) and (stored.compatible_free_slots or 0) > 0
+        if state != "ready_busy":
+            return False
+        # The only busy snapshot that may pass this capacity-only gate is the
+        # strict cache's fresh, lease-backed CPU probe-timeout shape. It does
+        # not make the member accepting or reserve a backend slot.
+        # observed_at is stamped with wall time by the post-sweep observer;
+        # the runtime's _clock is monotonic for leases and deadlines. Keep the
+        # timestamp domains separate when validating this durable snapshot.
+        wall_clock = getattr(self, "_wall_clock", time.time)
+        config = getattr(self, "config", None)
+        freshness_seconds = getattr(config, "freshness_seconds", None)
+        if not callable(wall_clock) or freshness_seconds is None:
+            return False
+        try:
+            age = wall_clock() - stored.observed_at
+            fresh = 0 <= age <= freshness_seconds
+        except (AttributeError, TypeError, ValueError):
+            return False
+        reasons = {getattr(reason, "value", reason) for reason in stored.reason_codes}
+        return (
+            fresh
+            and stored.gpu_id is None
+            and stored.semantic_health is False
+            and stored.accepting is False
+            and stored.systemd_active is True
+            and bool(stored.main_pid)
+            and stored.dispatcher_registered is True
+            and stored.dispatcher_leases > 0
+            and stored.backend_slots_total is None
+            and stored.backend_slots_busy is None
+            and stored.compatible_free_slots == 0
+            and reasons == {ReasonCode.MEMBER_NO_CAPACITY.value}
+        )
 
     # --------------------------------------------------------------- surface
 
@@ -2033,17 +2713,31 @@ class _CandidateCompatAdapter:
         self._service = service
         self._polling_wait = polling_wait
 
-    def submit_compat(self, request_body: dict, *, idempotency_key: str) -> JobRecord:
+    def submit_compat(
+        self,
+        request_body: dict,
+        *,
+        idempotency_key: str,
+        pinned_member: str | None = None,
+        kv_scope: dict | None = None,
+    ) -> JobRecord:
         payload = {
             "idempotency_key": idempotency_key,
             "request": request_body,
             "priority": int(Priority.NORMAL),
             "caller_scope": "compat",
         }
+        if pinned_member:
+            payload["pinned_member"] = pinned_member
+        if kv_scope:
+            return self._service.submit(payload, kv_scope=kv_scope)
         return self._service.submit(payload)
 
     def status(self, job_id: str) -> JobRecord:
         return self._service.status(job_id)
+
+    def cancel(self, job_id: str) -> JobRecord:
+        return self._service.cancel(job_id)
 
     async def wait_for_terminal(self, job_id: str, *, timeout: float) -> dict[str, Any]:
         return await self._polling_wait.wait(job_id, timeout=timeout)
@@ -2081,21 +2775,55 @@ class _CandidateCompatAdapter:
         choices = payload.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices else {}
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
-        content = message.get("content", "") if isinstance(message, dict) else ""
+        if not isinstance(message, dict):
+            message = {}
+        content = message.get("content") or ""
+        reasoning_content = message.get("reasoning_content")
+        tool_calls = [call for call in message.get("tool_calls") or [] if isinstance(call, dict)]
         base = {
             "id": payload.get("id", f"chatcmpl-{job_id}"),
             "created": payload.get("created", int(time.time())),
             "model": payload.get("model", "gemma"),
             "object": "chat.completion.chunk",
         }
-        first = dict(base)
-        first["choices"] = [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-        yield _sse_frame(first)
-        delta = dict(base)
-        delta["choices"] = [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
-        yield _sse_frame(delta)
+
+        def chunk(delta: dict[str, Any], finish_reason: Any = None) -> bytes:
+            frame = dict(base)
+            frame["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+            return _sse_frame(frame)
+
+        yield chunk({"role": "assistant"})
+        if reasoning_content:
+            yield chunk({"reasoning_content": str(reasoning_content)})
+        if content or not tool_calls:
+            yield chunk({"content": str(content)})
+        # Members are consumed as streams and their tool calls accumulated
+        # into the durable message; replay each call whole so streaming
+        # clients see the same tool calls a buffered client gets.
+        for index, call in enumerate(tool_calls):
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            yield chunk(
+                {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": call.get("id") or f"call_{job_id}_{index}",
+                            "type": call.get("type") or "function",
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": function.get("arguments") or "",
+                            },
+                        }
+                    ]
+                }
+            )
+        finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
         final = dict(base)
-        final["choices"] = [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason", "stop")}]
+        final["choices"] = [
+            {"index": 0, "delta": {}, "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop")}
+        ]
+        if isinstance(payload.get("usage"), dict):
+            final["usage"] = payload["usage"]
         yield _sse_frame(final)
         yield b"data: [DONE]\n\n"
 

@@ -11,7 +11,7 @@ from uuid import uuid4
 from aiohttp import web
 
 from .compatibility import build_requirements, evaluate, normalize_chat_request
-from .contracts import AttemptRecord, ContractError, JobRecord, JobState, Priority, ReasonCode
+from .contracts import AttemptRecord, ContractError, JobRecord, JobState, MemberState, Priority, ReasonCode
 from .redis_store import RepositoryUnavailable
 
 
@@ -24,7 +24,9 @@ class APIError(RuntimeError):
 
 
 class DurableBrokerService:
-    ALLOWED_SUBMIT_FIELDS = frozenset({"idempotency_key", "request", "priority", "caller_scope"})
+    ALLOWED_SUBMIT_FIELDS = frozenset(
+        {"idempotency_key", "request", "priority", "caller_scope", "pinned_member"}
+    )
 
     def __init__(
         self,
@@ -32,12 +34,67 @@ class DurableBrokerService:
         *,
         members: Callable[[], list],
         clock: Callable[[], float],
+        safety_margin_tokens: int = 1024,
     ) -> None:
         self.repository = repository
+        self.safety_margin_tokens = int(safety_margin_tokens)
         self.members = members
         self.clock = clock
+        self.member_admission: Callable[[str], bool] | None = None
+        self.member_capacity: Callable[[str], bool] | None = None
         self._sequence = 0
         self._lock = Lock()
+        self._all_dead_since: float | None = None
+
+    #: An outage of every member shorter than this (a router safe-restart) still queues.
+    DEAD_GRACE_SECONDS = 30.0
+    _DEAD_STATES = frozenset({MemberState.UNHEALTHY, MemberState.FAULTED, MemberState.OFFLINE})
+
+    def _fail_fast_if_all_dead(self, requirements, candidates) -> None:
+        """503 instead of queueing for up to api_wait_timeout when nothing can serve.
+
+        Only observed members count (observed_at 0 = no probe yet after boot).
+        """
+        compatible = [m for m in candidates if evaluate(requirements, m, safety_margin_tokens=self.safety_margin_tokens).compatible]
+        if not all(m.state in self._DEAD_STATES and m.observed_at > 0 for m in compatible):
+            self._all_dead_since = None
+            return
+        now = self.clock()
+        if self._all_dead_since is None:
+            self._all_dead_since = now
+        if now - self._all_dead_since >= self.DEAD_GRACE_SECONDS:
+            raise APIError(503, "no_live_member", "every compatible member is unhealthy")
+
+    #: The only reason ``reduce_member_readiness`` reports ``ready_busy``.
+    #: Capacity exhaustion is steady-state load, not a lifecycle transition.
+    CAPACITY_ONLY_REASONS = frozenset({ReasonCode.MEMBER_NO_CAPACITY.value})
+
+    def _pinned_admits(self, pinned, member_name: str) -> bool:
+        """Decide whether an observed pinned member may take a job right now.
+
+        ``accepting``/``state`` on the observer snapshot fold capacity in with
+        lifecycle health, and an embedded observer republishes only on its own
+        refresh tick. A slot released moments earlier is therefore invisible
+        for up to one interval, and a pinned submit landing in that window was
+        refused even though the durable mirror -- the authority the reservation
+        Lua reads -- had already proved the slot free.
+
+        So a refusal that is *capacity-only* is re-read from the durable mirror
+        via ``member_capacity``. Every other refusal, real saturation included,
+        still answers 503 immediately: no wait, no tick dependency.
+        """
+        state = getattr(pinned.state, "value", pinned.state)
+        if pinned.accepting and state == "ready_accepting":
+            return True
+        reasons = {getattr(code, "value", code) for code in (pinned.reason_codes or ())}
+        if state != "ready_busy" or reasons != set(self.CAPACITY_ONLY_REASONS):
+            return False
+        if self.member_capacity is None:
+            return False
+        try:
+            return bool(self.member_capacity(member_name))
+        except RepositoryUnavailable:
+            return False
 
     @staticmethod
     def _request_hash(request_body: dict) -> str:
@@ -46,7 +103,7 @@ class DurableBrokerService:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def submit(self, payload: dict) -> JobRecord:
+    def submit(self, payload: dict, *, kv_scope: dict | None = None) -> JobRecord:
         if not isinstance(payload, dict):
             raise APIError(400, "invalid_json", "JSON object required")
         unknown = sorted(set(payload) - self.ALLOWED_SUBMIT_FIELDS)
@@ -56,7 +113,12 @@ class DurableBrokerService:
         request_body = payload.get("request")
         if not isinstance(idem, str) or not idem or not isinstance(request_body, dict):
             raise APIError(400, "invalid_request", "idempotency_key and request are required")
-        request_body = normalize_chat_request(request_body)
+        request_body = normalize_chat_request(request_body)  # returns a copy
+        # The KV affinity scope is server-only: a client-sent value is always dropped, and only the
+        # in-process compat path (verified principal) may pass one as a keyword argument.
+        request_body.pop("_kv_session_id", None)
+        if kv_scope:
+            request_body["_kv_session_id"] = dict(kv_scope)
         messages = request_body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise APIError(400, "invalid_request", "messages or prompt is required")
@@ -87,8 +149,28 @@ class DurableBrokerService:
             input_tokens_hint=input_tokens_hint,
         )
         candidates = self.members()
-        if not any(evaluate(requirements, member).compatible for member in candidates):
+        pinned_member = payload.get("pinned_member")
+        if pinned_member is not None:
+            if not isinstance(pinned_member, str) or not pinned_member:
+                raise APIError(400, "invalid_request", "pinned_member must be a member name")
+            if pinned_member not in {member.name for member in candidates}:
+                raise APIError(404, "unknown_member", pinned_member)
+            requirements = replace(requirements, pinned_member=pinned_member)
+            pinned = next(member for member in candidates if member.name == pinned_member)
+            if not evaluate(requirements, pinned, safety_margin_tokens=self.safety_margin_tokens).compatible:
+                if not set(requirements.required_capabilities).issubset(set(pinned.capabilities)):
+                    raise APIError(503, "pinned_member_unavailable", "pinned member has no compatible route")
+                raise APIError(422, "no_eligible_member", ReasonCode.NO_ELIGIBLE_MEMBER.value)
+            try:
+                admission_ok = self.member_admission is None or self.member_admission(pinned_member)
+            except RepositoryUnavailable as exc:
+                raise APIError(503, "redis_state_unknown", str(exc)) from exc
+            if not admission_ok or not self._pinned_admits(pinned, pinned_member):
+                raise APIError(503, "pinned_member_unavailable", "pinned member is not currently dispatchable")
+        if not any(evaluate(requirements, member, safety_margin_tokens=self.safety_margin_tokens).compatible for member in candidates):
             raise APIError(422, "no_eligible_member", ReasonCode.NO_ELIGIBLE_MEMBER.value)
+        if pinned_member is None:
+            self._fail_fast_if_all_dead(requirements, candidates)
         with self._lock:
             self._sequence += 1
             sequence = self._sequence
@@ -103,6 +185,7 @@ class DurableBrokerService:
             input_tokens_estimate=requirements.input_tokens_estimate,
             max_output_tokens=requirements.max_output_tokens,
             required_capabilities=requirements.required_capabilities,
+            pinned_member=pinned_member,
         )
         try:
             return self.repository.submit(

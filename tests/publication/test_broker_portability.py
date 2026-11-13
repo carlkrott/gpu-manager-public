@@ -13,7 +13,7 @@ from gemma_broker.redis_store import (
     _derive_compatible_free_slots,
 )
 from gemma_broker.runtime import validate_candidate_config
-from combined_gemma_broker_service import load_broker_settings
+from combined_gemma_broker_service import build_member_configs, load_broker_settings
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -84,6 +84,20 @@ def test_config_rejects_mode_mismatch_and_unknown_fields():
     invalid["unexpected"] = True
     with pytest.raises(ConfigError, match="CONFIG_FIELDS_INVALID"):
         BrokerConfig.from_dict(invalid, candidate=True)
+
+
+def test_cloud_member_without_parallel_gets_slots_per_cloud_member():
+    def cloud(**extra):
+        return {"enabled": True, "member_type": "openai_compatible",
+                "endpoint": "http://127.0.0.1:9/v1/chat/completions", "model": "m", **extra}
+    services = {"member-primary": cloud(), "member-secondary": cloud(parallel=1),
+                "member-fallback": cloud()}
+    members, _ = build_member_configs(services, BrokerConfig.from_dict(_config(), candidate=True))
+    assert [members[n]["parallel"] for n in services] == [2, 1, 2]
+    custom = BrokerConfig.from_dict(_config(slots_per_cloud_member=3), candidate=True)
+    assert build_member_configs(services, custom)[0]["member-primary"]["parallel"] == 3
+    with pytest.raises(ConfigError, match="slots_per_cloud_member"):
+        BrokerConfig.from_dict(_config(slots_per_cloud_member=0), candidate=True)
 
 
 def test_production_namespace_is_required_for_non_candidate_mode():
@@ -190,3 +204,20 @@ def test_member_release_capacity_does_not_double_count_inflight_work():
     assert "local backend_free = math.max(0, configured - backend_busy)" in script
     assert "local dispatcher_free = math.max(0, configured - live_leases)" in script
     assert "free = math.min(configured, backend_free, dispatcher_free)" in script
+
+
+def test_c5_catalog_check_keys_on_models_url_not_router_unit(monkeypatch):
+    import combined_gemma_broker_service as svc
+
+    fetched: list[str] = []
+    monkeypatch.setattr(svc, "_fetch_router_models", lambda url: fetched.append(url) or frozenset({"m"}))
+
+    def cloud(model, **extra):
+        return {"enabled": True, "member_type": "openai_compatible", "systemd_unit": "any.service",
+                "endpoint": "http://127.0.0.1:9/v1/chat/completions", "model": model, **extra}
+    url = "http://127.0.0.1:9/v1/models"
+    services = {"member-primary": cloud("m", models_url=url), "member-secondary": cloud("gone", models_url=url),
+                "member-fallback": cloud("unchecked")}
+    members, _ = build_member_configs(services, BrokerConfig.from_dict(_config(), candidate=True))
+    assert fetched == [url]  # one fetch per catalog, none for the member without models_url
+    assert [members[n]["enabled"] for n in services] == [True, False, True]

@@ -100,6 +100,7 @@ class MemberDrainCoordinator:
                     MemberState.READY_ACCEPTING,
                     MemberState.JOINING,
                     MemberState.UNHEALTHY,
+                    MemberState.DRAINING,
                 ):
                     raise
                 begin_version = current.state_version

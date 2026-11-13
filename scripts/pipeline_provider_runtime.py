@@ -21,10 +21,10 @@ It provides:
 
        runtime = PipelineProviderRuntime(
            services_config=services_json,   # full services.json dict
-           provider_registry=frozenset({"open-design", "n8n", "comfyui", ...}),
+           provider_registry=frozenset({"n8n", "comfyui", ...}),
        )
        executor = runtime.build_executor(
-           provider_id="open-design",
+           provider_id="n8n",
            contract=worker_pipeline_dict,
            transport=my_transport,
        )
@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import base64 as _base64
+import binascii as _binascii
 import dataclasses
 import io as _io
 import ipaddress as _ipaddress
@@ -426,16 +427,22 @@ class _OpenAICompatibleTransport:
     def _encode_local_image(self, artifact_path: _Path, mime: str) -> tuple[str, bytes]:
         """Return a bounded image payload without modifying the source artifact."""
         raw = artifact_path.read_bytes()
+        return self._encode_image_bytes(raw, mime)
+
+    def _encode_image_bytes(self, raw: bytes, mime: str) -> tuple[str, bytes]:
+        """Validate and bound image bytes, including producer-inline artifacts."""
         limit = self._max_inline_image_bytes
-        if limit is None or len(raw) <= limit:
-            return mime, raw
-        if limit <= 0:
+        if limit is not None and limit <= 0:
             raise ProviderRuntimeError("max_inline_image_bytes must be positive")
 
         try:
             from PIL import Image
+            with Image.open(_io.BytesIO(raw)) as source:
+                source.verify()
+            if limit is None or len(raw) <= limit:
+                return mime, raw
 
-            with Image.open(artifact_path) as source:
+            with Image.open(_io.BytesIO(raw)) as source:
                 source.load()
                 if source.mode in {"RGBA", "LA"}:
                     rgba = source.convert("RGBA")
@@ -494,12 +501,23 @@ class _OpenAICompatibleTransport:
             # from completed, trusted pipeline stages; QC must inspect the
             # pixels rather than silently judging only the prompt text.
             artifact_root = pipeline_ctx.get("artifacts", {}) if stage_info.get("kind") == "qc" else {}
-            artifact_refs: list[str] = []
+            artifact_refs: list[str | dict] = []
 
             def _collect_artifacts(value: Any) -> None:
                 if len(artifact_refs) >= 4:
                     return
                 if isinstance(value, dict):
+                    inline_images = value.get("images")
+                    if isinstance(inline_images, list):
+                        for descriptor in inline_images:
+                            if isinstance(descriptor, dict) and descriptor not in artifact_refs:
+                                artifact_refs.append(descriptor)
+                                if len(artifact_refs) >= 4:
+                                    break
+                    if isinstance(value.get("data_b64"), str):
+                        if value not in artifact_refs and len(artifact_refs) < 4:
+                            artifact_refs.append(value)
+                        return
                     for key in (
                         "path_or_url", "artifact_path", "artifact_url",
                         "file_path", "path", "url", "image",
@@ -519,6 +537,24 @@ class _OpenAICompatibleTransport:
             image_parts: list[dict] = []
             seen_refs: set[str] = set()
             for artifact_ref in artifact_refs:
+                if isinstance(artifact_ref, dict):
+                    encoded_data = artifact_ref.get("data_b64")
+                    if not isinstance(encoded_data, str) or not encoded_data:
+                        raise ProviderRuntimeError("QC inline image data is missing")
+                    try:
+                        raw_image = _base64.b64decode(encoded_data, validate=True)
+                    except (ValueError, _binascii.Error) as exc:
+                        raise ProviderRuntimeError("QC inline image data is malformed") from exc
+                    if not raw_image or len(raw_image) > 32 * 1024 * 1024:
+                        raise ProviderRuntimeError("QC inline image size outside allowed range")
+                    image_name = artifact_ref.get("filename", "")
+                    mime = _mimetypes.guess_type(image_name)[0]
+                    if not mime or not mime.startswith("image/"):
+                        raise ProviderRuntimeError("QC artifact is not an image")
+                    inline_mime, inline_bytes = self._encode_image_bytes(raw_image, mime)
+                    encoded = _base64.b64encode(inline_bytes).decode("ascii")
+                    image_parts.append({"type": "image_url", "image_url": {"url": f"data:{inline_mime};base64,{encoded}"}})
+                    continue
                 if artifact_ref in seen_refs:
                     continue
                 seen_refs.add(artifact_ref)
@@ -554,8 +590,10 @@ class _OpenAICompatibleTransport:
                     "image_url": {"url": image_url},
                 })
 
-            if artifact_root and not image_parts:
-                raise ProviderRuntimeError("QC stage has artifacts but no usable image input")
+            if stage_info.get("kind") == "qc" and not image_parts:
+                raise ProviderRuntimeError(
+                    "QC unavailable: image could not be inspected."
+                )
 
             params = stage_info.get("params", {})
             param_str = ""
@@ -1103,7 +1141,7 @@ class PipelineProviderRuntime:
         Parameters
         ----------
         provider_id : str
-            Named provider (e.g. ``"open-design"``, ``"combined-gemma"``).
+            Named provider (e.g. ``"n8n"``, ``"combined-gemma"``).
         contract : dict
             The compiled worker pipeline dict (from
             ``service_pipeline.compile_generation_pipeline``).
@@ -1351,8 +1389,8 @@ class PipelineProviderRuntime:
                 continue
             else:
                 # http_json / http_openai_compatible / http_flow need a resolved URL.
-                # Worker-owned HTTP providers (open-design, combined-gemma) may lack
-                # endpoint_ref in their config (they use the ComfyUI/OD worker path,
+                # Worker-owned HTTP providers (combined-gemma) may lack
+                # endpoint_ref in their config (they use the ComfyUI worker path,
                 # not the HTTP transport path).  Skip building an HTTP executor for
                 # such providers so build_multi_provider_executor does not crash on
                 # RECONCILE pipelines that contain them in transport_map.
@@ -2653,7 +2691,7 @@ class CompositeProviderExecutor:
 
     Resolves each stage's ``provider`` field to the appropriate pre-built
     executor and routes the dispatch call accordingly.  One pipeline may
-    contain stages targeting completely different providers (e.g. ``open-design``
+    contain stages targeting completely different providers (e.g. ``n8n``
     for ``prompt_enhance`` and ``comfyui`` for ``generate`` via the
     gpu_manager_generation adapter).
 
@@ -2667,7 +2705,6 @@ class CompositeProviderExecutor:
         multi = runtime.build_multi_provider_executor(
             contract=pipeline_contract,
             transport_map={
-                "open-design": http_transport,
                 "combined-gemma": openai_transport,
             },
             stage_executor_factory=my_gpu_factory,

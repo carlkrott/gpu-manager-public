@@ -140,6 +140,8 @@ class MemberObserver:
             probe_errors["systemd"] = str(systemd_error)
 
         for probe_name, path in self.PROBE_PATHS:
+            if probe_name == "slots" and config.get("probe_profile") == "health_models":
+                continue  # no llama.cpp /slots on this server
             try:
                 status, payload = await self._http(config, path)
                 if status != 200:

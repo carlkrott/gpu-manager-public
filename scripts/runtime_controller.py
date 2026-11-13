@@ -30,6 +30,9 @@ class CheckedRuntimeBinding:
     profile: Mapping[str, Any]
 
 
+# observations older than this are reported stale by health (seconds)
+OBSERVATION_STALE_SECONDS = 3600.0
+
 _REQUIRED_CAPABILITIES = {
     "inspect", "prepare", "load", "health", "drain", "unload", "stop", "reconcile"
 }
@@ -235,6 +238,9 @@ class CheckedRuntimeController:
                     "observation_age_seconds": round(
                         max(0.0, now - record.observed_at), 3
                     ) if record.observed_at else None,
+                    # health reads this; a day-old observation is not a current state
+                    "observation_stale": not record.observed_at
+                    or now - record.observed_at > OBSERVATION_STALE_SECONDS,
                     "last_error": str(record.last_error)[:500]
                     if record.last_error
                     else None,

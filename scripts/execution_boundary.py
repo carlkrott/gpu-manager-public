@@ -85,11 +85,10 @@ if _t.TYPE_CHECKING:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Adapters whose stages are fully owned by the live ComfyUI/OD worker path.
+# Adapters whose stages are fully owned by the live ComfyUI worker path.
 # Kept for backward compatibility only — the authoritative classification now
 # comes from the ``managed`` field on each provider in services.json.
 LIVE_WORKER_OWNED_ADAPTERS: frozenset[str] = frozenset({
-    "open-design",
     "comfyui",
     "comfyui-qwen",
     "combined-gemma",
@@ -197,7 +196,7 @@ def register_provider_ownership(provider_id: str, adapter: str, managed: str = "
     Parameters
     ----------
     provider_id : str
-        Provider identifier (e.g. "comfyui", "open-design", "combined-gemma").
+        Provider identifier (e.g. "comfyui", "n8n", "combined-gemma").
     adapter : str
         Adapter type (e.g. "gpu_manager_generation", "http_json",
         "http_openai_compatible", "local_pipeline").
@@ -661,7 +660,7 @@ def safe_handoff_stages(
 
     This is the explicit handoff seam for mixed-ownership pipelines:
     the caller (typically the GPU Manager worker loop) executes the
-    worker-owned stages (prompt enhancement via OpenDesign, ComfyUI generation,
+    worker-owned stages (ComfyUI generation,
     QC via Combined-Gemma) and collects their outputs, then passes that
     evidence here to produce a ``HandoffResult`` whose ``external_stages``
     can be safely dispatched through ``CompositeProviderExecutor`` without

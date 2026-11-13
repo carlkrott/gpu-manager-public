@@ -15,6 +15,8 @@ import os
 from pathlib import Path
 import time
 from typing import Any, Mapping
+import urllib.request
+from uuid import uuid4
 
 import aiohttp
 from aiohttp import web
@@ -32,12 +34,65 @@ from gemma_broker.redis_store import (
 )
 from gemma_broker.runtime import BufferedAiohttpTransport, build_runtime
 from gpu_manager_contracts import registry_summary
-from api_auth import api_auth_middleware
+from api_auth import (
+    KDA_GEMMA_DEFAULT_PIN_APP_KEY,
+    KDA_GEMMA_MEMBER_PINS_APP_KEY,
+    KDA_GEMMA_ROUTING_GROUP,
+    KDA_GEMMA_SCOPED_GATE_APP_KEY,
+    api_auth_middleware,
+    honcho_gemma_request_is_authorized,
+    scoped_gemma_default_member,
+    scoped_gemma_pin_is_unpinned,
+    scoped_gemma_request_is_authorized,
+)
 
 
 LOGGER = logging.getLogger("combined_gemma_broker_service")
 DEFAULT_REDIS_URL = "redis://127.0.0.1:6379/0"
+_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
+
+def _fetch_router_models(url: str, timeout: float = 5.0) -> frozenset[str] | None:
+    """Model ids the fleet router lists at ``url`` (its /v1/models); None if unreachable.
+
+    A member behind the router must name a live id, so a dead id is rejected at
+    load instead of leaving the member permanently unhealthy. The router is the
+    catalog: adding a member model needs no broker code edit. An unreachable
+    router (boot order) is logged and accepted; its health probe still gates it.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as response:
+            data = json.load(response)
+        return frozenset(str(item["id"]) for item in data["data"])
+    except Exception as exc:
+        LOGGER.warning("MEMBER_MODEL_UNVERIFIED: router catalog %s unavailable (%s)", url, exc)
+        return None
+
+
+def apply_member_reasoning(payload: dict[str, Any], reasoning: Any) -> dict[str, Any]:
+    """Turn on llama-server thinking for a member configured with broker_reasoning.
+
+    ``{"effort": "high", "budget_tokens": N}``: thinking is capped at N tokens and
+    N is added to the caller's output budget, so short-answer callers still get an
+    answer. A caller that sends chat_template_kwargs.enable_thinking=false keeps it off.
+    """
+    if not isinstance(reasoning, dict):
+        return payload
+    kwargs = payload.get("chat_template_kwargs")
+    kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
+    if kwargs.get("enable_thinking") is False:
+        return payload
+    kwargs["enable_thinking"] = True
+    payload = {**payload, "chat_template_kwargs": kwargs, "reasoning_effort": reasoning["effort"]}
+    budget = int(reasoning.get("budget_tokens", 0))
+    if budget > 0:
+        payload["reasoning_budget_tokens"] = budget
+        for key in ("max_tokens", "max_completion_tokens"):
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                payload[key] = value + budget
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +109,7 @@ def build_member_configs(
     """Validate and normalize member service config without mutating input."""
     members: dict[str, dict[str, Any]] = {}
     endpoints: dict[str, str] = {}
+    router_catalogs: dict[str, frozenset[str] | None] = {}
     for name in config.ordered_members:
         raw = raw_services.get(name)
         if not isinstance(raw, dict):
@@ -64,19 +120,52 @@ def build_member_configs(
         if type(raw.get("enabled")) is not bool:
             raise ValueError(f"MEMBER_ENABLED_INVALID:{name}")
         member = dict(raw)
+        # Extra broker routing capabilities on top of chat/completion, e.g.
+        # ["vision"] for members that accept image parts (plan 5.1). A separate
+        # key: service "capabilities" already has registry consumers.
+        extra = member.pop("broker_capabilities", [])
+        if not isinstance(extra, list) or not all(isinstance(c, str) and c for c in extra):
+            raise ValueError(f"MEMBER_BROKER_CAPABILITIES_INVALID:{name}")
+        capabilities = tuple(dict.fromkeys(("chat", "completion", *extra)))
         timeout = member.get("forward_timeout", 600)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
             raise ValueError(f"MEMBER_FORWARD_TIMEOUT_INVALID:{name}")
+        reasoning = member.get("broker_reasoning")
+        if reasoning is not None and not (
+            isinstance(reasoning, dict)
+            and reasoning.get("effort") in _REASONING_EFFORTS
+            and type(reasoning.get("budget_tokens", 0)) is int
+            and reasoning.get("budget_tokens", 0) >= 0
+        ):
+            raise ValueError(f"MEMBER_BROKER_REASONING_INVALID:{name}")
+        limit = member.get("broker_context_limit")
+        if limit is not None and not (
+            type(limit) is int and 0 < limit <= int(member.get("context_per_slot") or limit)
+        ):
+            raise ValueError(f"MEMBER_BROKER_CONTEXT_LIMIT_INVALID:{name}")
         if member.get("member_type") == "openai_compatible":
+            if member.get("parallel", member.get("worker_parallel")) is None:
+                member["parallel"] = config.slots_per_cloud_member
             endpoint = member.get("endpoint")
             model = member.get("model")
             if not isinstance(endpoint, str) or not endpoint.startswith(("http://", "https://")):
                 raise ValueError(f"MEMBER_ENDPOINT_INVALID:{name}")
             if not isinstance(model, str) or not model:
                 raise ValueError(f"MEMBER_MODEL_INVALID:{name}")
+            # Members that declare a models_url are catalog-checked (C5: was a router unit literal).
+            if models_url := member.get("models_url"):
+                if models_url not in router_catalogs:
+                    router_catalogs[models_url] = _fetch_router_models(models_url)
+                known = router_catalogs[models_url]
+                if known is not None and model not in known:
+                    # The router hides models whose credential is missing or expired;
+                    # one such member must not make the whole broker unloadable.
+                    LOGGER.warning("MEMBER_MODEL_UNKNOWN:%s model=%s; member disabled", name, model)
+                    member["enabled"] = False
+                    member["self_disabled_reason"] = f"router /v1/models lacks {model}"
             member["cpu_only"] = True
             member["idle_service_configured"] = None
-            member["capabilities"] = ("chat", "completion")
+            member["capabilities"] = capabilities
             members[name] = member
             endpoints[name] = endpoint
             continue
@@ -84,7 +173,7 @@ def build_member_configs(
         if isinstance(port, bool) or not isinstance(port, int) or port <= 0 or port > 65535:
             raise ValueError(f"MEMBER_PORT_INVALID:{name}")
         member["idle_service_configured"] = None if member.get("cpu_only") else name
-        member["capabilities"] = ("chat", "completion")
+        member["capabilities"] = capabilities
         members[name] = member
         endpoints[name] = f"http://127.0.0.1:{port}/v1/chat/completions"
     return members, endpoints
@@ -379,6 +468,32 @@ class StandaloneBrokerService:
         )
 
 
+def recover_pre_acceptance_if_leader(
+    repository: RedisJobRepository,
+    *,
+    owner: str,
+    leader_ttl_seconds: float,
+    recovery_now: float,
+) -> tuple[bool, tuple]:
+    """Recover shared claims only after acquiring their dispatch leadership fence."""
+    try:
+        fence = repository.acquire_leadership(
+            owner=owner,
+            now=time.time(),
+            ttl_seconds=leader_ttl_seconds,
+        )
+    except Exception:
+        LOGGER.exception("skipping stale-claim recovery: leadership is unavailable")
+        return False, ()
+    if not fence:
+        return False, ()
+    recovered = repository.recover_stale_pre_acceptance_claims(
+        now=recovery_now,
+        max_age_seconds=120.0,
+    )
+    return True, recovered
+
+
 async def create_standalone_service(
     settings: BrokerSettings,
     *,
@@ -396,8 +511,12 @@ async def create_standalone_service(
         aging_seconds=settings.config.aging_interval_seconds,
         leadership_clock=time.time,
     )
-    recovered = repository.recover_stale_pre_acceptance_claims(
-        now=asyncio.get_running_loop().time(), max_age_seconds=120.0
+    recovery_owner = f"combined-gemma-broker:{os.getpid()}:{uuid4().hex}"
+    recovery_leader, recovered = recover_pre_acceptance_if_leader(
+        repository,
+        owner=recovery_owner,
+        leader_ttl_seconds=settings.config.leader_ttl_seconds,
+        recovery_now=asyncio.get_running_loop().time(),
     )
     if recovered:
         LOGGER.warning("requeued %d stale pre-acceptance claims", len(recovered))
@@ -427,13 +546,20 @@ async def create_standalone_service(
     transport = BufferedAiohttpTransport(
         session=session,
         endpoint_for_member=lambda member: settings.endpoints.get(member.name, ""),
-        request_for_member=lambda member, body: {
-            **body,
-            "model": settings.member_configs.get(member.name, {}).get(
-                "model", body.get("model", "gemma")
-            ),
-        },
+        request_for_member=lambda member, body: apply_member_reasoning(
+            {
+                **body,
+                "model": settings.member_configs.get(member.name, {}).get(
+                    "model", body.get("model", "gemma")
+                ),
+            },
+            settings.member_configs.get(member.name, {}).get("broker_reasoning"),
+        ),
         timeout=timeout,
+        timeout_for_member=lambda member: (
+            float(settings.member_configs[member.name].get("forward_timeout", 600)) + 60.0
+            if member.name in settings.member_configs else None
+        ),
     )
     runtime = build_runtime(
         config=settings.config,
@@ -443,6 +569,7 @@ async def create_standalone_service(
         clock=asyncio.get_running_loop().time,
         request_timeout=timeout,
         compat_timeout=timeout,
+        dispatch_owner=recovery_owner,
     )
     runtime_ref["runtime"] = runtime
     service = StandaloneBrokerService(
@@ -471,6 +598,14 @@ def _error(exc: Exception) -> web.Response:
 
 def create_standalone_app(service: StandaloneBrokerService) -> web.Application:
     app = web.Application(middlewares=[api_auth_middleware])
+    # Keep standalone broker auth aligned with the controller's embedded gate:
+    # only a running broker may admit the dedicated loopback Gemma credential.
+    config = service.settings.config
+    app[KDA_GEMMA_SCOPED_GATE_APP_KEY] = lambda: bool(config.enabled)
+    app[KDA_GEMMA_MEMBER_PINS_APP_KEY] = lambda: frozenset(config.ordered_members)
+    app[KDA_GEMMA_DEFAULT_PIN_APP_KEY] = lambda: (
+        ("gemma-4-e4b", KDA_GEMMA_ROUTING_GROUP) if config.ordered_members else None
+    )
 
     async def submit(request: web.Request):
         try:
@@ -501,9 +636,40 @@ def create_standalone_app(service: StandaloneBrokerService) -> web.Application:
 
     async def chat(request: web.Request):
         try:
+            body = await request.read()
+            # Honcho's dedicated scope targets the logical Gemma group. Admit it
+            # before KDA's default-member pin branch and preserve the client's
+            # unpinned routing-group semantics for the broker to select a member.
+            if honcho_gemma_request_is_authorized(request, body):
+                return await service.handle_proxy(
+                    method="POST", path="/v1/chat/completions", body=body,
+                    headers=request.headers, request=request,
+                )
+            forwarded_headers = request.headers
+            # A scoped KDA client whose submission would land UNPINNED -- no
+            # X-Backend at all, or the logical "Gemma" routing-group name, which
+            # gemma_broker.compat maps back to pinned_member=None -- is pinned
+            # server-side or refused, exactly as the controller's embedded gate
+            # does. Without this the scoped credential reached handle_proxy
+            # unpinned and any member could serve a model outside the
+            # credential's scope. An explicit member pin is a checked choice and
+            # is left exactly as the client sent it.
+            if (
+                scoped_gemma_pin_is_unpinned(request)
+                and scoped_gemma_request_is_authorized(request)
+            ):
+                default_member = scoped_gemma_default_member(request, body)
+                if default_member is None:
+                    return web.json_response(
+                        {"error": "scoped token without a member pin is limited to its default model",
+                         "code": "scoped_default_model_mismatch"},
+                        status=403,
+                    )
+                forwarded_headers = request.headers.copy()
+                forwarded_headers["X-Backend"] = default_member
             return await service.handle_proxy(
-                method="POST", path="/v1/chat/completions", body=await request.read(),
-                headers=request.headers, request=request,
+                method="POST", path="/v1/chat/completions", body=body,
+                headers=forwarded_headers, request=request,
             )
         except Exception as exc:
             return _error(exc)

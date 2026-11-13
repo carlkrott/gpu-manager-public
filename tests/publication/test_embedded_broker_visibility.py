@@ -23,6 +23,50 @@ ROOT = Path(__file__).resolve().parents[2]
 CONTROLLER = ROOT / "scripts" / "gpu-manager.py"
 
 
+@pytest.mark.parametrize(
+    ("leadership", "raises", "expected", "recovered"),
+    [
+        (False, False, (False, ()), False),
+        (True, False, (True, ["claim-1"]), True),
+        (None, True, (False, ()), False),
+    ],
+)
+def test_pre_acceptance_recovery_requires_leadership_fence(
+    leadership, raises, expected, recovered, caplog
+):
+    _load_controller()
+    from combined_gemma_broker_service import recover_pre_acceptance_if_leader
+
+    class _Repository:
+        recovery_calls = 0
+
+        def acquire_leadership(self, **kwargs):
+            assert kwargs["owner"] == "recovery-owner"
+            if raises:
+                raise RuntimeError("leadership unavailable")
+            return leadership
+
+        def recover_stale_pre_acceptance_claims(self, **kwargs):
+            self.recovery_calls += 1
+            assert kwargs == {"now": 4.0, "max_age_seconds": 120.0}
+            return ["claim-1"]
+
+    repository = _Repository()
+    result = recover_pre_acceptance_if_leader(
+        repository,
+        owner="recovery-owner",
+        leader_ttl_seconds=30.0,
+        recovery_now=4.0,
+    )
+    assert result == expected
+    assert repository.recovery_calls == int(recovered)
+    if raises:
+        assert any(
+            "skipping stale-claim recovery: leadership is unavailable" in record.message
+            for record in caplog.records
+        )
+
+
 PAYLOAD = {
     "schema": "combined-gemma.broker-metric.v1",
     "queue": {"depth": 0, "fresh": True},
@@ -126,7 +170,9 @@ def test_embedded_initializer_uses_cloud_aware_member_builder_and_model_rewrite(
     assert request_rewriter.id == "_request_for_member"
 
 
-def test_embedded_initializer_builds_cloud_transport_and_rewrites_model(monkeypatch):
+def test_embedded_initializer_builds_cloud_transport_and_rewrites_model(
+    monkeypatch, caplog
+):
     module = _load_controller()
     data = json.loads(
         (ROOT / "examples/combined-gemma/services.json").read_text(encoding="utf-8")
@@ -156,8 +202,13 @@ def test_embedded_initializer_builds_cloud_transport_and_rewrites_model(monkeypa
             pass
 
         @staticmethod
+        def acquire_leadership(**kwargs):
+            captured["recovery_owner"] = kwargs["owner"]
+            return True
+
+        @staticmethod
         def recover_stale_pre_acceptance_claims(**_kwargs):
-            return []
+            return ["claim-1"]
 
     class _DispatchLoop:
         is_running = True
@@ -218,6 +269,8 @@ def test_embedded_initializer_builds_cloud_transport_and_rewrites_model(monkeypa
     runtime = asyncio.run(module._initialize_combined_gemma_broker())
 
     assert runtime is not None
+    assert captured["dispatch_owner"] == captured["recovery_owner"]
+    assert any("requeued 1 stale pre-acceptance claims" in record.message for record in caplog.records)
     transport = captured["transport"]
     member = SimpleNamespace(name=member_name)
     assert transport._endpoint_for_member(member) == endpoint
@@ -320,7 +373,14 @@ def test_embedded_api_proxy_exposes_live_repository_for_attempt_status():
     assert proxy.repository is repository
 
 
-def test_embedded_start_rejoins_member_with_generation_fenced_cas():
+# A member already serving a job joins as ready_busy, not ready_accepting.
+@pytest.mark.parametrize(
+    "joined_state, accepting",
+    [("ready_accepting", True), ("ready_busy", False)],
+)
+def test_embedded_start_rejoins_member_with_generation_fenced_cas(
+    joined_state, accepting
+):
     module = _load_controller()
     service_name = "Gemma-MI50"
     calls: list[tuple] = []
@@ -353,9 +413,9 @@ def test_embedded_start_rejoins_member_with_generation_fenced_cas():
 
     async def _refresh():
         assert member.state.value == "joining"
-        member.state = SimpleNamespace(value="ready_accepting")
+        member.state = SimpleNamespace(value=joined_state)
         member.state_version = 19
-        member.accepting = True
+        member.accepting = accepting
 
     module._services_config = {
         "services": {
@@ -381,8 +441,7 @@ def test_embedded_start_rejoins_member_with_generation_fenced_cas():
 
     assert rejoined is True
     assert len(calls) == 1
-    assert member.state.value == "ready_accepting"
-    assert member.accepting is True
+    assert member.state.value == joined_state
 
 
 def test_embedded_start_drains_unhealthy_member_before_generation_fenced_rejoin():
@@ -465,6 +524,81 @@ def test_embedded_start_drains_unhealthy_member_before_generation_fenced_rejoin(
     assert [call[0] for call in calls] == ["drain", "begin_rejoin"]
     assert member.state.value == "ready_accepting"
     assert member.accepting is True
+
+
+def test_embedded_start_completes_stuck_draining_member_before_rejoin():
+    module = _load_controller()
+    service_name = "Gemma-RX6950XT"
+    calls: list[tuple] = []
+    member = SimpleNamespace(
+        name=service_name,
+        state=SimpleNamespace(value="draining"),
+        state_version=258560,
+        generation_fence=3_000,
+        accepting=False,
+    )
+
+    class _Repository:
+        @staticmethod
+        def get_member(name):
+            assert name == service_name
+            return member
+
+        @staticmethod
+        def begin_member_rejoin(
+            name, *, expected_state_version, generation_fence
+        ):
+            assert expected_state_version == 258561
+            assert generation_fence > 3_000
+            calls.append(("begin_rejoin", expected_state_version))
+            member.state = SimpleNamespace(value="joining")
+            member.state_version = 258562
+            member.generation_fence = generation_fence
+            return member
+
+    async def _drain_member(
+        name, *, expected_state_version, timeout, retry_stale
+    ):
+        assert name == service_name
+        assert expected_state_version == 258560
+        assert retry_stale is True
+        calls.append(("drain", expected_state_version))
+        member.state = SimpleNamespace(value="offline")
+        member.state_version = 258561
+        return SimpleNamespace(drained=True, member=member, lease_count=0)
+
+    async def _refresh():
+        member.state = SimpleNamespace(value="ready_accepting")
+        member.state_version = 258563
+        member.accepting = True
+
+    setattr(module, "_services_config", {
+        "services": {
+            service_name: {
+                "enabled": True,
+                "type": "llm_backend",
+                "routing_group": "Gemma",
+            }
+        },
+        "combined_gemma_broker": {"enabled": True},
+        "combined_gemma_deployment": {"mode": "embedded"},
+    })
+    setattr(
+        module,
+        "_combined_gemma_broker",
+        SimpleNamespace(_repository=_Repository(), drain_member=_drain_member),
+    )
+    setattr(module, "_refresh_combined_gemma_member_snapshots", _refresh)
+
+    rejoined = asyncio.run(
+        module._rejoin_combined_gemma_member_after_start(
+            service_name, timeout=0.1
+        )
+    )
+
+    assert rejoined is True
+    assert [call[0] for call in calls] == ["drain", "begin_rejoin"]
+    assert member.state.value == "ready_accepting"
 
 
 def test_embedded_start_completes_real_repository_rejoin_and_reserves(
@@ -561,7 +695,10 @@ def test_embedded_start_completes_real_repository_rejoin_and_reserves(
     module._combined_gemma_member_cache = cache
     module._combined_gemma_broker = SimpleNamespace(
         _repository=repository,
-        dispatch_loop=SimpleNamespace(is_running=True),
+        dispatch_loop=SimpleNamespace(
+            is_running=True,
+            active_dispatch_suppression=lambda name: None,
+        ),
     )
     module.session = _ProbeSession()
     monkeypatch.setattr(
@@ -830,7 +967,10 @@ def test_member_refresh_uses_configured_ordered_members_only():
     }
     module._combined_gemma_member_cache = _Cache()
     module._combined_gemma_broker = SimpleNamespace(
-        dispatch_loop=SimpleNamespace(is_running=True),
+        dispatch_loop=SimpleNamespace(
+            is_running=True,
+            active_dispatch_suppression=lambda name: None,
+        ),
         _repository=_Repository(),
     )
     module.session = SimpleNamespace(closed=False)
@@ -865,7 +1005,7 @@ def test_member_refresh_observes_openai_compatible_member(monkeypatch):
         async def observe(self, name, *, now):
             assert now > 0
             observations.append(name)
-            return object()
+            return {"observed_at": now}
 
     class _Cache:
         _configs = {member_name: config}
@@ -891,7 +1031,10 @@ def test_member_refresh_observes_openai_compatible_member(monkeypatch):
     }
     module._combined_gemma_member_cache = _Cache()
     module._combined_gemma_broker = SimpleNamespace(
-        dispatch_loop=SimpleNamespace(is_running=True),
+        dispatch_loop=SimpleNamespace(
+            is_running=True,
+            active_dispatch_suppression=lambda name: None,
+        ),
         _repository=_Repository(),
     )
     module.session = SimpleNamespace(closed=False)
@@ -1067,7 +1210,10 @@ def test_member_refresh_refuses_invalid_ordered_members(ordered_members, caplog)
     }
     module._combined_gemma_member_cache = _Cache()
     module._combined_gemma_broker = SimpleNamespace(
-        dispatch_loop=SimpleNamespace(is_running=True),
+        dispatch_loop=SimpleNamespace(
+            is_running=True,
+            active_dispatch_suppression=lambda name: None,
+        ),
         _repository=_Repository(),
     )
     module.session = SimpleNamespace(closed=False)
