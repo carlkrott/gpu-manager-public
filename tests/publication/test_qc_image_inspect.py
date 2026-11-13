@@ -19,7 +19,7 @@ from pipeline_provider_runtime import (  # noqa: E402
 from stage_dispatch import StageContext  # noqa: E402
 
 LIVE_ARTIFACT = Path(
-    "/mnt/agent-storage-b/ai-dev/minimax-music3/production/comfyui-output/"
+    "/srv/comfyui-output/"
     "gm-6f4dff9a5b61-image-0.png"
 )
 LIVE_FAILURE = "QC unavailable: image could not be inspected."

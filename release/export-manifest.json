@@ -1126,8 +1126,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_qc_image_inspect.py",
-      "sha256": "1b931d4c2cad0b09eaffdffc8f1d7f04d50a3fa4bbffa4621baf8f39d0569ad8",
-      "size": 5275
+      "sha256": "c26a70cd505df857289ff26391b4cea60f097b2f05ab458ed86e753527c8bbc7",
+      "size": 5226
     },
     {
       "disposition": "core",
