@@ -1078,8 +1078,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_oom_inflight_deploy.py",
-      "sha256": "98c237d71e372e404ee927e6bb983bf765464015398b6a222945a8ab2aa7261e",
-      "size": 27600
+      "sha256": "d5bf12ee44b395f8f6d6d1abb1153092552860d2bd20d83d9dc9077eb4aeb0aa",
+      "size": 27616
     },
     {
       "disposition": "core",
@@ -1126,8 +1126,8 @@
     {
       "disposition": "core",
       "path": "tests/publication/test_qc_image_inspect.py",
-      "sha256": "d02c1168e3a32217b8b89845c0c1d088813f48802fc213e2c55f81b72b95d4e4",
-      "size": 5185
+      "sha256": "1b931d4c2cad0b09eaffdffc8f1d7f04d50a3fa4bbffa4621baf8f39d0569ad8",
+      "size": 5275
     },
     {
       "disposition": "core",

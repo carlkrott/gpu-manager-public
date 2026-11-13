@@ -48,7 +48,8 @@ async def _capture_request(artifacts, *, stage_kind="qc", max_inline_image_bytes
 
 @pytest.mark.parametrize("retry_count", [0, 1], ids=["first-attempt", "generate-retry-2"])
 def test_qc_request_includes_decodable_image_for_live_artifact(retry_count):
-    assert LIVE_ARTIFACT.is_file()
+    if not LIVE_ARTIFACT.is_file():
+        pytest.skip("live artifact is installation data, not part of the public export")
     encoded = base64.b64encode(LIVE_ARTIFACT.read_bytes()).decode("ascii")
     produced = {
         "images": [{"filename": LIVE_ARTIFACT.name, "subfolder": "", "type": "output", "data_b64": encoded}],

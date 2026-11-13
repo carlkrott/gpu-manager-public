@@ -11,6 +11,7 @@ import importlib.util
 from pathlib import Path
 import pytest
 import sqlite3
+import sys
 import subprocess
 import tempfile
 import textwrap
@@ -476,7 +477,7 @@ def test_authenticated_preflight_case() -> None:
         try:
             result = subprocess.run(
                 [
-                    "python3", str(helper),
+                    sys.executable, str(helper),
                     "--auth-source-dir", str(WORKSPACE / "scripts"),
                     "--services-json", str(fixture["services"]),
                     "--lease-db", str(fixture["leases"]),
