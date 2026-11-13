@@ -17,6 +17,9 @@ The current dependency inventory is:
 | packaging | 26.3 | Apache-2.0 OR BSD-2-Clause |
 | pluggy | 1.6.0 | MIT |
 | Pygments | 2.20.0 | BSD-2-Clause |
+| pytest-asyncio | 1.5.0 | Apache-2.0 |
+| fakeredis | 2.40.0 | BSD-3-Clause |
+| sortedcontainers | 2.4.0 | Apache-2.0 |
 
 Transitive runtime packages are pinned in `requirements.lock` with hashes. Development pins are explicit in `requirements-dev.lock`; resolve them only from the configured package index and review the installed distribution metadata before a release.
 

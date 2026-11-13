@@ -52,8 +52,8 @@
     {
       "disposition": "core",
       "path": "THIRD_PARTY_NOTICES.md",
-      "sha256": "2f76d7d37877be1ecf43b62fa1a63ce0963a565a50783d299cece510a1bc90cd",
-      "size": 1524
+      "sha256": "94301c81ab32f4c3b93bdded44941bc70c3e98291292f46e053d19b01aaef8b2",
+      "size": 1644
     },
     {
       "disposition": "core",
@@ -106,8 +106,8 @@
     {
       "disposition": "utility",
       "path": "requirements-dev.lock",
-      "sha256": "69a6f40e85c385d28a6d01d8d691a20d6b7ad6d551e900510789ac3f0e05a771",
-      "size": 578
+      "sha256": "2797ab555f07e488748a9f93a844d7c46d48b817dea3e4b36090b0197792bbd7",
+      "size": 1116
     },
     {
       "disposition": "utility",
